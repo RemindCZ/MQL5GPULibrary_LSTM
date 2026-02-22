@@ -75,7 +75,7 @@
     </Link>
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
-      <CudaRuntime>Static</CudaRuntime>
+      <CudaRuntime>Shared</CudaRuntime>
       <CodeGeneration>compute_86,sm_86</CodeGeneration>
       <GPUDebugInfo>false</GPUDebugInfo>
       <GenerateLineInfo>true</GenerateLineInfo>
@@ -93,7 +93,7 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="x64\Release\MQL5GPULibrary_LSTM.dll">
-      <DeploymentContent>true</DeploymentContent>
+      <DeploymentContent>false</DeploymentContent>
       <FileType>Discomap</FileType>
     </None>
   </ItemGroup>
