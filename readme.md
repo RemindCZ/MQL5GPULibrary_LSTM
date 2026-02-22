@@ -98,6 +98,246 @@ void     DN_GetError(short* buf, int len);
 
 ---
 
+## Comprehensive DLL Function Documentation (English)
+
+This section provides a complete, implementation-aligned reference for all exported DLL functions used from MQL5.
+
+### Calling convention and return semantics
+
+- All exports use `__stdcall`.
+- `MQL_BOOL` is an integer (`1 = success`, `0 = failure`).
+- Handle-returning functions return `0` on failure.
+- `DN_GetTrainingStatus` returns one of:
+  - `0` = idle
+  - `1` = training in progress
+  - `2` = training completed
+  - `-1` = error or invalid handle
+
+### Model lifecycle and threading model
+
+The DLL supports multiple independent models via integer handles.
+
+1. Create model: `DN_Create`.
+2. Configure sequence and mini-batch policy.
+3. Add one or more LSTM layers.
+4. Define output layer dimension.
+5. Load training batch.
+6. Start asynchronous training and poll status.
+7. Run inference (`DN_PredictBatch`).
+8. Optionally save/load model state.
+9. Release handle with `DN_Free`.
+
+Important runtime behavior:
+
+- Asynchronous training runs in a worker thread.
+- Training lock ownership is exclusive while training executes.
+- `DN_GetTrainingStatus`, `DN_GetTrainingResult`, and `DN_StopTraining` are lock-free from caller perspective.
+
+### Data layout contract for `X`, `T`, and `Y`
+
+The API accepts host-side `double*` arrays and internally converts to GPU float tensors.
+
+- Let:
+  - `batch` = number of samples
+  - `seq_len` = timesteps per sample
+  - `feature_dim` = features per timestep
+  - `in = seq_len * feature_dim`
+  - `out` = output dimension
+- Required linear lengths:
+  - `X`: `batch * in`
+  - `T`: `batch * out`
+  - `Y`: `batch * out`
+- `DN_LoadBatch` and `DN_PredictBatch` validate `in % seq_len == 0`.
+
+### Detailed function reference
+
+#### `int DN_Create();`
+
+Creates a new network instance and returns a positive handle.
+
+- Returns `0` if CUDA context initialization fails.
+- Each handle maps to one internal `LSTMNet` instance.
+
+#### `void DN_Free(int h);`
+
+Safely destroys the model instance.
+
+- Requests training stop if worker thread is active.
+- Waits for synchronization points to avoid race conditions.
+- Invalid handles are ignored safely.
+
+#### `MQL_BOOL DN_SetSequenceLength(int h, int seq_len);`
+
+Sets sequence length used by load/train/predict routines.
+
+- Effective value is clamped to at least `1`.
+- Must match the shape assumption used in `in` parameters.
+
+#### `MQL_BOOL DN_SetMiniBatchSize(int h, int mbs);`
+
+Configures mini-batch size for training.
+
+- Effective value is clamped to at least `1`.
+- Affects optimizer step scheduling and memory buffers.
+
+#### `MQL_BOOL DN_AddLayerEx(int h, int in, int out, int act, int ln, double drop);`
+
+Adds one LSTM layer.
+
+- `in`: expected input size for the layer definition.
+- `out`: hidden size of the LSTM layer.
+- `drop`: dropout probability for that layer.
+- `act` and `ln` are currently accepted for compatibility, but not used by the current implementation.
+
+Operational note:
+
+- During `DN_LoadBatch`/`DN_PredictBatch`, layer input dimensions are auto-bound to actual upstream dimensions when needed.
+
+#### `MQL_BOOL DN_SetGradClip(int h, double clip);`
+
+Sets gradient clipping value used during optimizer updates.
+
+- Applied inside layer update kernels.
+- Useful for controlling exploding gradients.
+
+#### `MQL_BOOL DN_SetOutputDim(int h, int out_dim);`
+
+Creates/updates output projection layer based on last LSTM hidden size.
+
+- Requires at least one LSTM layer to exist.
+- Reinitializes output weights when output dimension changes.
+
+#### `MQL_BOOL DN_LoadBatch(int h, const double* X, const double* T, int batch, int in, int out, int l);`
+
+Loads full training dataset batch into persistent GPU buffers.
+
+- `X` and `T` must be non-null and preallocated with valid lengths.
+- `l` is a layout parameter reserved for compatibility; current implementation does not branch by this argument.
+- Rebuilds bindings when feature dimension differs from existing layer input shape.
+- Ensures output layer shape equals requested `out`.
+
+On success, this function sets the internal training dataset used by `DN_TrainAsync`.
+
+#### `MQL_BOOL DN_PredictBatch(int h, const double* X, int batch, int in, int l, double* Y);`
+
+Runs forward inference on provided input batch.
+
+- Converts host `double` input to internal GPU float.
+- Executes full forward pass through LSTM stack and output layer.
+- Converts prediction back to host `double` output array.
+- `l` is currently reserved and not used in dispatch logic.
+
+#### `MQL_BOOL DN_SnapshotWeights(int h);`
+
+Stores current model weights as "best" snapshot.
+
+- Captures all LSTM layers and output layer.
+- Intended for checkpointing before risky retraining.
+
+#### `MQL_BOOL DN_RestoreWeights(int h);`
+
+Restores model weights from previously saved snapshot.
+
+- Restores all compatible layers.
+- Returns failure if snapshots are not available for required components.
+
+#### `MQL_BOOL DN_TrainAsync(int h, int epochs, double target_mse, double lr, double wd);`
+
+Starts asynchronous training over the last batch loaded by `DN_LoadBatch`.
+
+- Preconditions:
+  - Batch data already loaded.
+  - At least one LSTM layer.
+  - Output layer initialized.
+- Uses shuffled mini-batches, Adam-style updates, learning-rate schedule, optional early stop (`target_mse > 0`).
+- Returns `0` immediately if training is already running.
+
+Training completes when:
+
+- all epochs finish,
+- `target_mse` is reached during periodic full-dataset evaluation,
+- or stop flag is set via `DN_StopTraining`.
+
+#### `int DN_GetTrainingStatus(int h);`
+
+Reads current async training state.
+
+- Non-blocking polling call.
+- Safe to call frequently from indicator timer/update loops.
+
+#### `void DN_GetTrainingResult(int h, double* out_mse, int* out_epochs);`
+
+Retrieves final metrics from latest async run.
+
+- `out_mse`: final full-train MSE.
+- `out_epochs`: number of epochs completed.
+- Either pointer may be null.
+
+#### `void DN_StopTraining(int h);`
+
+Sets cooperative stop flag for active training worker.
+
+- Stop is observed at epoch/mini-batch boundaries.
+- Use with status polling until non-running state is returned.
+
+#### `int DN_GetLayerCount(int h);`
+
+Returns total number of active layers.
+
+- Includes all LSTM layers plus output layer if created.
+
+#### `double DN_GetLayerWeightNorm(int h, int l);`
+#### `double DN_GetGradNorm(int h);`
+
+Diagnostic placeholders in current build.
+
+- Currently return `0.0`.
+- Exposed for forward-compatible tooling/API stability.
+
+#### `int DN_SaveState(int h);`
+
+Serializes current model into internal text buffer and returns required byte count including null terminator.
+
+- Returns `0` on failure.
+- Must be followed by `DN_GetState` to copy payload out.
+
+#### `MQL_BOOL DN_GetState(int h, char* buf, int max_len);`
+
+Copies previously serialized state into caller buffer.
+
+- Requires successful `DN_SaveState` before call.
+- Fails if buffer is too small.
+- Writes null-terminated text payload.
+
+#### `MQL_BOOL DN_LoadState(int h, const char* buf);`
+
+Loads model from serialized text format.
+
+- Expected header token: `LSTM_V1`.
+- Recreates architecture and copies all weights/biases to GPU.
+
+#### `void DN_GetError(short* buf, int len);`
+
+Returns last DLL error message as UTF-16-like short buffer.
+
+- Provide writable array and positive length.
+- Result is null-terminated.
+- Typical errors include CUDA launch/runtime failures, dimension mismatches, and out-of-memory conditions.
+
+### Recommended robust usage pattern in MQL5
+
+1. Build/configure architecture once at startup.
+2. Validate every return code (`== 1`).
+3. On failure, immediately call `DN_GetError` and log message.
+4. During asynchronous training:
+   - call `DN_TrainAsync`,
+   - poll `DN_GetTrainingStatus` from `OnTimer`/`OnCalculate`,
+   - read metrics with `DN_GetTrainingResult` on completion,
+   - optionally checkpoint via `DN_SnapshotWeights`.
+5. Always call `DN_Free` in deinitialization path.
+
+---
+
 ## Důležité poznámky k datům
 
 - `seq_len` musí souhlasit mezi konfigurací (`DN_SetSequenceLength`) a daty (`DN_LoadBatch`, `DN_PredictBatch`).
