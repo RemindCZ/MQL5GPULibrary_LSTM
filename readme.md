@@ -297,6 +297,11 @@ Mismatch between these rules and configured model dimensions is a common source 
 
 Open `docs/index.html` in a web browser to inspect the included visual explanation of LSTM data and flow.
 
+## Official Links
+
+- Detailed online documentation: https://remind.cz/DLL/MQL5GPULibrary_LSTM.html
+- Author website: https://remind.cz/
+
 ## Typical Failure Sources
 
 - DLL imports disabled in MT5.
