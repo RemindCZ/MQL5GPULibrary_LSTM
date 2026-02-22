@@ -15,12 +15,12 @@ This repository contains:
 
 The implementation in `kernel.cu` is currently labeled as LSTM DLL `v1.3.0` and is designed around:
 
-- CUDA streams and cuBLAS/cuRAND integration.
+- Per-thread `GPUContext` with its own CUDA stream + cuBLAS + cuRAND handles.
 - Column-major matrix layout for all GEMM operations.
 - Multi-layer LSTM stack and a linear output projection layer.
 - Persistent GPU buffers for loaded training data.
 - Asynchronous training through a dedicated worker thread.
-- Thread-safe handle-based model management.
+- Thread-safe handle-based model management (`std::shared_mutex` + atomics).
 
 ## Core Features
 
@@ -86,6 +86,15 @@ Important implications:
 - Output layer weight matrix shape is `[hidden_last x out_dim]`.
 - Host-side arrays received from MQL5 are transformed to GPU float buffers.
 - Input sequences are transposed to timestep-major GPU layout for recurrent processing.
+
+Canonical GEMM conventions used in `kernel.cu`:
+
+- LSTM weights: `W` is `[input_size + hidden_size, 4 * hidden_size]`.
+  - Forward: `gates = W^T * hx`
+  - Backward: `dW += hx * dg^T`, `dhx = W * dg`
+- Output weights: `W_out` is `[hidden_last, out_dim]`.
+  - Forward: `Y = W_out^T * h_last`
+  - Backward: `dW_out = h_last * dY^T`, `dh_last = W_out * dY`
 
 If you provide incorrect dimensions, calls fail and details can be retrieved via `DN_GetError`.
 
@@ -187,11 +196,15 @@ Returns total active layer count (all LSTM layers plus output layer when present
 
 #### `double DN_GetLayerWeightNorm(int h, int l);`
 
-Currently exposed as placeholder; currently returns `0.0`.
+Returns L2 norm of the selected layer weights on device:
+
+- `l = 0 .. n_lstm-1` for LSTM layers,
+- `l = n_lstm` for output layer,
+- otherwise `0.0`.
 
 #### `double DN_GetGradNorm(int h);`
 
-Currently exposed as placeholder; currently returns `0.0`.
+Returns aggregate L2 norm over current gradient buffers (`dW`, `db`) across all layers.
 
 ### Checkpoint and serialization
 
@@ -263,6 +276,7 @@ Mismatch between these rules and configured model dimensions is a common source 
 - Async worker acquires exclusive model lock during training.
 - Status/result/stop interface is lock-free from caller perspective (atomic-based).
 - `DN_Free` is designed to avoid leaving worker threads running.
+- Most public exports intentionally use exclusive model lock to protect mutable caches/temporaries.
 
 ## MetaTrader 5 Deployment
 
