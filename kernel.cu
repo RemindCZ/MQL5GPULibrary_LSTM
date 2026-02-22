@@ -1147,6 +1147,8 @@ struct OutputLayer {
     }
 };
 
+static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n);
+
 // ============================================================================
 // LSTMNet — Main network class
 // ============================================================================
@@ -1524,9 +1526,55 @@ public:
 
     float GetOutputMin()  const { return 0.0f; }
     float GetOutputMax()  const { return 0.0f; }
-    float GetGradNorm()   const { return 0.0f; }
+    float GetGradNorm()   const {
+        GPUContext ctx;
+        if (!ctx.Init(0)) return 0.0f;
+
+        double sq_sum = 0.0;
+        for (const auto& l : lstm_layers) {
+            if (l->dW.ptr && l->dW.count > 0) {
+                double n = ComputeDeviceL2Norm(ctx.stream, l->dW.ptr, (int)l->dW.count);
+                sq_sum += n * n;
+            }
+            if (l->db.ptr && l->db.count > 0) {
+                double n = ComputeDeviceL2Norm(ctx.stream, l->db.ptr, (int)l->db.count);
+                sq_sum += n * n;
+            }
+        }
+        if (output_layer) {
+            if (output_layer->dW.ptr && output_layer->dW.count > 0) {
+                double n = ComputeDeviceL2Norm(ctx.stream, output_layer->dW.ptr,
+                    (int)output_layer->dW.count);
+                sq_sum += n * n;
+            }
+            if (output_layer->db.ptr && output_layer->db.count > 0) {
+                double n = ComputeDeviceL2Norm(ctx.stream, output_layer->db.ptr,
+                    (int)output_layer->db.count);
+                sq_sum += n * n;
+            }
+        }
+
+        return (float)std::sqrt(sq_sum);
+    }
     int   GetLayerCount() const { return (int)lstm_layers.size() + (output_layer ? 1 : 0); }
-    float GetLayerWeightNorm(int) const { return 0.0f; }
+    float GetLayerWeightNorm(int layer_idx) const {
+        GPUContext ctx;
+        if (!ctx.Init(0)) return 0.0f;
+
+        if (layer_idx >= 0 && layer_idx < (int)lstm_layers.size()) {
+            const LSTMLayer* layer = lstm_layers[(size_t)layer_idx].get();
+            if (!layer->W.ptr || layer->W.count == 0) return 0.0f;
+            return (float)ComputeDeviceL2Norm(ctx.stream, layer->W.ptr, (int)layer->W.count);
+        }
+
+        if (output_layer && layer_idx == (int)lstm_layers.size()) {
+            if (!output_layer->W.ptr || output_layer->W.count == 0) return 0.0f;
+            return (float)ComputeDeviceL2Norm(ctx.stream, output_layer->W.ptr,
+                (int)output_layer->W.count);
+        }
+
+        return 0.0f;
+    }
     float GetLayerGradNorm(int)   const { return 0.0f; }
     float GetLayerActMin(int)     const { return 0.0f; }
     float GetLayerActMax(int)     const { return 0.0f; }
@@ -1887,6 +1935,25 @@ static LSTMNet* FindNetNoLock(int h) {
     return it->second.get();
 }
 
+static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n) {
+    if (!buf || n <= 0) return 0.0;
+
+    GPUMemory<float> reduce;
+    if (!reduce.alloc(1)) return 0.0;
+
+    CUDA_CHECK_VOID(cudaMemsetAsync(reduce.ptr, 0, sizeof(float), stream_h));
+    kL2NormReduceWarp << <std::min((n + 255) / 256, 1024), 256, 0, stream_h >> > (
+        n, buf, reduce.ptr);
+    CUDA_CHECK_VOID(cudaGetLastError());
+
+    float sum = 0.0f;
+    CUDA_CHECK_VOID(cudaMemcpyAsync(&sum, reduce.ptr, sizeof(float),
+        cudaMemcpyDeviceToHost, stream_h));
+    CUDA_CHECK_VOID(cudaStreamSynchronize(stream_h));
+
+    return std::sqrt((double)sum);
+}
+
 DLL_EXPORT int DLL_CALL DN_Create() {
     auto net = std::make_unique<LSTMNet>();
     if (!net->IsInitOK()) return 0;
@@ -2028,8 +2095,17 @@ DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) {
     return net ? net->GetLayerCount() : 0;
 }
 
-DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) { return 0.0; }
-DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) { return 0.0; }
+DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) {
+    std::unique_lock<std::shared_mutex> lk;
+    LSTMNet* net = FindAndLockExclusive(h, lk);
+    return net ? (double)net->GetLayerWeightNorm(l) : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) {
+    std::unique_lock<std::shared_mutex> lk;
+    LSTMNet* net = FindAndLockExclusive(h, lk);
+    return net ? (double)net->GetGradNorm() : 0.0;
+}
 
 DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
     std::unique_lock<std::shared_mutex> lk;
