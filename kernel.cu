@@ -1743,6 +1743,7 @@ public:
         if (!ctx.Init(0)) return MQL_FALSE;
 
         int feature_dim = in_dim / seq_len;
+        if (feature_dim * seq_len != in_dim) return MQL_FALSE;
         if (!BindInputIfNeeded(feature_dim)) return MQL_FALSE;
         if (!BindIntermediateLayers())       return MQL_FALSE;
 
@@ -1942,6 +1943,13 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
     if (!net) return MQL_FALSE;
     net->SetGradClip((float)clip);
     return MQL_TRUE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) {
+    std::unique_lock<std::shared_mutex> lk;
+    LSTMNet* net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    return net->SetOutputLayer(out_dim);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
