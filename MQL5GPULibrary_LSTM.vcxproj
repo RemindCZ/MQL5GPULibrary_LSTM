@@ -87,7 +87,9 @@
     </CudaCompile>
   </ItemGroup>
   <ItemGroup>
-    <Text Include="readme.md" />
+    <Text Include="readme.md">
+      <DeploymentContent>true</DeploymentContent>
+    </Text>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
