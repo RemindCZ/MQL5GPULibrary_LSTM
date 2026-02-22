@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MQL5GPULibrary_LSTM – Dokumentace LSTM</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: Arial, sans-serif; line-height: 1.55; margin: 0; color: #1e293b; background: #f8fafc; }
+    header, main, footer { max-width: 980px; margin: 0 auto; padding: 20px; }
+    header { padding-top: 28px; }
+    h1, h2 { color: #0f172a; }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 18px; margin: 14px 0; box-shadow: 0 3px 12px rgba(15, 23, 42, 0.06); }
+    .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 12px; margin-right: 6px; }
+    code { background: #eff6ff; padding: 2px 6px; border-radius: 6px; }
+    img { width: 100%; max-width: 920px; border-radius: 10px; border: 1px solid #cbd5e1; background: #fff; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+    .metric { padding: 10px; border-radius: 10px; background: #f1f5f9; border: 1px solid #cbd5e1; }
+    footer { color: #475569; font-size: 14px; }
+    .signature { font-weight: 700; color: #0f172a; }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="pill">MetaTrader 5</span>
+    <span class="pill">CUDA</span>
+    <span class="pill">LSTM DLL</span>
+    <h1>LSTM v knihovně MQL5GPULibrary_LSTM</h1>
+    <p>
+      Tato dokumentace vysvětluje, jak DLL implementuje a používá LSTM síť:
+      od načtení sekvenčních dat až po asynchronní trénování a predikci.
+    </p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1) Co LSTM řeší v této DLL</h2>
+      <p>
+        LSTM (Long Short-Term Memory) zpracovává časové sekvence tak, aby si model
+        udržel kontext z předchozích kroků. V této DLL je LSTM použito pro finanční
+        časové řady v MT5: model dostane sekvenci vstupů <code>X</code>, naučí se vztah
+        k cíli <code>T</code> a vrací predikci <code>Y</code>.
+      </p>
+      <div class="grid" id="lstm-metrics"></div>
+    </section>
+
+    <section class="card">
+      <h2>2) Tok dat a trénování</h2>
+      <img src="./lstm-flow.svg" alt="Schéma toku dat LSTM DLL" />
+      <p>
+        Schéma ukazuje praktické API pořadí: <code>DN_Create</code> → konfigurace
+        vrstev a sekvence → <code>DN_LoadBatch</code> → <code>DN_TrainAsync</code>
+        → polling přes <code>DN_GetTrainingStatus</code> → <code>DN_PredictBatch</code>.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>3) Klíčové body implementace</h2>
+      <ul>
+        <li>Vstupy jsou sekvence o délce <code>seq_len</code>, rozměr <code>in</code> musí sedět na architekturu.</li>
+        <li>Trénování běží asynchronně, takže MT5 vlákno může dál vykreslovat indikátor.</li>
+        <li>Volání <code>DN_SnapshotWeights</code> / <code>DN_RestoreWeights</code> chrání před degradací modelu při retrainu.</li>
+        <li>Výstupní dimenze se nastaví přes <code>DN_SetOutputDim</code> a musí odpovídat targetu.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <p class="signature">Remind Tomáš Bělák</p>
+  </footer>
+
+  <script src="./app.js"></script>
+</body>
+</html>

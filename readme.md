@@ -338,6 +338,19 @@ Returns last DLL error message as UTF-16-like short buffer.
 
 ---
 
+
+## Interaktivní HTML dokumentace
+
+K repozitáři byla doplněna vizuální dokumentace vysvětlující funkci LSTM v DLL:
+
+- `docs/index.html`
+- `docs/app.js`
+- `docs/lstm-flow.svg`
+
+Dokumentaci otevřete v prohlížeči přes `docs/index.html`.
+
+---
+
 ## Důležité poznámky k datům
 
 - `seq_len` musí souhlasit mezi konfigurací (`DN_SetSequenceLength`) a daty (`DN_LoadBatch`, `DN_PredictBatch`).
