@@ -134,3 +134,20 @@ Doporučený postup:
 ## Licence
 
 Projekt je licencovaný pod MIT licencí. Podrobnosti jsou v `LICENSE.txt`.
+
+## Přiložený indikátor pro MT5
+
+V repozitáři je i ukázkový indikátor `MQL5/Indicators/LSTMTrendStart.mq5`, který používá tuto DLL pro detekci začínajícího trendu:
+
+- trénuje model nad posledním oknem historických dat (returns)
+- periodicky spouští asynchronní přeučení
+- na každé nové svíčce predikuje trend score
+- vykreslí šipku nahoru/dolů při překročení prahu `InpSignalThreshold`
+
+### Nasazení v MetaTrader 5
+
+1. Zkopírujte `MQL5GPULibrary_LSTM.dll` do `MQL5\Libraries`.
+2. Zkopírujte `MQL5/Indicators/LSTMTrendStart.mq5` do `MQL5\Indicators` (datová složka terminálu).
+3. V MetaEditoru indikátor zkompilujte.
+4. V MT5 zapněte **Allow DLL imports**.
+5. Přidejte indikátor do grafu a upravte inputy (sekvence, retrain interval, threshold) podle trhu/timeframu.
