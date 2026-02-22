@@ -58,31 +58,6 @@
 
     .lead { color: var(--muted); max-width: 900px; font-size: 1.05rem; }
 
-    .quick-links {
-      margin-top: 18px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
-    .quick-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 8px 14px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      color: #d6e7ff;
-      text-decoration: none;
-      font-weight: 600;
-      background: rgba(34, 53, 108, 0.4);
-    }
-
-    .quick-link:hover {
-      border-color: rgba(99, 179, 255, 0.65);
-      background: rgba(42, 66, 132, 0.55);
-    }
-
     .grid {
       display: grid;
       gap: 18px;
@@ -194,10 +169,6 @@
     </div>
     <h1>MQL5GPULibrary_LSTM<br/>produkční DLL pro sekvenční predikce v MT5</h1>
     <p class="lead">Dokumentace je aktualizována dle aktuálního zdrojového kódu <code>kernel.cu</code>. Zaměřuje se na API exporty, threading model, interní GPU pipeline, serializaci stavu modelu a doporučený workflow pro robustní nasazení v indikátorech a expertech.</p>
-    <div class="quick-links">
-      <a class="quick-link" href="https://remind.cz/DLL/MQL5GPULibrary_LSTM.html" target="_blank" rel="noopener noreferrer">Online dokumentace</a>
-      <a class="quick-link" href="https://remind.cz/" target="_blank" rel="noopener noreferrer">Web autora</a>
-    </div>
   </header>
 
   <main class="container">
@@ -240,6 +211,17 @@ DN_TrainAsync(h, 120, 0.0008, 0.001, 0.00001);
 </code></pre>
       </article>
     </section>
+
+<section class="panel container" style="margin-top:20px;">
+  <h2>Autor projektu</h2>
+  <p>
+    Tomáš Bělák —
+    <a href="https://github.com/RemindCZ/MQL5GPULibrary_LSTM" target="_blank" style="color:#63b3ff;">
+      GitHub repozitář projektu MQL5GPULibrary_LSTM
+    </a>
+  </p>
+</section>
+
   </main>
 
   <footer class="container">
