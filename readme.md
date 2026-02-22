@@ -1,193 +1,103 @@
-﻿
-Here is a comprehensive and professional README.md file tailored for your GitHub repository. It highlights the high-performance nature of the library and documents the API clearly.
-MQL5-GPU-LSTM: CUDA Accelerated Neural Network Library
-![alt text](https://img.shields.io/badge/CUDA-11%2B-green.svg)
+# MQL5GPULibrary_LSTM
 
-![alt text](https://img.shields.io/badge/Platform-Windows%20x64-blue.svg)
+MQL5GPULibrary_LSTM je dynamická knihovna pro Windows x64, která umožňuje trénování a inferenci LSTM sítí přes CUDA přímo z prostředí MetaTrader 5 (MQL5).
 
-![alt text](https://img.shields.io/badge/MQL5-Compatible-orange.svg)
+Knihovna je navržená pro nízkou latenci a průběžný provoz. Trénování je možné spustit asynchronně, takže terminál může dál zpracovávat tick data a strategii.
 
-# MQL5-GPU-LSTM
+## Hlavní vlastnosti
 
-CUDA-Accelerated Neural Network Library for MetaTrader 5
+- akcelerace výpočtů na NVIDIA GPU přes CUDA
+- asynchronní trénování ve worker vlákně
+- vícevstvé LSTM s konfigurací rozměrů po vrstvách
+- gradient clipping
+- snapshot a obnova vah
+- serializace a deserializace stavu modelu
 
-MQL5-GPU-LSTM is a high-performance dynamic link library designed to bring deep learning capabilities directly into MetaTrader 5 (MQL5). Unlike traditional CPU-based solutions, it leverages NVIDIA GPUs through CUDA, cuBLAS, and cuRAND to train and execute multi-layer LSTM networks significantly faster.
+## Požadavky
 
-A feature of the library is asynchronous training. Heavy computations run in a background thread, allowing the MetaTrader terminal to remain fully responsive while continuing to process ticks and update the user interface.
+- Windows 64-bit
+- MetaTrader 5 64-bit
+- NVIDIA GPU
+- nainstalovaný CUDA runtime kompatibilní s použitou verzí DLL
 
----
+V prostředí, kde běží MT5, musí být dostupné příslušné CUDA knihovny (například `cudart64_*.dll`, `cublas64_*.dll`, `curand64_*.dll`).
 
-## Features
+## Instalace
 
-Pure CUDA implementation  
-Built on top of cuBLAS for matrix operations and cuRAND for random number generation to achieve maximum throughput.
+1. Zkopírujte `MQL5GPULibrary_LSTM.dll` do složky `MQL5\Libraries` v datovém adresáři MetaTraderu.
+2. V MT5 zapněte povolení DLL importů v nastavení Expert Advisors.
+3. V MQL5 skriptu nebo EA použijte `#import` se správnými signaturami funkcí.
 
-Asynchronous training  
-Model training runs in a background thread without blocking the terminal UI.
+## Exportované API
 
-Multi-layer LSTM support  
-Allows stacking multiple LSTM layers with arbitrary hidden sizes.
+Níže je přehled exportů z DLL podle aktuální implementace.
 
-Modern optimization  
-Implements the AdamW optimizer with weight decay and gradient clipping.
+### Správa instance
 
-Dropout regularization  
-Supports inverted dropout for improved training stability.
+- `int DN_Create()`
+- `void DN_Free(int h)`
 
-Memory efficiency  
-Uses persistent GPU buffers to minimize allocation overhead during real-time trading.
+### Konfigurace
 
-State serialization  
-Full network state, including weights and optimizer moments, can be saved and restored using MQL5 byte arrays.
+- `bool DN_SetSequenceLength(int h, int seq_len)`
+- `bool DN_SetMiniBatchSize(int h, int mbs)`
+- `bool DN_AddLayerEx(int h, int in, int out, int act, int ln, double drop)`
+- `bool DN_SetGradClip(int h, double clip)`
 
----
+### Data a inference
 
-## Requirements
+- `bool DN_LoadBatch(int h, const double* X, const double* T, int batch, int in, int out, int l)`
+- `bool DN_PredictBatch(int h, const double* X, int batch, int in, int l, double* Y)`
 
-NVIDIA GPU (Compute Capability 6.0 or higher recommended)  
-Up-to-date NVIDIA drivers  
-MetaTrader 5 (64-bit)  
+### Trénování
 
-Required CUDA runtime libraries must be available in the system PATH or in the MT5 Libraries folder:
+- `bool DN_TrainAsync(int h, int epochs, double target_mse, double lr, double wd)`
+- `int DN_GetTrainingStatus(int h)`
+- `void DN_GetTrainingResult(int h, double* out_mse, int* out_epochs)`
+- `void DN_StopTraining(int h)`
 
-cudart64_xx.dll  
-cublas64_xx.dll  
-curand64_xx.dll  
+Stavy trénování:
 
----
+- `0` nečinný stav
+- `1` běží trénování
+- `2` trénování dokončeno
+- `-1` chyba nebo neplatný handle
 
-## Installation
+### Stav modelu a diagnostika
 
-1. Download the compiled MQL5GPULibrary_LSTM.dll file.
+- `bool DN_SnapshotWeights(int h)`
+- `bool DN_RestoreWeights(int h)`
+- `int DN_GetLayerCount(int h)`
+- `double DN_GetLayerWeightNorm(int h, int l)`
+- `double DN_GetGradNorm(int h)`
+- `int DN_SaveState(int h)`
+- `bool DN_GetState(int h, char* buf, int max_len)`
+- `bool DN_LoadState(int h, const char* buf)`
+- `void DN_GetError(short* buf, int len)`
 
-2. Place the DLL into the MetaTrader 5 data folder:
+Poznámka: některé diagnostické funkce mohou vracet pouze výchozí hodnoty podle aktuální verze implementace.
 
-MQL5\Libraries
+## Základní příklad pro MQL5
 
-3. Enable DLL imports in MetaTrader:
-
-Tools → Options → Expert Advisors → Allow DLL imports
-
----
-
-## API Documentation
-
-The library exports stdcall functions compatible with MQL5.
-
----
-
-### Instance Management
-
-DN_Create()  
-Creates a new LSTM network instance on the GPU and returns an integer handle.
-
-DN_Free(int h)  
-Releases all GPU resources associated with the given handle.
-
----
-
-### Configuration and Architecture
-
-DN_SetSequenceLength(int h, int seq_len)  
-Sets the time-step lookback window size.
-
-DN_SetMiniBatchSize(int h, int batch_size)  
-Sets the mini-batch size used during training.
-
-DN_AddLayerEx(int h, int in, int out, int act, int ln, double dropout)  
-Adds an LSTM layer.  
-"in" defines input dimension, "out" defines hidden size.  
-"act" and "ln" are reserved parameters.  
-"dropout" specifies dropout probability between 0.0 and 1.0.
-
-DN_SetOutputDim(int h, int out_dim)  
-Defines the dimension of the final dense output layer.
-
-DN_SetGradClip(int h, double clip)  
-Sets gradient clipping threshold to prevent exploding gradients.
-
----
-
-### Data Loading
-
-DN_LoadBatch(...)  
-Uploads training data from MQL5 arrays to GPU tensors.
-
----
-
-### Asynchronous Training
-
-DN_TrainAsync(int h, int epochs, double target_mse, double lr, double weight_decay)  
-Starts training in a background thread and returns immediately.
-
-DN_GetTrainingStatus(int h)  
-Returns current training state:
-
-0 = idle  
-1 = running  
-2 = completed  
--1 = error  
-
-DN_GetTrainingResult(int h, double &mse, int &epochs)  
-Retrieves final MSE and epoch count after training completes.
-
-DN_StopTraining(int h)  
-Immediately signals the background thread to stop.
-
----
-
-### Inference
-
-DN_PredictBatch(...)  
-Performs forward pass from input features to output predictions.  
-Dropout is automatically disabled during inference.
-
----
-
-### State Management
-
-DN_SnapshotWeights(int h)  
-Stores the current weights as a reference state.
-
-DN_RestoreWeights(int h)  
-Restores weights from the last snapshot.
-
-DN_SaveState(int h)  
-Serializes the full network state and returns the buffer size.
-
-DN_GetState(int h, char &buffer[], int length)  
-Copies serialized state into an MQL5 array.
-
-DN_LoadState(int h, const char &buffer[])  
-Restores network state from serialized data.
-
----
-
-### Diagnostics
-
-DN_GetError(short &buffer[], int length)  
-Retrieves the last CUDA or cuBLAS error message.
-
-DN_GetGradNorm(int h)  
-Returns the L2 norm of the most recent gradient values.
-
----
-
-## Example Usage in MQL5
-
+```mq5
 #import "MQL5GPULibrary_LSTM.dll"
-int DN_Create();
-int DN_TrainAsync(int h,int epochs,double mse,double lr,double wd);
-int DN_GetTrainingStatus(int h);
+int  DN_Create();
+void DN_Free(int h);
+bool DN_TrainAsync(int h, int epochs, double target_mse, double lr, double wd);
+int  DN_GetTrainingStatus(int h);
+void DN_StopTraining(int h);
 #import
 
-int net_handle = 0;
+int g_net = 0;
 
 int OnInit()
 {
-   net_handle = DN_Create();
+   g_net = DN_Create();
+   if(g_net <= 0)
+      return INIT_FAILED;
 
-   DN_TrainAsync(net_handle, 10000, 0.001, 0.001, 0.0001);
+   if(!DN_TrainAsync(g_net, 2000, 0.001, 0.0005, 0.0001))
+      return INIT_FAILED;
 
    EventSetTimer(1);
    return INIT_SUCCEEDED;
@@ -195,35 +105,32 @@ int OnInit()
 
 void OnTimer()
 {
-   int status = DN_GetTrainingStatus(net_handle);
-
-   if(status == 1)
-      Print("Training in progress");
-
+   int status = DN_GetTrainingStatus(g_net);
    if(status == 2)
    {
-      Print("Training completed");
+      Print("Trénování dokončeno");
       EventKillTimer();
    }
 }
 
----
+void OnDeinit(const int reason)
+{
+   DN_StopTraining(g_net);
+   DN_Free(g_net);
+}
+```
 
-## Building from Source
+## Build ze zdroje
 
-Required tools:
+Projekt obsahuje řešení pro Visual Studio a CUDA (`.sln`, `.vcxproj`, `kernel.cu`).
 
-Visual Studio 2019 or 2022  
-CUDA Toolkit version 11.x or 12.x  
+Doporučený postup:
 
-Recommended project settings:
+1. Otevřete `MQL5GPULibrary_LSTM.sln` ve Visual Studio.
+2. Zvolte konfiguraci `Release` a platformu `x64`.
+3. Ověřte nastavení cesty k CUDA Toolkit.
+4. Proveďte build DLL.
 
-Configuration: Release  
-Platform: x64  
-GPU debug information disabled for maximum performance
+## Licence
 
----
-
-## License
-
-MIT License. See the LICENSE file for full details.
+Projekt je licencovaný pod MIT licencí. Podrobnosti jsou v `LICENSE.txt`.
