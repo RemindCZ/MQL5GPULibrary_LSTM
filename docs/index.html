@@ -3,70 +3,218 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MQL5GPULibrary_LSTM – Dokumentace LSTM</title>
+  <title>MQL5GPULibrary_LSTM — CUDA LSTM DLL</title>
   <style>
-    :root { color-scheme: light; }
-    body { font-family: Arial, sans-serif; line-height: 1.55; margin: 0; color: #1e293b; background: #f8fafc; }
-    header, main, footer { max-width: 980px; margin: 0 auto; padding: 20px; }
-    header { padding-top: 28px; }
-    h1, h2 { color: #0f172a; }
-    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 14px; padding: 18px; margin: 14px 0; box-shadow: 0 3px 12px rgba(15, 23, 42, 0.06); }
-    .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; background: #dbeafe; color: #1d4ed8; font-size: 12px; margin-right: 6px; }
-    code { background: #eff6ff; padding: 2px 6px; border-radius: 6px; }
-    img { width: 100%; max-width: 920px; border-radius: 10px; border: 1px solid #cbd5e1; background: #fff; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
-    .metric { padding: 10px; border-radius: 10px; background: #f1f5f9; border: 1px solid #cbd5e1; }
-    footer { color: #475569; font-size: 14px; }
-    .signature { font-weight: 700; color: #0f172a; }
+    :root {
+      --bg: #070b1b;
+      --bg-soft: #0f1532;
+      --card: rgba(14, 24, 54, 0.78);
+      --line: rgba(130, 162, 255, 0.25);
+      --text: #d9e5ff;
+      --muted: #9bb0df;
+      --accent: #63b3ff;
+      --accent-2: #9a7dff;
+      --ok: #5de2b1;
+      --warn: #ffd166;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+      background:
+        radial-gradient(circle at 10% 10%, #1a2d64 0%, rgba(26,45,100,0) 45%),
+        radial-gradient(circle at 90% 15%, #341d7a 0%, rgba(52,29,122,0) 35%),
+        linear-gradient(160deg, #060a17 0%, #050716 60%, #03040d 100%);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    .container { width: min(1200px, 92vw); margin: 0 auto; }
+
+    .hero {
+      padding: 56px 0 30px;
+    }
+
+    .badges { display: flex; flex-wrap: wrap; gap: 10px; }
+    .badge {
+      border: 1px solid var(--line);
+      padding: 4px 11px;
+      border-radius: 999px;
+      color: #c7dcff;
+      background: rgba(28, 47, 97, 0.5);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+    }
+
+    h1 {
+      margin: 16px 0 10px;
+      font-size: clamp(2rem, 4.6vw, 4rem);
+      line-height: 1.08;
+      max-width: 850px;
+      text-shadow: 0 6px 24px rgba(80, 121, 255, 0.33);
+    }
+
+    .lead { color: var(--muted); max-width: 900px; font-size: 1.05rem; }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(170deg, rgba(20, 32, 72, 0.86), rgba(10, 17, 40, 0.76));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 14px 30px rgba(2, 5, 22, 0.55);
+      backdrop-filter: blur(6px);
+      padding: 18px;
+    }
+
+    h2 { margin: 0 0 10px; font-size: 1.45rem; }
+    h3 { margin: 0 0 8px; font-size: 1.05rem; }
+    p { margin: 0; }
+
+    section { margin: 16px 0 18px; }
+
+    .stats .value {
+      font-size: 1.45rem;
+      font-weight: 700;
+      color: #eaf1ff;
+      margin-bottom: 3px;
+    }
+
+    .flow-img {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      margin-bottom: 12px;
+      background: #fff;
+    }
+
+    .api-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+      overflow: hidden;
+      border-radius: 14px;
+    }
+
+    .api-table th, .api-table td {
+      border-bottom: 1px solid rgba(117, 146, 230, 0.24);
+      text-align: left;
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+
+    .api-table th {
+      color: #b9cbf4;
+      background: rgba(34, 53, 108, 0.5);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .tag { font-size: 0.73rem; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--line); }
+    .tag.async { color: #c0f8e7; border-color: rgba(93,226,177,.4); }
+    .tag.sync { color: #c7dcff; }
+
+    code {
+      font-family: Consolas, "SFMono-Regular", monospace;
+      color: #d8ebff;
+      background: rgba(23, 39, 87, 0.72);
+      border: 1px solid rgba(109, 139, 220, 0.35);
+      border-radius: 6px;
+      padding: 1px 6px;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      border-radius: 12px;
+      background: rgba(5, 12, 31, 0.9);
+      border: 1px solid rgba(118, 149, 233, 0.3);
+      overflow: auto;
+      color: #d7e6ff;
+    }
+
+    .timeline { display: grid; gap: 10px; }
+    .step {
+      display: grid;
+      grid-template-columns: 36px 1fr;
+      gap: 10px;
+      align-items: start;
+    }
+    .step .n {
+      width: 34px; height: 34px; border-radius: 11px;
+      display: grid; place-items: center;
+      font-weight: 700;
+      color: #09132f;
+      background: linear-gradient(160deg, #7ec5ff, #d0dbff);
+      box-shadow: 0 6px 16px rgba(126,197,255,0.35);
+    }
+
+    footer { color: #91a9de; padding: 24px 0 40px; font-size: .9rem; }
   </style>
 </head>
 <body>
-  <header>
-    <span class="pill">MetaTrader 5</span>
-    <span class="pill">CUDA</span>
-    <span class="pill">LSTM DLL</span>
-    <h1>LSTM v knihovně MQL5GPULibrary_LSTM</h1>
-    <p>
-      Tato dokumentace vysvětluje, jak DLL implementuje a používá LSTM síť:
-      od načtení sekvenčních dat až po asynchronní trénování a predikci.
-    </p>
+  <header class="hero container">
+    <div class="badges">
+      <span class="badge">MetaTrader 5</span>
+      <span class="badge">CUDA + cuBLAS + cuRAND</span>
+      <span class="badge">LSTM DLL v1.3.0</span>
+      <span class="badge">Asynchronní trénink</span>
+    </div>
+    <h1>MQL5GPULibrary_LSTM<br/>produkční DLL pro sekvenční predikce v MT5</h1>
+    <p class="lead">Dokumentace je aktualizována dle aktuálního zdrojového kódu <code>kernel.cu</code>. Zaměřuje se na API exporty, threading model, interní GPU pipeline, serializaci stavu modelu a doporučený workflow pro robustní nasazení v indikátorech a expertech.</p>
   </header>
 
-  <main>
-    <section class="card">
-      <h2>1) Co LSTM řeší v této DLL</h2>
-      <p>
-        LSTM (Long Short-Term Memory) zpracovává časové sekvence tak, aby si model
-        udržel kontext z předchozích kroků. V této DLL je LSTM použito pro finanční
-        časové řady v MT5: model dostane sekvenci vstupů <code>X</code>, naučí se vztah
-        k cíli <code>T</code> a vrací predikci <code>Y</code>.
-      </p>
-      <div class="grid" id="lstm-metrics"></div>
+  <main class="container">
+    <section class="grid stats" id="runtime-stats"></section>
+
+    <section class="panel">
+      <h2>Architektura a tok dat</h2>
+      <img src="./lstm-flow.svg" alt="Tok dat a API orchestrace LSTM DLL" class="flow-img"/>
+      <p class="lead">Model pracuje se sekvencemi o délce <code>seq_len</code>, používá sloupcově orientované matice (column-major) pro cuBLAS a drží trénovací data v persistentních GPU bufferech. Každá instance modelu má vlastní handle, vlastní synchronizační primitiva a bezpečný lifecycle při uvolnění.</p>
     </section>
 
-    <section class="card">
-      <h2>2) Tok dat a trénování</h2>
-      <img src="./lstm-flow.svg" alt="Schéma toku dat LSTM DLL" />
-      <p>
-        Schéma ukazuje praktické API pořadí: <code>DN_Create</code> → konfigurace
-        vrstev a sekvence → <code>DN_LoadBatch</code> → <code>DN_TrainAsync</code>
-        → polling přes <code>DN_GetTrainingStatus</code> → <code>DN_PredictBatch</code>.
-      </p>
+    <section class="grid" id="feature-cards"></section>
+
+    <section class="panel">
+      <h2>Stavy asynchronního tréninku</h2>
+      <div class="grid" id="state-cards"></div>
     </section>
 
-    <section class="card">
-      <h2>3) Klíčové body implementace</h2>
-      <ul>
-        <li>Vstupy jsou sekvence o délce <code>seq_len</code>, rozměr <code>in</code> musí sedět na architekturu.</li>
-        <li>Trénování běží asynchronně, takže MT5 vlákno může dál vykreslovat indikátor.</li>
-        <li>Volání <code>DN_SnapshotWeights</code> / <code>DN_RestoreWeights</code> chrání před degradací modelu při retrainu.</li>
-        <li>Výstupní dimenze se nastaví přes <code>DN_SetOutputDim</code> a musí odpovídat targetu.</li>
-      </ul>
+    <section class="panel">
+      <h2>Kompletní DLL API (exporty)</h2>
+      <table class="api-table" id="api-table"></table>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Referenční workflow v MQL5</h2>
+        <div class="timeline" id="workflow"></div>
+      </article>
+      <article class="panel">
+        <h2>Ukázka orchestrace</h2>
+<pre><code>int h = DN_Create();
+DN_SetSequenceLength(h, 32);
+DN_SetMiniBatchSize(h, 64);
+DN_AddLayerEx(h, 16, 64, 0, 0, 0.10);
+DN_AddLayerEx(h, 64, 32, 0, 0, 0.05);
+DN_SetOutputDim(h, 1);
+DN_LoadBatch(h, X, T, batch, 512, 1, 0);
+DN_TrainAsync(h, 120, 0.0008, 0.001, 0.00001);
+// poll DN_GetTrainingStatus(...), then DN_PredictBatch(...)
+</code></pre>
+      </article>
     </section>
   </main>
 
-  <footer>
-    <p class="signature">Remind Tomáš Bělák</p>
+  <footer class="container">
+    Dokumentace: DLL exporty a runtime chování synchronizované s aktuálním zdrojovým kódem projektu MQL5GPULibrary_LSTM.
   </footer>
 
   <script src="./app.js"></script>
