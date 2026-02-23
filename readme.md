@@ -1,5 +1,14 @@
 # MQL5GPULibrary_LSTM
 
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![Open Source](https://img.shields.io/badge/Open%20Source-Yes-brightgreen.svg)
+
+**Open-source status:** This project is fully open source under the MIT License (`LICENSE.txt`). You can use, modify, and redistribute it for commercial and non-commercial purposes.
+
+**GitHub short description (recommended):** CUDA-accelerated open-source LSTM DLL for MetaTrader 5 with asynchronous training, dropout, checkpointing, and model serialization.
+
+**Project icon:** `PROJECT_ICON.svg` (ready to use as repository avatar or documentation asset).
+
 MQL5GPULibrary_LSTM is a 64-bit CUDA-accelerated DLL for MetaTrader 5 that provides a multi-layer LSTM model with asynchronous training, dropout support, model checkpointing, and state serialization. The repository also includes an MT5 indicator example (`MQL5/Indicators/LSTMTrendStart.mq5`) that demonstrates practical usage for financial time series prediction.
 
 ## Project Scope
