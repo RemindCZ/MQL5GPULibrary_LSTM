@@ -1,22 +1,22 @@
 const runtimeStats = [
-  { value: "v1.3.0", title: "Verze runtime", text: "Aktuální hlavička v kernel.cu deklaruje LSTM DLL v1.3.0." },
+  { value: "v1.4.0", title: "Verze runtime", text: "Aktuální hlavička v kernel.cu deklaruje LSTM DLL v1.4.0." },
   { value: "column-major", title: "Maticový layout", text: "Všechny GEMM operace jsou orientované pro nativní cuBLAS pořadí." },
-  { value: "std::shared_mutex", title: "Thread safety", text: "Každý model má vlastní zámek a atomické stavy tréninku." },
-  { value: "GPU persistent buffers", title: "Správa dat", text: "Trénovací batch je držen na GPU pro opakované epochy bez reloadu." }
+  { value: "std::shared_mutex + atomics", title: "Thread safety", text: "Modely kombinují zámky pro mutace a lock-free čtení stavu/progressu." },
+  { value: "Progress API", title: "Telemetry", text: "DN_GetProgress* a DN_GetProgressAll zpřístupňují živé metriky tréninku." }
 ];
 
 const featureCards = [
   { title: "Multi-layer LSTM", text: "Přidávání vrstev přes DN_AddLayerEx + samostatná výstupní projekce DN_SetOutputDim." },
   { title: "Asynchronní trénink", text: "DN_TrainAsync spustí worker thread a MT5 může mezitím pokračovat v OnTimer/OnCalculate." },
+  { title: "Progress reporting", text: "Epocha, mini-batch, LR, MSE, best-MSE, grad norm, ETA i procenta dokončení bez blokace." },
   { title: "Checkpointing", text: "DN_SnapshotWeights a DN_RestoreWeights chrání model před degradací během experimentů." },
   { title: "Serializace stavu", text: "DN_SaveState / DN_GetState / DN_LoadState umožňují přenos modelu ve textové podobě LSTM_V1." },
-  { title: "Diagnostika", text: "Normy vah, normy gradientů a centrální chybová hláška přes DN_GetError(short*)." },
   { title: "CUDA kontext", text: "Per-thread GPUContext drží stream, cuBLAS handle i cuRAND generator v RAII režimu." }
 ];
 
 const trainingStates = [
-  { code: "0", label: "TS_IDLE", description: "Model neprovádí trénink nebo už doběhl a čeká na další instrukce." },
-  { code: "1", label: "TS_TRAINING", description: "Asynchronní worker aktivně učí model. Lze průběžně pollovat stav." },
+  { code: "0", label: "TS_IDLE", description: "Model netrénuje nebo doběhl a čeká na další instrukce." },
+  { code: "1", label: "TS_TRAINING", description: "Asynchronní worker aktivně učí model. Progress lze průběžně pollovat." },
   { code: "2", label: "TS_COMPLETED", description: "Trénink dokončen. Výsledek lze načíst přes DN_GetTrainingResult." },
   { code: "-1", label: "TS_ERROR", description: "Došlo k chybě. Detail vrací DN_GetError." }
 ];
@@ -37,6 +37,19 @@ const apiRows = [
   ["DN_GetTrainingStatus", "Trénink", "async", "Lock-free polling stavu běhu tréninku."],
   ["DN_GetTrainingResult", "Trénink", "async", "Vrátí finální MSE a počet epoch."],
   ["DN_StopTraining", "Trénink", "async", "Nastaví stop flag a nechá worker bezpečně doběhnout."],
+  ["DN_GetProgressEpoch", "Progress", "async", "Aktuální epocha."],
+  ["DN_GetProgressTotalEpochs", "Progress", "async", "Celkový počet epoch v běžícím tréninku."],
+  ["DN_GetProgressMiniBatch", "Progress", "async", "Aktuální mini-batch v epoše."],
+  ["DN_GetProgressTotalMiniBatches", "Progress", "async", "Počet mini-batchů na epochu."],
+  ["DN_GetProgressLR", "Progress", "async", "Aktuální learning rate."],
+  ["DN_GetProgressMSE", "Progress", "async", "Poslední spočtené MSE."],
+  ["DN_GetProgressBestMSE", "Progress", "async", "Nejlepší dosud naměřené MSE."],
+  ["DN_GetProgressGradNorm", "Progress", "async", "Aktuální gradient norm."],
+  ["DN_GetProgressTotalSteps", "Progress", "async", "Celkem trénovacích kroků."],
+  ["DN_GetProgressPercent", "Progress", "async", "Procento dokončení tréninku."],
+  ["DN_GetProgressElapsedSec", "Progress", "async", "Uplynulý čas tréninku v sekundách."],
+  ["DN_GetProgressETASec", "Progress", "async", "Odhad zbývajícího času v sekundách."],
+  ["DN_GetProgressAll", "Progress", "async", "Bulk getter hlavních progress metrik jedním voláním."],
   ["DN_GetLayerCount", "Diagnostika", "sync", "Počet aktivních vrstev (LSTM + output layer)."],
   ["DN_GetLayerWeightNorm", "Diagnostika", "sync", "L2 norma vah vybrané vrstvy."],
   ["DN_GetGradNorm", "Diagnostika", "sync", "Agregovaná L2 norma gradient bufferů."],
@@ -48,11 +61,12 @@ const apiRows = [
 
 const workflowSteps = [
   "DN_Create + ověření handle.",
-  "Nastavení sekvence, batch size a LSTM vrstev.",
-  "Nastavení výstupní dimenze a načtení batch dat.",
+  "Nastavení seq_len, mini-batch a LSTM vrstev.",
+  "DN_SetOutputDim a DN_LoadBatch.",
   "Volitelně snapshot vah před tréninkem.",
-  "DN_TrainAsync + polling stavu přes DN_GetTrainingStatus.",
-  "Vyčtení výsledku tréninku a případný restore snapshotu.",
+  "DN_TrainAsync + polling DN_GetTrainingStatus.",
+  "Průběžné čtení DN_GetProgressAll (nebo DN_GetProgress*).",
+  "DN_GetTrainingResult po doběhu nebo stopu.",
   "DN_PredictBatch v runtime smyčce indikátoru.",
   "DN_Free při deinitu bez dangling vláken."
 ];
