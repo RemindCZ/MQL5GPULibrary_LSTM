@@ -1,986 +1,271 @@
+//+------------------------------------------------------------------+
+//| LSTM_RealTimePredictor.mq5                           v2.1        |
+//| GPU-optimized real-time LSTM price predictor                     |
+//| All NN computation on GPU via MQL5GPULibrary_LSTM.dll            |
+//|                                                                  |
+//| v2.1 Changes:                                                    |
+//|  - Uses new DN_GetProgressAll() for real-time training progress  |
+//|  - Accurate ETA from GPU-side timing                             |
+//|  - Live MSE, LR, grad norm display during training               |
+//|  - Enhanced progress bar with detailed training metrics          |
+//+------------------------------------------------------------------+
+#property copyright "Tomáš Bělák"
+#property link      "https://remind.cz/"
+#property description "LSTM Real-Time Predictor (GPU): real-time predikce ceny pomocí LSTM sítě počítané na GPU přes MQL5GPULibrary_LSTM.dll. Zobrazuje predikovanou cenu, horní/dolní pásmo nejistoty a sílu trendu. Podporuje asynchronní trénink na GPU s živým průběhem (MSE, LR, grad norm, ETA) a dávkovou predikci pro vysoký výkon."
+#property version   "2.10"
 #property strict
-#property indicator_separate_window
-#property indicator_buffers 4
-#property indicator_plots   3
-#property version "1.31"
+#property indicator_chart_window
+#property indicator_buffers 8
+#property indicator_plots   4
 
-// Plot 0: Expected Move %
-#property indicator_label1  "ExpectedMove %"
+#property indicator_label1  "Predicted Price"
 #property indicator_type1   DRAW_LINE
+#property indicator_color1  clrDodgerBlue
 #property indicator_style1  STYLE_SOLID
 #property indicator_width1  2
-#property indicator_color1  clrDodgerBlue
 
-// Plot 1: Low Threshold
-#property indicator_label2  "Thr Low"
+#property indicator_label2  "Upper Band"
 #property indicator_type2   DRAW_LINE
+#property indicator_color2  clrLightSkyBlue
 #property indicator_style2  STYLE_DOT
 #property indicator_width2  1
-#property indicator_color2  clrLime
 
-// Plot 2: High Threshold
-#property indicator_label3  "Thr High"
+#property indicator_label3  "Lower Band"
 #property indicator_type3   DRAW_LINE
+#property indicator_color3  clrLightSkyBlue
 #property indicator_style3  STYLE_DOT
 #property indicator_width3  1
-#property indicator_color3  clrRed
 
-// ============================================================================
-// DLL API — asynchronní NN
-// ============================================================================
+#property indicator_label4  "Trend Strength"
+#property indicator_type4   DRAW_HISTOGRAM
+#property indicator_color4  clrLime,clrRed
+#property indicator_style4  STYLE_SOLID
+#property indicator_width4  3
+
+//+------------------------------------------------------------------+
+//| DLL Import                                                        |
+//+------------------------------------------------------------------+
 #import "MQL5GPULibrary_LSTM.dll"
-int    DN_Create();
-void   DN_Free(int h);
-int    DN_SetSequenceLength(int h, int seq_len);
-int    DN_SetMiniBatchSize(int h, int mbs);
-int    DN_AddLayerEx(int h, int in_dim, int out_dim, int act, int use_ln, double dropout);
-int    DN_SetGradClip(int h, double clip);
-int    DN_LoadBatch(int h, const double &X[], const double &T[], int batch, int in_dim, int out_dim, int layout);
-int    DN_PredictBatch(int h, const double &X[], int batch, int in_dim, int layout, double &out_Y[]);
-int    DN_SnapshotWeights(int h);
-int    DN_RestoreWeights(int h);
-double DN_GetGradNorm(int h);
-void   DN_GetError(short &buf[], int len);
+   int    DN_Create();
+   void   DN_Free(int h);
+   int    DN_SetSequenceLength(int h, int seq_len);
+   int    DN_SetMiniBatchSize(int h, int mbs);
+   int    DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
+   int    DN_SetOutputDim(int h, int out_dim);
+   int    DN_SetGradClip(int h, double clip);
+   int    DN_LoadBatch(int h, const double &X[], const double &T[],
+                       int batch, int in_dim, int out_dim, int layout);
+   int    DN_TrainAsync(int h, int epochs, double target_mse,
+                        double lr, double wd);
+   int    DN_GetTrainingStatus(int h);
+   void   DN_GetTrainingResult(int h, double &out_mse, int &out_epochs);
+   void   DN_StopTraining(int h);
+   int    DN_PredictBatch(int h, const double &X[], int batch,
+                          int in_dim, int layout, double &Y[]);
+   int    DN_SnapshotWeights(int h);
+   int    DN_RestoreWeights(int h);
+   int    DN_GetLayerCount(int h);
+   double DN_GetLayerWeightNorm(int h, int layer);
+   double DN_GetGradNorm(int h);
+   int    DN_SaveState(int h);
+   int    DN_GetState(int h, char &buf[], int max_len);
+   int    DN_LoadState(int h, const char &buf[]);
+   void   DN_GetError(short &buf[], int len);
 
-// Async
-int    DN_TrainAsync(int h, int epochs, double target_mse, double lr, double wd);
-int    DN_GetTrainingStatus(int h); // 0=IDLE, 1=RUNNING, 2=COMPLETED, -1=ERROR
-void   DN_GetTrainingResult(int h, double &out_mse, int &out_epochs);
-void   DN_StopTraining(int h);
+   // Progress monitoring (lock-free, safe during training)
+   int    DN_GetProgressEpoch(int h);
+   int    DN_GetProgressTotalEpochs(int h);
+   int    DN_GetProgressMiniBatch(int h);
+   int    DN_GetProgressTotalMiniBatches(int h);
+   double DN_GetProgressLR(int h);
+   double DN_GetProgressMSE(int h);
+   double DN_GetProgressBestMSE(int h);
+   double DN_GetProgressGradNorm(int h);
+   int    DN_GetProgressTotalSteps(int h);
+   double DN_GetProgressPercent(int h);
+   double DN_GetProgressElapsedSec(int h);
+   double DN_GetProgressETASec(int h);
+   int    DN_GetProgressAll(int h,
+             int &epoch, int &total_epochs,
+             int &mb, int &total_mb,
+             double &lr, double &mse, double &best_mse,
+             double &grad_norm, double &pct,
+             double &elapsed_sec, double &eta_sec);
 #import
 
-// ============================================================================
-// Inputs
-// ============================================================================
-input group "═══ Symboly ═══"
-input string InpExtraSymbol1 = "EURUSD";
-input string InpExtraSymbol2 = "XAUUSD";
+//+------------------------------------------------------------------+
+//| Inputs                                                            |
+//+------------------------------------------------------------------+
+input group "=== Architecture ==="
+input int      InpLookback        = 30;
+input int      InpHiddenSize1     = 96;       // Layer-1 hidden (larger for GPU)
+input int      InpHiddenSize2     = 48;       // Layer-2 hidden
+input int      InpHiddenSize3     = 0;        // Layer-3 hidden (0 = off)
+input int      InpPredictAhead    = 5;
+input double   InpDropout         = 0.10;
+
+input group "=== Training (GPU) ==="
+input int      InpTrainBars       = 5000;     // Max training bars (fills VRAM)
+input int      InpInitialEpochs   = 300;
+input int      InpRetrainEpochs   = 80;
+input int      InpRetrainInterval = 200;
+input double   InpLearningRate    = 0.0008;
+input double   InpWeightDecay     = 0.0001;
+input double   InpTargetMSE       = 0.005;
+input int      InpMiniBatch       = 64;       // GPU mini-batch
+
+input group "=== Prediction (GPU Batch) ==="
+input int      InpPredictBatch    = 512;      // Predict this many bars per GPU call
+input int      InpMaxPredictBars  = 2000;     // Max bars to predict backwards
+
+input group "=== Display ==="
+input bool     InpShowFutureLine  = true;
+input bool     InpShowConfidence  = true;
+input int      InpFutureBars      = 10;
+input color    InpBullColor       = clrLime;
+input color    InpBearColor       = clrRed;
+input int      InpInfoCorner      = 0;
+input int      InpProgressWidth   = 260;
+input int      InpProgressHeight  = 18;
+
+input group "=== Advanced ==="
+input double   InpGradClip        = 5.0;
+input bool     InpAutoRetrain     = true;
+input bool     InpSaveModel       = false;
+input string   InpModelFile       = "lstm_v2.bin";
+input bool     InpVerboseLog      = false;    // Print debug info
+
+//+------------------------------------------------------------------+
+//| Feature constants                                                 |
+//+------------------------------------------------------------------+
+#define FEAT_PER_BAR  16
+#define OUTPUT_DIM    3
+
+//+------------------------------------------------------------------+
+//| Globals                                                           |
+//+------------------------------------------------------------------+
+double g_PredictedPrice[];
+double g_UpperBand[];
+double g_LowerBand[];
+double g_TrendStrength[];
+double g_TrendColor[];
+double g_PredDirection[];
+double g_Confidence[];
+double g_Magnitude[];
+
+int    g_NetHandle        = 0;
+bool   g_ModelReady       = false;
+bool   g_IsTraining       = false;
+int    g_LastTrainBar     = 0;
+int    g_TotalBars        = 0;
+double g_LastMSE          = 0.0;
+int    g_TotalEpochs      = 0;
+double g_BestMSE          = 1e10;
+
+int    g_TargetEpochs     = 0;
+int    g_CurrentEpochs    = 0;
+datetime g_TrainStartTime = 0;
+
+int    g_CorrectPred      = 0;
+int    g_TotalPred        = 0;
+
+double g_ATRMean          = 0.0;
+
+// GPU-side progress (updated from DLL) --------------------------------
+int    g_ProgEpoch        = 0;
+int    g_ProgTotalEpochs  = 0;
+int    g_ProgMB           = 0;
+int    g_ProgTotalMB      = 0;
+int    g_ProgTotalSteps   = 0;   // FIX: was used but never declared
+double g_ProgLR           = 0.0;
+double g_ProgMSE          = 0.0;
+double g_ProgBestMSE      = 0.0;
+double g_ProgGradNorm     = 0.0;
+double g_ProgPercent      = 0.0;
+double g_ProgElapsedSec   = 0.0;
+double g_ProgETASec       = 0.0;
+
+// Feature cache -------------------------------------------------------
+double g_FeatureCache[];
+int    g_CacheStartBar   = -1;
+int    g_CachedBars      = 0;
+int    g_CacheValidTo    = -1;
+
+// ATR cache -----------------------------------------------------------
+double g_ATRCache[];
+int    g_ATRCacheStart    = -1;
+int    g_ATRCachedBars    = 0;
 
-input group "═══ Zarovnání času ═══"
-input bool   InpAlignExact   = false;  // exact=true často selže na M15 (BTC 24/7 vs FX seance)
+// Batch prediction bookkeeping ----------------------------------------
+int    g_LastPredictedTo  = -1;
 
-input group "═══ Sekvence a target ═══"
-input int    InpSeqLen       = 32;     // délka sekvence
-input int    InpHorizonH     = 12;     // horizont pro future range (barů dopředu)
-input int    InpHiddenSize   = 64;
-input double InpDropout      = 0.0;
+// VRAM estimate -------------------------------------------------------
+double g_EstVRAM_MB       = 0;
 
-input group "═══ Trénování ═══"
-input int    InpTrainBars    = 12000;  // počet trénovacích vzorků (cílený)
-input int    InpEpochs       = 4000;
-input double InpLR           = 0.002;
-input double InpWD           = 0.00005;
-input double InpTargetMSE    = 0.0005;
-input double InpGradClip     = 3.0;
-input int    InpMiniBatch    = 32;
-input double InpTargetClamp  = 2.5;    // clamp z-score targetu (po log1p)
+string g_FuturePrefix  = "LSTM_F_";
+string g_InfoPrefix    = "LSTM_I_";
+string g_ProgPrefix    = "LSTM_P_";
 
-input group "═══ Prahy a zobrazení ═══"
-input int    InpHistoryLenThr     = 200;  // historie pro adaptivní prahy
-input double InpThrMinPct         = 0.15; // minimální práh v %
-input double InpThrLowPercentile  = 0.50; // percentil low (0..1)
-input double InpThrHighPercentile = 0.85; // percentil high (0..1)
-input int    InpCalcHistory       = 600;  // kolik barů zpět dopočítat křivku
-input bool   InpShowComment       = true;
-
-input group "═══ Filtrace multi-symbol kvality ═══"
-input bool   InpFilterFrozenOtherSymbols = true; // když EURUSD/XAUUSD vrací pořád stejný bar index, sample přeskočit
-input int    InpMinShiftChanges          = 3;    // min. počet změn shiftu v sekvenci (na každém extra symbolu)
-
-input group "═══ Multi-symbol sampling ═══"
-input int    InpAttemptMult = 4; // kolikrát víc pokusů než train_bars (kvůli FX víkendům/seancím)
-
-input group "═══ Anti-spam (retry) ═══"
-input int    InpTrainRetrySec = 30; // minimální čas mezi pokusy spustit trénink po failu
-
-input group "═══ SUPER-DEBUG ═══"
-input bool   InpSuperDebug     = true;    // zapnout detailní debug
-input int    InpDbgMaxLines    = 140;     // max řádků na jeden pokus (anti-spam)
-input bool   InpDbgDumpOnce    = false;   // pokud true, po prvním failu už další dumpy nepojedou
-input int    InpDbgShiftPrintLimit = 12;  // kolik prvních iBarShift řádků tisknout v PrepareData (anti-spam)
-
-// ============================================================================
-// Buffers
-// ============================================================================
-double g_buf_move_pct[];
-double g_buf_thr_low[];
-double g_buf_thr_high[];
-double g_buf_raw[];
-
-// ============================================================================
-// State
-// ============================================================================
-int    g_net = 0;
-bool   g_trained = false;
-bool   g_async_training = false;
-bool   g_init_done = false;
-
-uint   g_train_start_tick = 0;
-bool   g_is_retrain = false;
-
-double g_t_mean = 0.0;
-double g_t_std  = 1.0;
-
-// Threshold history
-double g_abs_hist[];
-int    g_abs_count = 0;
-
-// Symbols
-string g_sym_main;
-string g_sym1;
-string g_sym2;
-
-// Rates cache
-MqlRates g_r_main[];
-MqlRates g_r_1[];
-MqlRates g_r_2[];
-
-// Volume normalization
-double g_vmax_main = 1.0;
-double g_vmax_1    = 1.0;
-double g_vmax_2    = 1.0;
-
-// Retry control
-datetime g_last_train_attempt = 0;
-
-// ============================================================================
-// SUPER-DEBUG infra
-// ============================================================================
-int  g_dbg_lines_left = 0;
-bool g_dbg_failed_once = false;
-int  g_dbg_shift_print_left = 0;
-
-ulong NowUS() { return (ulong)GetMicrosecondCount(); }
-
-void DbgResetBudget()
-{
-   g_dbg_lines_left = InpDbgMaxLines;
-   g_dbg_shift_print_left = InpDbgShiftPrintLimit;
-}
-
-bool DbgCan()
-{
-   if(!InpSuperDebug) return false;
-   if(InpDbgDumpOnce && g_dbg_failed_once) return false;
-   return (g_dbg_lines_left > 0);
-}
-
-void DbgPrint(const string tag, const string msg)
-{
-   if(!DbgCan()) return;
-   Print(tag, " ", msg);
-   g_dbg_lines_left--;
-}
-
-string TFToStr(ENUM_TIMEFRAMES tf)
-{
-   if(tf==PERIOD_M1)  return "M1";
-   if(tf==PERIOD_M5)  return "M5";
-   if(tf==PERIOD_M15) return "M15";
-   if(tf==PERIOD_M30) return "M30";
-   if(tf==PERIOD_H1)  return "H1";
-   if(tf==PERIOD_H4)  return "H4";
-   if(tf==PERIOD_D1)  return "D1";
-   return IntegerToString((int)tf);
-}
-
-string TimeToStrSec(datetime t) { return TimeToString(t, TIME_DATE|TIME_MINUTES|TIME_SECONDS); }
-
-void MarkDbgFail() { g_dbg_failed_once = true; }
-
-// ============================================================================
-// Error helpers
-// ============================================================================
-string GetDLLError()
-{
-   short buf[];
-   ArrayResize(buf, 512);
-   DN_GetError(buf, 512);
-   return ShortArrayToString(buf);
-}
-
-// ============================================================================
-// Safe wrappers for debug
-// ============================================================================
-int SafeCopyRates(const string sym, ENUM_TIMEFRAMES tf, int start, int count, MqlRates &out[])
-{
-   ResetLastError();
-   int got = CopyRates(sym, tf, start, count, out);
-   int le = GetLastError();
-   DbgPrint("[DBG]", StringFormat("CopyRates(%s,%s,start=%d,count=%d) => got=%d, err=%d", sym, TFToStr(tf), start, count, got, le));
-   return got;
-}
-
-int SafeBars(const string sym, ENUM_TIMEFRAMES tf)
-{
-   ResetLastError();
-   int b = Bars(sym, tf);
-   int le = GetLastError();
-   DbgPrint("[DBG]", StringFormat("Bars(%s,%s) => %d, err=%d", sym, TFToStr(tf), b, le));
-   return b;
-}
-
-// iBarShift je drahý a logy snadno zaspamují terminál.
-// Tiskneme jen omezeně (InpDbgShiftPrintLimit) a jen pokud je SUPER-DEBUG.
-int SafeBarShiftLimited(const string sym, ENUM_TIMEFRAMES tf, datetime t, bool exact)
-{
-   ResetLastError();
-   int sh = iBarShift(sym, tf, t, exact);
-   int le = GetLastError();
-
-   if(DbgCan() && g_dbg_shift_print_left > 0)
-   {
-      DbgPrint("[DBG]", StringFormat("iBarShift(%s,%s,time=%s,exact=%s) => sh=%d, err=%d",
-               sym, TFToStr(tf), TimeToStrSec(t), (exact?"true":"false"), sh, le));
-      g_dbg_shift_print_left--;
-   }
-   return sh;
-}
-
-// ============================================================================
-// Threshold history
-// ============================================================================
-void ResetThrHistory()
-{
-   g_abs_count = 0;
-   ArrayResize(g_abs_hist, InpHistoryLenThr);
-}
-
-void PushThrSample(double move_pct, int counter)
-{
-   double v = MathAbs(move_pct);
-   int idx = (g_abs_count < InpHistoryLenThr) ? g_abs_count : (counter % InpHistoryLenThr);
-   if(ArraySize(g_abs_hist) != InpHistoryLenThr)
-      ArrayResize(g_abs_hist, InpHistoryLenThr);
-   g_abs_hist[idx] = v;
-   if(g_abs_count < InpHistoryLenThr) g_abs_count++;
-}
-
-double PercentileFromHist(double p)
-{
-   int n = MathMin(g_abs_count, InpHistoryLenThr);
-   if(n < 20) return InpThrMinPct;
-
-   double tmp[];
-   ArrayResize(tmp, n);
-   for(int i=0;i<n;i++) tmp[i] = g_abs_hist[i];
-   ArraySort(tmp);
-
-   int idx = (int)MathFloor((n - 1) * p);
-   idx = MathMax(0, MathMin(idx, n-1));
-   double thr = tmp[idx];
-   if(thr < InpThrMinPct) thr = InpThrMinPct;
-   return thr;
-}
-
-// ============================================================================
-// Denorm: raw -> log1p(range) -> range -> %
-// ============================================================================
-double DenormExpectedMovePct(double raw)
-{
-   double z = raw * g_t_std + g_t_mean;   // log(1+range)
-   double range = MathExp(z) - 1.0;
-   if(range < 0) range = 0;
-   return 100.0 * range;
-}
-
-// ============================================================================
-// PrepareData
-// Robust fix:
-// - extend main lookback window by InpAttemptMult to survive FX closed periods
-// - compute max iBarShift over required main times for s1,s2
-// - load s1,s2 deep enough (max_shift+3) so shifts are always in-range
-// Features per symbol (4): [logret_seq, range/close, body/close, vol_norm]
-// Target: log1p(future_range(main, H bars)) -> z-score + clamp
-// Optional: filter sequences where EURUSD/XAUUSD shifts don't change enough.
-// ============================================================================
-bool PrepareData(double &X[], double &T[], int &samples, int train_bars)
-{
-   DbgResetBudget();
-   ulong t0 = NowUS();
-
-   const int seq = InpSeqLen;
-   const int H   = InpHorizonH;
-   const int feat_per_sym = 4;
-   const int sym_count = 3;
-   const int feat_total = feat_per_sym * sym_count;
-   const int idim = seq * feat_total;
-
-   bool exact = InpAlignExact;
-
-   DbgPrint("[DBG]", "================ SUPER-DEBUG: PrepareData BEGIN ================");
-   DbgPrint("[DBG]", StringFormat("Symbols: main=%s, s1=%s, s2=%s | TF=%s | exact=%s",
-                                 g_sym_main, g_sym1, g_sym2, TFToStr(_Period), (exact?"true":"false")));
-
-   // --- NEW: attempt multiplier (FX closed periods) ---
-   int attempt_mult = MathMax(1, InpAttemptMult);
-   int want_attempts = train_bars * attempt_mult;
-
-   int b0 = SafeBars(g_sym_main, _Period);
-   int max_possible_attempts = b0 - (seq + H + 3);
-   if(max_possible_attempts < train_bars)
-   {
-      DbgPrint("[FAIL]", StringFormat("Not enough bars for main. bars=%d need_at_least=%d",
-                                     b0, (train_bars + seq + H + 3)));
-      MarkDbgFail();
-      return false;
-   }
-
-   int max_attempt = MathMin(want_attempts, max_possible_attempts);
-   int need_main   = max_attempt + seq + H + 3;
-
-   DbgPrint("[DBG]", StringFormat("Params: train_bars=%d, seq=%d, H=%d, idim=%d", train_bars, seq, H, idim));
-   DbgPrint("[DBG]", StringFormat("attempt_mult=%d => want_attempts=%d, max_attempt=%d", attempt_mult, want_attempts, max_attempt));
-   DbgPrint("[DBG]", StringFormat("need_main=%d", need_main));
-
-   // Ensure symbols in MarketWatch
-   SymbolSelect(g_sym1, true);
-   SymbolSelect(g_sym2, true);
-
-   if(b0 < need_main)
-   {
-      DbgPrint("[FAIL]", StringFormat("Not enough bars for main lookback. b0=%d need_main=%d", b0, need_main));
-      MarkDbgFail();
-      return false;
-   }
-
-   ArraySetAsSeries(g_r_main, true);
-   int got0 = SafeCopyRates(g_sym_main, _Period, 0, need_main, g_r_main);
-   if(got0 < need_main)
-   {
-      DbgPrint("[FAIL]", StringFormat("CopyRates main insufficient. got0=%d need_main=%d", got0, need_main));
-      MarkDbgFail();
-      return false;
-   }
-
-   // Compute max shifts required for s1/s2 over the main time window.
-   int max_sh1 = -1;
-   int max_sh2 = -1;
-
-   for(int i=0; i<need_main; i++)
-   {
-      datetime tm = g_r_main[i].time;
-
-      int sh1 = SafeBarShiftLimited(g_sym1, _Period, tm, exact);
-      int sh2 = SafeBarShiftLimited(g_sym2, _Period, tm, exact);
-
-      if(sh1 > max_sh1) max_sh1 = sh1;
-      if(sh2 > max_sh2) max_sh2 = sh2;
-   }
-
-   if(max_sh1 < 0 || max_sh2 < 0)
-   {
-      DbgPrint("[FAIL]", StringFormat("iBarShift max failed: max_sh1=%d max_sh2=%d", max_sh1, max_sh2));
-      DbgPrint("[DBG]", "Tip: stáhni historii EURUSD/XAUUSD pro tento timeframe, nebo zkontroluj název symbolu u brokera.");
-      MarkDbgFail();
-      return false;
-   }
-
-   int need1 = max_sh1 + 3;
-   int need2 = max_sh2 + 3;
-
-   DbgPrint("[DBG]", StringFormat("Computed depth for others: max_sh1=%d max_sh2=%d => need1=%d need2=%d",
-                                 max_sh1, max_sh2, need1, need2));
-
-   int b1 = SafeBars(g_sym1, _Period);
-   int b2 = SafeBars(g_sym2, _Period);
-   if(b1 < need1 || b2 < need2)
-   {
-      DbgPrint("[FAIL]", StringFormat("Not enough bars for others. b1=%d need1=%d | b2=%d need2=%d", b1, need1, b2, need2));
-      DbgPrint("[DBG]", "Tip: otevři graf EURUSD a XAUUSD na stejném TF a nech terminál stáhnout historii.");
-      MarkDbgFail();
-      return false;
-   }
-
-   ArraySetAsSeries(g_r_1, true);
-   ArraySetAsSeries(g_r_2, true);
-
-   int got1 = SafeCopyRates(g_sym1, _Period, 0, need1, g_r_1);
-   int got2 = SafeCopyRates(g_sym2, _Period, 0, need2, g_r_2);
-   if(got1 < need1 || got2 < need2)
-   {
-      DbgPrint("[FAIL]", StringFormat("CopyRates others insufficient. got1=%d need1=%d | got2=%d need2=%d", got1, need1, got2, need2));
-      MarkDbgFail();
-      return false;
-   }
-
-   // vmax over actual loaded ranges
-   g_vmax_main = 1.0; for(int i=0;i<ArraySize(g_r_main);i++) g_vmax_main = MathMax(g_vmax_main, (double)g_r_main[i].tick_volume);
-   g_vmax_1    = 1.0; for(int i=0;i<ArraySize(g_r_1);i++)    g_vmax_1    = MathMax(g_vmax_1,    (double)g_r_1[i].tick_volume);
-   g_vmax_2    = 1.0; for(int i=0;i<ArraySize(g_r_2);i++)    g_vmax_2    = MathMax(g_vmax_2,    (double)g_r_2[i].tick_volume);
-   DbgPrint("[OK]", StringFormat("vmax: main=%.0f s1=%.0f s2=%.0f", g_vmax_main, g_vmax_1, g_vmax_2));
-
-   // Build up to train_bars samples (with possible filtering)
-   samples = 0;
-
-   ArrayResize(X, train_bars * idim);
-   ArrayResize(T, train_bars);
-
-   // --- targets precompute on main
-   double sum=0.0, sum2=0.0;
-   double tmpRawT[];
-   ArrayResize(tmpRawT, max_attempt);
-
-   int attempts = 0;
-
-   for(int s_try=0; s_try<max_attempt; s_try++)
-   {
-      // Chronological indexing:
-      // i_ch_end increases with s_try; map to series index via (need_main-1)-i_ch_end.
-      int i_ch_end = (seq - 1) + s_try;
-      int i_series_end = (need_main - 1) - i_ch_end;
-      if(i_series_end < 0 || i_series_end >= need_main) break;
-
-      double c0 = g_r_main[i_series_end].close;
-      if(c0 <= 0) break;
-
-      double mxH=-1e100, mnL=1e100;
-      for(int j=1; j<=H; j++)
-      {
-         int i_ch_f = i_ch_end + j;
-         int i_series_f = (need_main - 1) - i_ch_f;
-         if(i_series_f < 0) { mxH=-1e100; break; }
-         mxH = MathMax(mxH, g_r_main[i_series_f].high);
-         mnL = MathMin(mnL, g_r_main[i_series_f].low);
-      }
-      if(mxH < -1e50) break;
-
-      double range = (mxH - mnL) / c0;
-      if(range < 0) range = 0;
-      double z = MathLog(1.0 + range);
-
-      tmpRawT[s_try] = z;
-      sum += z; sum2 += z*z;
-      attempts++;
-   }
-
-   if(attempts < train_bars)
-   {
-      DbgPrint("[FAIL]", StringFormat("Not enough attempts for training. attempts=%d required=%d", attempts, train_bars));
-      MarkDbgFail();
-      return false;
-   }
-
-   g_t_mean = sum / attempts;
-   g_t_std  = MathSqrt(MathMax(1e-10, sum2/attempts - g_t_mean*g_t_mean));
-
-   int idx0_series_end = (need_main - 1) - ((seq - 1) + 0);
-   DbgPrint("[DBG]", StringFormat("Target sample0: time_end=%s c0=%.5f z=%.6f",
-                                 TimeToStrSec(g_r_main[idx0_series_end].time),
-                                 g_r_main[idx0_series_end].close, tmpRawT[0]));
-   DbgPrint("[OK]", StringFormat("Target stats: mean=%.8f std=%.8f (attempts=%d)", g_t_mean, g_t_std, attempts));
-
-   // 2nd pass: build X/T samples
-   for(int s_try=0; s_try<attempts && samples < train_bars; s_try++)
-   {
-      // optional: detect frozen shifts on extra symbols within this sequence
-      int last_sh1 = INT_MAX, last_sh2 = INT_MAX;
-      int chg1 = 0, chg2 = 0;
-
-      double zn = (tmpRawT[s_try] - g_t_mean) / g_t_std;
-      if(zn > InpTargetClamp) zn = InpTargetClamp;
-      if(zn < -InpTargetClamp) zn = -InpTargetClamp;
-
-      int i_ch_end = (seq - 1) + s_try;
-      int i_ch_start = i_ch_end - (seq - 1);
-
-      int shM_arr[], sh1_arr[], sh2_arr[];
-      ArrayResize(shM_arr, seq);
-      ArrayResize(sh1_arr, seq);
-      ArrayResize(sh2_arr, seq);
-
-      bool ok = true;
-
-      // collect shifts for all t
-      for(int t=0; t<seq; t++)
-      {
-         int i_ch = i_ch_start + t;
-         int i_series = (need_main - 1) - i_ch;
-         if(i_series < 0 || i_series >= need_main) { ok=false; break; }
-
-         datetime tm = g_r_main[i_series].time;
-
-         int shM = iBarShift(g_sym_main, _Period, tm, exact);
-         int sh1 = iBarShift(g_sym1,     _Period, tm, exact);
-         int sh2 = iBarShift(g_sym2,     _Period, tm, exact);
-
-         if(InpSuperDebug && s_try==0 && t < 3 && DbgCan())
-         {
-            DbgPrint("[DBG]", StringFormat("t=%d time=%s shM=%d sh1=%d sh2=%d", t, TimeToStrSec(tm), shM, sh1, sh2));
-         }
-
-         if(shM < 0 || sh1 < 0 || sh2 < 0) { ok=false; break; }
-
-         // CRITICAL: bounds check vs actually loaded arrays
-         if(shM >= ArraySize(g_r_main) || sh1 >= ArraySize(g_r_1) || sh2 >= ArraySize(g_r_2))
-         {
-            DbgPrint("[FAIL]", StringFormat("Shift OOR: shM=%d/%d sh1=%d/%d sh2=%d/%d time=%s",
-               shM, ArraySize(g_r_main), sh1, ArraySize(g_r_1), sh2, ArraySize(g_r_2), TimeToStrSec(tm)));
-            ok=false; break;
-         }
-
-         shM_arr[t] = shM;
-         sh1_arr[t] = sh1;
-         sh2_arr[t] = sh2;
-
-         if(InpFilterFrozenOtherSymbols)
-         {
-            if(last_sh1 != INT_MAX && sh1 != last_sh1) chg1++;
-            if(last_sh2 != INT_MAX && sh2 != last_sh2) chg2++;
-            last_sh1 = sh1;
-            last_sh2 = sh2;
-         }
-      }
-
-      if(!ok) continue;
-
-      if(InpFilterFrozenOtherSymbols)
-      {
-         if(chg1 < InpMinShiftChanges || chg2 < InpMinShiftChanges)
-         {
-            // likely weekend / FX frozen mapping -> skip
-            continue;
-         }
-      }
-
-      // fill X
-      for(int t=0; t<seq; t++)
-      {
-         int shM = shM_arr[t];
-         int sh1 = sh1_arr[t];
-         int sh2 = sh2_arr[t];
-
-         double cM = g_r_main[shM].close;
-         double c1 = g_r_1[sh1].close;
-         double c2 = g_r_2[sh2].close;
-         if(cM<=0||c1<=0||c2<=0) { ok=false; break; }
-
-         // returns computed within sequence (no sh+1!)
-         double retM=0.0, ret1=0.0, ret2=0.0;
-         if(t > 0)
-         {
-            double cMp = g_r_main[shM_arr[t-1]].close;
-            double c1p = g_r_1[sh1_arr[t-1]].close;
-            double c2p = g_r_2[sh2_arr[t-1]].close;
-            if(cMp>0) retM = MathLog(cM / cMp);
-            if(c1p>0) ret1 = MathLog(c1 / c1p);
-            if(c2p>0) ret2 = MathLog(c2 / c2p);
-         }
-
-         // ranges and body
-         double f_m1 = (g_r_main[shM].high - g_r_main[shM].low) / cM;
-         double f_m2 = (g_r_main[shM].close - g_r_main[shM].open) / cM;
-         double f_m3 = (g_vmax_main>0)? (double)g_r_main[shM].tick_volume / g_vmax_main : 0;
-
-         double f_11 = (g_r_1[sh1].high - g_r_1[sh1].low) / c1;
-         double f_12 = (g_r_1[sh1].close - g_r_1[sh1].open) / c1;
-         double f_13 = (g_vmax_1>0)? (double)g_r_1[sh1].tick_volume / g_vmax_1 : 0;
-
-         double f_21 = (g_r_2[sh2].high - g_r_2[sh2].low) / c2;
-         double f_22 = (g_r_2[sh2].close - g_r_2[sh2].open) / c2;
-         double f_23 = (g_vmax_2>0)? (double)g_r_2[sh2].tick_volume / g_vmax_2 : 0;
-
-         int off = samples*idim + t*feat_total;
-         X[off+0]=retM;  X[off+1]=f_m1; X[off+2]=f_m2; X[off+3]=f_m3;
-         X[off+4]=ret1;  X[off+5]=f_11; X[off+6]=f_12; X[off+7]=f_13;
-         X[off+8]=ret2;  X[off+9]=f_21; X[off+10]=f_22; X[off+11]=f_23;
-      }
-
-      if(!ok) continue;
-
-      T[samples] = zn;
-      samples++;
-   }
-
-   DbgPrint("[DBG]", StringFormat("Sampling result: valid=%d / attempts=%d (%.1f%%)",
-                                 samples, attempts,
-                                 (attempts>0 ? 100.0*(double)samples/(double)attempts : 0.0)));
-
-   if(samples < train_bars)
-   {
-      DbgPrint("[FAIL]", StringFormat("Filtering removed too many samples. got=%d required=%d", samples, train_bars));
-      DbgPrint("[DBG]", "Tip: zvyš InpAttemptMult, vypni InpFilterFrozenOtherSymbols nebo sniž InpMinShiftChanges.");
-      MarkDbgFail();
-      return false;
-   }
-
-   ArrayResize(X, samples * idim);
-
-   ulong t1 = NowUS();
-   DbgPrint("[OK]", StringFormat("PrepareData OK. samples=%d idim=%d time=%.3f ms",
-                                 samples, idim, (double)(t1-t0)/1000.0));
-   DbgPrint("[DBG]", "================ SUPER-DEBUG: PrepareData END ==================");
-   return true;
-}
-
-// ============================================================================
-// Async training orchestration
-// ============================================================================
-bool StartAsyncTraining(int train_bars, int epochs, bool retrain)
-{
-   if(g_async_training) return false;
-
-   double X[], T[];
-   int samples = 0;
-
-   if(!PrepareData(X, T, samples, train_bars))
-   {
-      Print("[FAIL] PrepareData selhala (multi-symbol / target range)");
-      return false;
-   }
-
-   int feat_total = 4 * 3;
-   int idim = InpSeqLen * feat_total;
-
-   if(InpSuperDebug)
-      Print("[DBG] LoadBatch: samples=", samples, " idim=", idim, " out_dim=1 layout=0");
-
-   if(!DN_LoadBatch(g_net, X, T, samples, idim, 1, 0))
-   {
-      Print("[FAIL] DN_LoadBatch chyba: ", GetDLLError());
-      return false;
-   }
-
-   if(retrain) DN_SnapshotWeights(g_net);
-
-   g_train_start_tick = GetTickCount();
-   g_is_retrain = retrain;
-
-   double lr = retrain ? InpLR * 0.5 : InpLR;
-
-   if(!DN_TrainAsync(g_net, epochs, InpTargetMSE, lr, InpWD))
-   {
-      Print("[FAIL] DN_TrainAsync selhal: ", GetDLLError());
-      if(retrain) DN_RestoreWeights(g_net);
-      return false;
-   }
-
-   g_async_training = true;
-   EventSetTimer(1);
-   Print(retrain ? "[OK] Spouštím RETRAIN na pozadí..." : "[OK] Spouštím PRVNÍ TRÉNINK na pozadí...");
-   return true;
-}
-
-void CheckTrainingStatus()
-{
-   if(!g_async_training)
-   {
-      EventKillTimer();
-      return;
-   }
-
-   int st = DN_GetTrainingStatus(g_net);
-
-   if(st == 1)
-   {
-      if(InpShowComment)
-      {
-         uint elapsed = (GetTickCount() - g_train_start_tick) / 1000;
-         Comment("LSTM: trénink běží... ", IntegerToString((int)elapsed), " s");
-      }
-      return;
-   }
-
-   EventKillTimer();
-   g_async_training = false;
-
-   if(st == 2)
-   {
-      double mse; int ep;
-      DN_GetTrainingResult(g_net, mse, ep);
-      double dur = (GetTickCount() - g_train_start_tick) / 1000.0;
-
-      Print(g_is_retrain ? "[OK] RETRAIN" : "[OK] TRÉNINK",
-            " Hotovo: ", ep, " epoch, MSE=", DoubleToString(mse, 6),
-            " (", DoubleToString(dur, 1), "s)");
-
-      DN_SnapshotWeights(g_net);
-
-      g_trained = true;
-      ResetThrHistory();
-      ChartRedraw(0);
-   }
-   else
-   {
-      Print("[FAIL] Trénink selhal: ", GetDLLError());
-      if(g_is_retrain) DN_RestoreWeights(g_net);
-      g_trained = false;
-      if(InpShowComment) Comment("LSTM: trénink selhal");
-   }
-}
-
-// ============================================================================
-// Build input for inference at bar index
-// Robustly load enough depth for s1/s2 based on required times
-// ============================================================================
-bool BuildInputAtShift(double &X[], int shift_main, int &idim_out)
-{
-   const int seq = InpSeqLen;
-   const int feat_total = 4 * 3;
-   const int idim = seq * feat_total;
-   idim_out = idim;
-
-   bool exact = InpAlignExact;
-
-   int need_main = shift_main + seq + 5;
-   if(Bars(g_sym_main, _Period) < need_main) return false;
-
-   ArraySetAsSeries(g_r_main, true);
-   if(CopyRates(g_sym_main, _Period, 0, need_main, g_r_main) < need_main) return false;
-
-   int max_sh1 = -1, max_sh2 = -1;
-   for(int t=0; t<seq; t++)
-   {
-      int shMain = shift_main + (seq - 1 - t);
-      if(shMain < 0 || shMain >= ArraySize(g_r_main)) return false;
-      datetime tm = g_r_main[shMain].time;
-
-      int sh1 = iBarShift(g_sym1, _Period, tm, exact);
-      int sh2 = iBarShift(g_sym2, _Period, tm, exact);
-      if(sh1 < 0 || sh2 < 0) return false;
-
-      if(sh1 > max_sh1) max_sh1 = sh1;
-      if(sh2 > max_sh2) max_sh2 = sh2;
-   }
-
-   int need1 = max_sh1 + 3;
-   int need2 = max_sh2 + 3;
-
-   if(Bars(g_sym1, _Period) < need1) return false;
-   if(Bars(g_sym2, _Period) < need2) return false;
-
-   ArraySetAsSeries(g_r_1, true);
-   ArraySetAsSeries(g_r_2, true);
-
-   if(CopyRates(g_sym1, _Period, 0, need1, g_r_1) < need1) return false;
-   if(CopyRates(g_sym2, _Period, 0, need2, g_r_2) < need2) return false;
-
-   g_vmax_main=1; for(int i=0;i<ArraySize(g_r_main);i++) g_vmax_main=MathMax(g_vmax_main,(double)g_r_main[i].tick_volume);
-   g_vmax_1=1;    for(int i=0;i<ArraySize(g_r_1);i++)    g_vmax_1   =MathMax(g_vmax_1,   (double)g_r_1[i].tick_volume);
-   g_vmax_2=1;    for(int i=0;i<ArraySize(g_r_2);i++)    g_vmax_2   =MathMax(g_vmax_2,   (double)g_r_2[i].tick_volume);
-
-   ArrayResize(X, idim);
-
-   int shM_arr[], sh1_arr[], sh2_arr[];
-   ArrayResize(shM_arr, seq);
-   ArrayResize(sh1_arr, seq);
-   ArrayResize(sh2_arr, seq);
-
-   for(int t=0; t<seq; t++)
-   {
-      int shMain = shift_main + (seq - 1 - t);
-      datetime tm = g_r_main[shMain].time;
-
-      int shM = iBarShift(g_sym_main, _Period, tm, exact);
-      int sh1 = iBarShift(g_sym1,     _Period, tm, exact);
-      int sh2 = iBarShift(g_sym2,     _Period, tm, exact);
-      if(shM < 0 || sh1 < 0 || sh2 < 0) return false;
-
-      if(shM >= ArraySize(g_r_main) || sh1 >= ArraySize(g_r_1) || sh2 >= ArraySize(g_r_2)) return false;
-
-      shM_arr[t]=shM; sh1_arr[t]=sh1; sh2_arr[t]=sh2;
-   }
-
-   for(int t=0; t<seq; t++)
-   {
-      int shM = shM_arr[t], sh1 = sh1_arr[t], sh2 = sh2_arr[t];
-
-      double cM = g_r_main[shM].close;
-      double c1 = g_r_1[sh1].close;
-      double c2 = g_r_2[sh2].close;
-      if(cM<=0||c1<=0||c2<=0) return false;
-
-      double retM=0.0, ret1=0.0, ret2=0.0;
-      if(t > 0)
-      {
-         double cMp = g_r_main[shM_arr[t-1]].close;
-         double c1p = g_r_1[sh1_arr[t-1]].close;
-         double c2p = g_r_2[sh2_arr[t-1]].close;
-         if(cMp>0) retM = MathLog(cM / cMp);
-         if(c1p>0) ret1 = MathLog(c1 / c1p);
-         if(c2p>0) ret2 = MathLog(c2 / c2p);
-      }
-
-      double f_m1 = (g_r_main[shM].high - g_r_main[shM].low) / cM;
-      double f_m2 = (g_r_main[shM].close - g_r_main[shM].open) / cM;
-      double f_m3 = (g_vmax_main>0)? (double)g_r_main[shM].tick_volume / g_vmax_main : 0;
-
-      double f_11 = (g_r_1[sh1].high - g_r_1[sh1].low) / c1;
-      double f_12 = (g_r_1[sh1].close - g_r_1[sh1].open) / c1;
-      double f_13 = (g_vmax_1>0)? (double)g_r_1[sh1].tick_volume / g_vmax_1 : 0;
-
-      double f_21 = (g_r_2[sh2].high - g_r_2[sh2].low) / c2;
-      double f_22 = (g_r_2[sh2].close - g_r_2[sh2].open) / c2;
-      double f_23 = (g_vmax_2>0)? (double)g_r_2[sh2].tick_volume / g_vmax_2 : 0;
-
-      int off = t*feat_total;
-      X[off+0]=retM;  X[off+1]=f_m1;  X[off+2]=f_m2;  X[off+3]=f_m3;
-      X[off+4]=ret1;  X[off+5]=f_11;  X[off+6]=f_12;  X[off+7]=f_13;
-      X[off+8]=ret2;  X[off+9]=f_21;  X[off+10]=f_22; X[off+11]=f_23;
-   }
-
-   return true;
-}
-
-// ============================================================================
-// Predict
-// ============================================================================
-bool PredictForBar(int bar_idx, double &out_raw, double &out_move_pct)
-{
-   if(!g_trained) return false;
-   if(g_async_training) return false;
-
-   int shift_main = bar_idx + 1;
-   double X[];
-   int idim = 0;
-
-   if(!BuildInputAtShift(X, shift_main, idim)) return false;
-
-   double Y[];
-   ArrayResize(Y, 1);
-   if(!DN_PredictBatch(g_net, X, 1, idim, 0, Y)) return false;
-
-   out_raw = Y[0];
-   out_move_pct = DenormExpectedMovePct(out_raw);
-   return true;
-}
-
-// ============================================================================
-// History calc
-// ============================================================================
-void CalculateHistory(int rates_total)
-{
-   if(!g_trained || g_async_training) return;
-
-   int max_bar = rates_total - 5;
-   int calc_bars = MathMin(InpCalcHistory, max_bar);
-   if(calc_bars <= 0) return;
-
-   ResetThrHistory();
-
-   int counter = 0;
-   for(int bar = calc_bars; bar >= 0; bar--)
-   {
-      double raw, mv;
-      if(!PredictForBar(bar, raw, mv))
-      {
-         g_buf_move_pct[bar] = EMPTY_VALUE;
-         g_buf_raw[bar]      = EMPTY_VALUE;
-         g_buf_thr_low[bar]  = EMPTY_VALUE;
-         g_buf_thr_high[bar] = EMPTY_VALUE;
-         continue;
-      }
-
-      counter++;
-      PushThrSample(mv, counter);
-
-      double thrL = PercentileFromHist(InpThrLowPercentile);
-      double thrH = PercentileFromHist(InpThrHighPercentile);
-
-      g_buf_move_pct[bar] = mv;
-      g_buf_raw[bar]      = raw;
-      g_buf_thr_low[bar]  = thrL;
-      g_buf_thr_high[bar] = thrH;
-   }
-}
-
-// ============================================================================
-// Comment
-// ============================================================================
-void UpdateComment(double move_pct, double thrL, double thrH)
-{
-   if(!InpShowComment) return;
-   if(g_async_training) return;
-
-   string state = "LOW MOVE";
-   if(move_pct >= thrH) state = "HIGH MOVE";
-   else if(move_pct >= thrL) state = "MOVE OK";
-
-   string txt =
-      "ExpectedMove: " + DoubleToString(move_pct, 3) + " %\n" +
-      "ThrLow: " + DoubleToString(thrL, 3) + " % | ThrHigh: " + DoubleToString(thrH, 3) + " %\n" +
-      "State: " + state + "\n" +
-      "Inputs: " + g_sym_main + " + " + g_sym1 + " + " + g_sym2 + " | TF=" + TFToStr(_Period);
-
-   Comment(txt);
-}
-
-// ============================================================================
-// Events
-// ============================================================================
+//+------------------------------------------------------------------+
+//| Init                                                              |
+//+------------------------------------------------------------------+
 int OnInit()
 {
-   g_sym_main = _Symbol;
-   g_sym1 = InpExtraSymbol1;
-   g_sym2 = InpExtraSymbol2;
+   Print("=== LSTM Real-Time Predictor v2.1 (GPU + Progress) ===");
 
-   SymbolSelect(g_sym1, true);
-   SymbolSelect(g_sym2, true);
+   SetIndexBuffer(0, g_PredictedPrice, INDICATOR_DATA);
+   SetIndexBuffer(1, g_UpperBand,      INDICATOR_DATA);
+   SetIndexBuffer(2, g_LowerBand,      INDICATOR_DATA);
+   SetIndexBuffer(3, g_TrendStrength,  INDICATOR_DATA);
+   SetIndexBuffer(4, g_TrendColor,     INDICATOR_COLOR_INDEX);
+   SetIndexBuffer(5, g_PredDirection,  INDICATOR_CALCULATIONS);
+   SetIndexBuffer(6, g_Confidence,     INDICATOR_CALCULATIONS);
+   SetIndexBuffer(7, g_Magnitude,      INDICATOR_CALCULATIONS);
 
-   SetIndexBuffer(0, g_buf_move_pct, INDICATOR_DATA);
-   SetIndexBuffer(1, g_buf_thr_low,  INDICATOR_DATA);
-   SetIndexBuffer(2, g_buf_thr_high, INDICATOR_DATA);
-   SetIndexBuffer(3, g_buf_raw,      INDICATOR_CALCULATIONS);
+   for(int i = 0; i < 4; i++)
+      PlotIndexSetDouble(i, PLOT_EMPTY_VALUE, 0.0);
 
-   ArraySetAsSeries(g_buf_move_pct, true);
-   ArraySetAsSeries(g_buf_thr_low,  true);
-   ArraySetAsSeries(g_buf_thr_high, true);
-   ArraySetAsSeries(g_buf_raw,      true);
+   IndicatorSetString(INDICATOR_SHORTNAME,
+      StringFormat("LSTM-GPU(%d,%d,%d)", InpLookback, InpHiddenSize1, InpPredictAhead));
 
-   PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-   PlotIndexSetDouble(2, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-
-   ResetThrHistory();
-
-   g_net = DN_Create();
-   if(g_net <= 0)
+   if(!InitNetwork())
    {
-      Print("[FAIL] DN_Create: ", GetDLLError());
+      Print("FATAL: Network init failed");
       return INIT_FAILED;
    }
 
-   DN_SetSequenceLength(g_net, InpSeqLen);
-   DN_SetMiniBatchSize(g_net, InpMiniBatch);
-   DN_SetGradClip(g_net, InpGradClip);
-   DN_AddLayerEx(g_net, 0, InpHiddenSize, 0, 0, InpDropout);
-
-   // Kick off training if enough main bars exist (others will be validated inside PrepareData)
-   int attempt_mult = MathMax(1, InpAttemptMult);
-   int need_hint = (InpTrainBars * attempt_mult) + InpSeqLen + InpHorizonH + 10;
-
-   if(Bars(g_sym_main, _Period) >= need_hint)
+   if(InpSaveModel && FileIsExist(InpModelFile, FILE_COMMON))
    {
-      g_last_train_attempt = TimeCurrent();
-      if(!StartAsyncTraining(InpTrainBars, InpEpochs, false))
-         Print("[FAIL] StartAsyncTraining failed at OnInit.");
-   }
-   else
-   {
-      Print("[DBG] Not enough bars yet on main. Need ~", need_hint, " bars (main).");
+      if(LoadModel()) { Print("Model loaded OK"); g_ModelReady = true; }
    }
 
-   g_init_done = true;
+   CreateInfoPanel();
+   CreateProgressBar();
+   EventSetMillisecondTimer(100);
+
    return INIT_SUCCEEDED;
 }
 
+//+------------------------------------------------------------------+
+//| Deinit                                                            |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   if(g_net > 0)
+   if(g_NetHandle > 0 && g_IsTraining)
    {
-      DN_StopTraining(g_net);
-      DN_Free(g_net);
-      g_net = 0;
+      DN_StopTraining(g_NetHandle);
+      Sleep(500);
    }
-   Comment("");
+   if(InpSaveModel && g_ModelReady && g_NetHandle > 0)
+      SaveModel();
+   if(g_NetHandle > 0) { DN_Free(g_NetHandle); g_NetHandle = 0; }
+   CleanupObjects();
 }
 
-void OnTimer()
-{
-   CheckTrainingStatus();
-}
-
+//+------------------------------------------------------------------+
+//| OnCalculate                                                       |
+//+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
                 const int prev_calculated,
                 const datetime &time[],
@@ -992,42 +277,1186 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-   if(!g_init_done || g_net <= 0) return prev_calculated;
-   if(g_async_training) return prev_calculated;
+   int minBars = InpLookback + InpTrainBars + InpPredictAhead + 50;
+   if(rates_total < minBars) return 0;
 
-   // If not trained yet, try to start training when enough bars exist (with cooldown)
-   if(!g_trained)
+   g_TotalBars = rates_total;
+
+   //--- Initial training
+   if(!g_ModelReady && !g_IsTraining)
    {
-      if((TimeCurrent() - g_last_train_attempt) >= InpTrainRetrySec)
-      {
-         g_last_train_attempt = TimeCurrent();
-         StartAsyncTraining(InpTrainBars, InpEpochs, false);
-      }
-      return prev_calculated;
+      if(StartTraining(rates_total, open, high, low, close, tick_volume, true))
+         g_IsTraining = true;
    }
 
-   // Initial history calculation
-   if(prev_calculated == 0)
-      CalculateHistory(rates_total);
+   //--- Auto retrain
+   if(g_ModelReady && InpAutoRetrain && !g_IsTraining)
+   {
+      if(rates_total - g_LastTrainBar >= InpRetrainInterval)
+      {
+         if(StartTraining(rates_total, open, high, low, close, tick_volume, false))
+            g_IsTraining = true;
+      }
+   }
 
-   // Current prediction
-   double raw0, mv0;
-   if(!PredictForBar(0, raw0, mv0)) return rates_total;
+   //--- Bulk prediction
+   if(g_ModelReady && !g_IsTraining)
+   {
+      BulkPredict(rates_total, prev_calculated, open, high, low, close, tick_volume);
+   }
+   else
+   {
+      int start = (prev_calculated == 0) ? 0 : prev_calculated - 1;
+      for(int i = start; i < rates_total; i++)
+      {
+         g_PredictedPrice[i] = close[i];
+         g_UpperBand[i]      = 0;
+         g_LowerBand[i]      = 0;
+         g_TrendStrength[i]  = 0;
+         g_TrendColor[i]     = 0;
+      }
+   }
 
-   static int counter = 0;
-   counter++;
-   PushThrSample(mv0, counter);
+   //--- Future line
+   if(g_ModelReady && InpShowFutureLine && rates_total > 0)
+      DrawFuturePrediction(rates_total - 1, time, close, high, low);
 
-   double thrL = PercentileFromHist(InpThrLowPercentile);
-   double thrH = PercentileFromHist(InpThrHighPercentile);
-
-   g_buf_move_pct[0] = mv0;
-   g_buf_raw[0]      = raw0;
-   g_buf_thr_low[0]  = thrL;
-   g_buf_thr_high[0] = thrH;
-
-   UpdateComment(mv0, thrL, thrH);
-
+   UpdateInfoPanel();
+   UpdateProgressBar();
    return rates_total;
+}
+
+//+------------------------------------------------------------------+
+//| Timer — polls GPU progress                                        |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   if(!g_IsTraining || g_NetHandle == 0)
+   {
+      if(g_IsTraining) UpdateProgressBar();
+      return;
+   }
+
+   //--- Poll GPU-side progress (lock-free, no blocking)
+   PollGPUProgress();
+
+   int st = DN_GetTrainingStatus(g_NetHandle);
+   if(st == 1) // TS_TRAINING
+   {
+      UpdateInfoPanel();
+      UpdateProgressBar();
+      return;
+   }
+
+   //--- Training finished
+   g_IsTraining = false;
+   double mse = 0; int ep = 0;
+   DN_GetTrainingResult(g_NetHandle, mse, ep);
+   g_LastMSE = mse;
+   g_CurrentEpochs = ep;
+   g_TotalEpochs += ep;
+
+   if(st == 2) // TS_COMPLETED
+   {
+      Print(StringFormat("Training done: MSE=%.6f ep=%d elapsed=%.1fs",
+            mse, ep, g_ProgElapsedSec));
+      if(mse < g_BestMSE)
+      {
+         g_BestMSE = mse;
+         DN_SnapshotWeights(g_NetHandle);
+      }
+      g_ModelReady = true;
+      g_LastTrainBar = g_TotalBars;
+      g_LastPredictedTo = -1;
+      InvalidateCache();
+      if(InpSaveModel) SaveModel();
+   }
+   else // TS_ERROR
+   {
+      Print("Training error: ", GetDLLError());
+      DN_RestoreWeights(g_NetHandle);
+   }
+   UpdateInfoPanel();
+   UpdateProgressBar();
+}
+
+//+------------------------------------------------------------------+
+//| Poll GPU progress — single DLL call gets all metrics              |
+//+------------------------------------------------------------------+
+void PollGPUProgress()
+{
+   if(g_NetHandle == 0) return;
+
+   if(!DN_GetProgressAll(g_NetHandle,
+         g_ProgEpoch, g_ProgTotalEpochs,
+         g_ProgMB, g_ProgTotalMB,
+         g_ProgLR, g_ProgMSE, g_ProgBestMSE,
+         g_ProgGradNorm, g_ProgPercent,
+         g_ProgElapsedSec, g_ProgETASec))
+   {
+      return; // net not found
+   }
+
+   // FIX: keep steps in a declared global
+   g_ProgTotalSteps = DN_GetProgressTotalSteps(g_NetHandle);
+
+   // Sync local tracking variables
+   g_CurrentEpochs = g_ProgEpoch;
+   if(g_ProgMSE > 0) g_LastMSE = g_ProgMSE;
+   if(g_ProgBestMSE < g_BestMSE && g_ProgBestMSE > 0)
+      g_BestMSE = g_ProgBestMSE;
+}
+
+//+------------------------------------------------------------------+
+//| Init network                                                      |
+//+------------------------------------------------------------------+
+bool InitNetwork()
+{
+   g_NetHandle = DN_Create();
+   if(g_NetHandle == 0) { Print("DN_Create fail: ", GetDLLError()); return false; }
+
+   DN_SetSequenceLength(g_NetHandle, InpLookback);
+   DN_SetMiniBatchSize(g_NetHandle, InpMiniBatch);
+   DN_SetGradClip(g_NetHandle, InpGradClip);
+
+   if(!DN_AddLayerEx(g_NetHandle, FEAT_PER_BAR, InpHiddenSize1, 0, 0, InpDropout))
+   { Print("L1 fail: ", GetDLLError()); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+
+   if(!DN_AddLayerEx(g_NetHandle, 0, InpHiddenSize2, 0, 0, InpDropout * 0.5))
+   { Print("L2 fail: ", GetDLLError()); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+
+   if(InpHiddenSize3 > 0)
+   {
+      if(!DN_AddLayerEx(g_NetHandle, 0, InpHiddenSize3, 0, 0, 0.0))
+      { Print("L3 fail: ", GetDLLError()); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+   }
+
+   if(!DN_SetOutputDim(g_NetHandle, OUTPUT_DIM))
+   { Print("OutDim fail: ", GetDLLError()); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+
+   EstimateVRAM();
+
+   Print(StringFormat("Network: %d -> LSTM(%d) -> LSTM(%d)%s -> %d",
+         FEAT_PER_BAR, InpHiddenSize1, InpHiddenSize2,
+         InpHiddenSize3 > 0 ? StringFormat(" -> LSTM(%d)", InpHiddenSize3) : "",
+         OUTPUT_DIM));
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Estimate VRAM usage                                               |
+//+------------------------------------------------------------------+
+void EstimateVRAM()
+{
+   int H1 = InpHiddenSize1, H2 = InpHiddenSize2, H3 = InpHiddenSize3;
+   int F  = FEAT_PER_BAR;
+   int S  = InpLookback;
+   int N  = InpTrainBars;
+   int MB = InpMiniBatch;
+
+   double w1 = (double)(F + H1) * 4 * H1 * 4;
+   double w2 = (double)(H1 + H2) * 4 * H2 * 4;
+   double w3 = (H3 > 0) ? (double)(H2 + H3) * 4 * H3 * 4 : 0;
+   int lastH = (H3 > 0) ? H3 : H2;
+   double wo = (double)lastH * OUTPUT_DIM * 4;
+
+   double weightMem = (w1 + w2 + w3 + wo) * 3;
+
+   double dataMem = (double)N * S * F * 4.0 + (double)N * OUTPUT_DIM * 4.0;
+
+   double cacheMem = (double)S * MB * H1 * 4.0 * 7;
+   cacheMem += (double)S * MB * H2 * 4.0 * 7;
+   if(H3 > 0) cacheMem += (double)S * MB * H3 * 4.0 * 7;
+
+   double gradMem = cacheMem * 0.5;
+
+   double predMem = (double)InpPredictBatch * S * F * 8.0;
+   predMem += (double)InpPredictBatch * OUTPUT_DIM * 8.0;
+
+   g_EstVRAM_MB = (weightMem + dataMem + cacheMem + gradMem + predMem) / (1024.0 * 1024.0);
+
+   Print(StringFormat("Est. VRAM: %.1f MB (W:%.1f D:%.1f C:%.1f G:%.1f P:%.1f)",
+         g_EstVRAM_MB,
+         weightMem / 1048576.0,
+         dataMem / 1048576.0,
+         cacheMem / 1048576.0,
+         gradMem / 1048576.0,
+         predMem / 1048576.0));
+}
+
+//+------------------------------------------------------------------+
+//| Invalidate feature cache                                          |
+//+------------------------------------------------------------------+
+void InvalidateCache()
+{
+   g_CacheStartBar = -1;
+   g_CachedBars    = 0;
+   g_CacheValidTo  = -1;
+   g_ATRCacheStart = -1;
+   g_ATRCachedBars = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Bulk ATR computation                                              |
+//+------------------------------------------------------------------+
+void BulkComputeATR(int startBar, int count, int period,
+                    const double &high[],
+                    const double &low[],
+                    const double &close[],
+                    int rates_total)
+{
+   if(g_ATRCacheStart == startBar && g_ATRCachedBars >= count)
+      return;
+
+   ArrayResize(g_ATRCache, count);
+   g_ATRCacheStart = startBar;
+   g_ATRCachedBars = count;
+
+   for(int i = 0; i < count; i++)
+   {
+      int bar = startBar + i;
+      double sum = 0;
+      int n = 0;
+      for(int k = 0; k < period && bar + k < rates_total - 1; k++)
+      {
+         double h  = high[bar + k];
+         double l  = low[bar + k];
+         double pc = close[bar + k + 1];
+         double tr = MathMax(h - l, MathMax(MathAbs(h - pc), MathAbs(l - pc)));
+         sum += tr;
+         n++;
+      }
+      g_ATRCache[i] = (n > 0) ? sum / n : _Point * 100;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get cached ATR                                                    |
+//+------------------------------------------------------------------+
+double GetCachedATR(int barIdx)
+{
+   if(g_ATRCacheStart < 0) return _Point * 100;
+   int idx = barIdx - g_ATRCacheStart;
+   if(idx < 0 || idx >= g_ATRCachedBars) return _Point * 100;
+   return g_ATRCache[idx];
+}
+
+//+------------------------------------------------------------------+
+//| Bulk feature extraction                                           |
+//+------------------------------------------------------------------+
+void BulkExtractFeatures(int startBar, int count,
+                         const double &open[],
+                         const double &high[],
+                         const double &low[],
+                         const double &close[],
+                         const long &tick_volume[],
+                         int rates_total,
+                         double &feats[])
+{
+   ArrayResize(feats, count * FEAT_PER_BAR);
+
+   int atrStart = startBar;
+   int atrCount = count + 30;
+   if(atrStart + atrCount > rates_total)
+      atrCount = rates_total - atrStart;
+   BulkComputeATR(atrStart, atrCount, 14, high, low, close, rates_total);
+
+   double volMAScratch[];
+   ArrayResize(volMAScratch, count);
+   for(int i = 0; i < count; i++)
+   {
+      int bar = startBar + i;
+      double s = 0;
+      int n = 0;
+      for(int k = 0; k < 20 && bar + k < rates_total; k++)
+      {
+         s += (double)tick_volume[bar + k];
+         n++;
+      }
+      volMAScratch[i] = (n > 0) ? s / n : 1.0;
+   }
+
+   for(int i = 0; i < count; i++)
+   {
+      int bar = startBar + i;
+      int off = i * FEAT_PER_BAR;
+
+      if(bar < 1 || bar >= rates_total - 1)
+      {
+         for(int k = 0; k < FEAT_PER_BAR; k++)
+            feats[off + k] = 0;
+         continue;
+      }
+
+      double o = open[bar];
+      double h = high[bar];
+      double l = low[bar];
+      double c = close[bar];
+      double prevC = close[bar + 1];
+      double vol = (double)tick_volume[bar];
+      double prevVol = (double)tick_volume[bar + 1];
+
+      double range = h - l;
+      if(range < _Point) range = _Point;
+      if(prevC < _Point) prevC = c;
+      if(prevVol < 1) prevVol = vol;
+
+      double atr = GetCachedATR(bar);
+      if(atr < _Point) atr = _Point;
+
+      double avgATR = (g_ATRMean > _Point) ? g_ATRMean : atr;
+
+      int fi = off;
+
+      feats[fi++] = (o - prevC) / atr;
+      feats[fi++] = (h - prevC) / atr;
+      feats[fi++] = (l - prevC) / atr;
+      feats[fi++] = (c - prevC) / atr;
+
+      feats[fi++] = (c - prevC) / atr;
+      feats[fi++] = (h - prevC) / atr;
+      feats[fi++] = (l - prevC) / atr;
+
+      feats[fi++] = atr / avgATR - 1.0;
+      feats[fi++] = range / atr;
+
+      double gain = 0, loss = 0;
+      for(int k = 0; k < 14 && bar + k < rates_total - 1; k++)
+      {
+         double change = close[bar + k] - close[bar + k + 1];
+         if(change > 0) gain += change;
+         else loss -= change;
+      }
+      double rs = (loss > 0) ? gain / loss : 1.0;
+      feats[fi++] = (100.0 - 100.0 / (1.0 + rs) - 50.0) / 50.0;
+
+      double emaF = 0, emaS = 0;
+      double aF = 2.0 / 13.0, aS = 2.0 / 27.0;
+      for(int k = 0; k < 26 && bar + k < rates_total; k++)
+      {
+         if(k < 12) emaF += close[bar + k] * MathPow(1.0 - aF, k);
+         emaS += close[bar + k] * MathPow(1.0 - aS, k);
+      }
+      emaF *= aF;
+      emaS *= aS;
+      feats[fi++] = (emaF - emaS) / atr;
+
+      double hh = h, ll = l;
+      for(int k = 0; k < 14 && bar + k < rates_total; k++)
+      {
+         if(high[bar + k] > hh) hh = high[bar + k];
+         if(low[bar + k] < ll) ll = low[bar + k];
+      }
+      double stR = hh - ll;
+      double stoch = (stR > _Point) ? (c - ll) / stR : 0.5;
+      feats[fi++] = (stoch - 0.5) * 2.0;
+
+      double vc = (prevVol > 0) ? (vol - prevVol) / prevVol : 0;
+      feats[fi++] = MathMax(-3.0, MathMin(3.0, vc)) / 3.0;
+
+      double vma = volMAScratch[i];
+      double vr = (vma > 0) ? vol / vma : 1.0;
+      feats[fi++] = MathMax(-2.0, MathMin(2.0, vr - 1.0));
+
+      double body = c - o;
+      double uShadow = h - MathMax(o, c);
+      double lShadow = MathMin(o, c) - l;
+      feats[fi++] = body / range;
+      feats[fi++] = (uShadow - lShadow) / range;
+   }
+
+   g_CacheStartBar = startBar;
+   g_CachedBars    = count;
+   g_CacheValidTo  = startBar;
+}
+
+//+------------------------------------------------------------------+
+//| Build sequence input                                              |
+//+------------------------------------------------------------------+
+void BuildSequenceInput(const double &barFeatures[],
+                        int featureStartBar,
+                        int totalFeatBars,
+                        const int &sampleBars[],
+                        int nSamples,
+                        int seqLen,
+                        double &X[])
+{
+   int inDim = seqLen * FEAT_PER_BAR;
+   ArrayResize(X, nSamples * inDim);
+
+   for(int s = 0; s < nSamples; s++)
+   {
+      int tgtBar = sampleBars[s];
+
+      for(int t = 0; t < seqLen; t++)
+      {
+         int bar = tgtBar + (seqLen - 1 - t);
+         int cacheIdx = bar - featureStartBar;
+
+         int xOff = s * inDim + t * FEAT_PER_BAR;
+
+         if(cacheIdx >= 0 && cacheIdx < totalFeatBars)
+         {
+            int fOff = cacheIdx * FEAT_PER_BAR;
+            for(int f = 0; f < FEAT_PER_BAR; f++)
+               X[xOff + f] = barFeatures[fOff + f];
+         }
+         else
+         {
+            for(int f = 0; f < FEAT_PER_BAR; f++)
+               X[xOff + f] = 0;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Compute normalization params                                      |
+//+------------------------------------------------------------------+
+void ComputeNormParams(int rates_total,
+                       const double &close[],
+                       const double &high[],
+                       const double &low[])
+{
+   int n = MathMin(InpTrainBars, rates_total - InpLookback - 10);
+   double sumATR = 0;
+   for(int i = 0; i < n; i++)
+   {
+      int bar = i + 1;
+      if(bar >= rates_total - 1) break;
+      double sum = 0; int cnt = 0;
+      for(int k = 0; k < 14 && bar + k < rates_total - 1; k++)
+      {
+         double h  = high[bar + k];
+         double l  = low[bar + k];
+         double pc = close[bar + k + 1];
+         sum += MathMax(h - l, MathMax(MathAbs(h - pc), MathAbs(l - pc)));
+         cnt++;
+      }
+      sumATR += (cnt > 0 ? sum / cnt : _Point);
+   }
+   g_ATRMean = (n > 0) ? sumATR / n : _Point * 100;
+   if(g_ATRMean < _Point) g_ATRMean = _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Start training (GPU)                                              |
+//+------------------------------------------------------------------+
+bool StartTraining(int rates_total,
+                   const double &open[],
+                   const double &high[],
+                   const double &low[],
+                   const double &close[],
+                   const long &tick_volume[],
+                   bool initial)
+{
+   if(g_NetHandle == 0) return false;
+
+   g_TargetEpochs   = initial ? InpInitialEpochs : InpRetrainEpochs;
+   g_CurrentEpochs  = 0;
+   g_TrainStartTime = TimeCurrent();
+
+   // Reset GPU progress tracking
+   g_ProgEpoch       = 0;
+   g_ProgTotalEpochs = g_TargetEpochs;
+   g_ProgMB          = 0;
+   g_ProgTotalMB     = 0;
+   g_ProgTotalSteps  = 0; // FIX: reset steps too
+   g_ProgLR          = InpLearningRate;
+   g_ProgMSE         = 0;
+   g_ProgBestMSE     = 0;
+   g_ProgGradNorm    = 0;
+   g_ProgPercent     = 0;
+   g_ProgElapsedSec  = 0;
+   g_ProgETASec      = 0;
+
+   ComputeNormParams(rates_total, close, high, low);
+
+   int maxSamples = MathMin(InpTrainBars, rates_total - InpLookback - InpPredictAhead - 5);
+   if(maxSamples < 50) { Print("Too few samples: ", maxSamples); return false; }
+
+   int inDim = InpLookback * FEAT_PER_BAR;
+
+   int firstTarget = 1 + InpPredictAhead;
+   int lastTarget  = maxSamples + InpPredictAhead;
+   int oldestBar   = lastTarget + InpLookback;
+   int newestBar   = firstTarget;
+
+   if(oldestBar >= rates_total - 1) oldestBar = rates_total - 2;
+
+   int featRange = oldestBar - newestBar + 1;
+
+   uint t0 = GetTickCount();
+
+   double barFeats[];
+   BulkExtractFeatures(newestBar, featRange, open, high, low, close,
+                       tick_volume, rates_total, barFeats);
+
+   if(InpVerboseLog)
+      Print("Feature extraction: ", featRange, " bars in ",
+            GetTickCount() - t0, " ms");
+
+   int sampleBars[];
+   ArrayResize(sampleBars, maxSamples);
+   for(int s = 0; s < maxSamples; s++)
+      sampleBars[s] = s + firstTarget;
+
+   double X[];
+   BuildSequenceInput(barFeats, newestBar, featRange,
+                      sampleBars, maxSamples, InpLookback, X);
+
+   double T[];
+   ArrayResize(T, maxSamples * OUTPUT_DIM);
+   ArrayInitialize(T, 0);
+
+   for(int s = 0; s < maxSamples; s++)
+   {
+      int predBar = s + 1;
+      int tgtBar  = predBar + InpPredictAhead;
+
+      if(tgtBar >= rates_total - 1 || predBar >= rates_total) continue;
+
+      double pc = close[tgtBar];
+      double cc = close[predBar];
+      if(pc < _Point) pc = _Point;
+
+      double ret = (cc - pc) / pc;
+      double atr = GetCachedATR(tgtBar);
+      if(atr < _Point) atr = _Point;
+      double normRet = ret / (atr / pc);
+
+      T[s * OUTPUT_DIM + 0] = MathTanh(normRet * 2.0);
+      T[s * OUTPUT_DIM + 1] = 1.0 / (1.0 + MathExp(-MathAbs(normRet)));
+
+      double volRatio = atr / g_ATRMean;
+      T[s * OUTPUT_DIM + 2] = 1.0 / (1.0 + volRatio);
+   }
+
+   uint t1 = GetTickCount();
+   if(InpVerboseLog)
+      Print("Data prep total: ", t1 - t0, " ms for ", maxSamples, " samples");
+
+   if(!DN_LoadBatch(g_NetHandle, X, T, maxSamples, inDim, OUTPUT_DIM, 0))
+   {
+      Print("LoadBatch fail: ", GetDLLError());
+      return false;
+   }
+
+   uint t2 = GetTickCount();
+   double transferMB = ((double)maxSamples * inDim * 8.0 +
+                        (double)maxSamples * OUTPUT_DIM * 8.0) / 1048576.0;
+   if(InpVerboseLog)
+      Print(StringFormat("GPU transfer: %.1f MB in %d ms", transferMB, t2 - t1));
+
+   if(!DN_TrainAsync(g_NetHandle, g_TargetEpochs, InpTargetMSE,
+                     InpLearningRate, InpWeightDecay))
+   {
+      Print("TrainAsync fail: ", GetDLLError());
+      return false;
+   }
+
+   Print(StringFormat("Training started: %d samples x %d epochs (%.1f MB on GPU)",
+         maxSamples, g_TargetEpochs, transferMB));
+
+   UpdateProgressBar();
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Bulk GPU-batched prediction                                       |
+//+------------------------------------------------------------------+
+void BulkPredict(int rates_total,
+                 int prev_calculated,
+                 const double &open[],
+                 const double &high[],
+                 const double &low[],
+                 const double &close[],
+                 const long &tick_volume[])
+{
+   if(!g_ModelReady || g_NetHandle == 0 || g_IsTraining) return;
+
+   int newestBar = InpLookback;
+   int oldestBar = rates_total - 1;
+
+   int startPred = newestBar;
+   if(prev_calculated > 0 && g_LastPredictedTo >= newestBar)
+   {
+      startPred = MathMax(newestBar, rates_total - (rates_total - prev_calculated) - 1);
+   }
+
+   int maxPred = MathMin(InpMaxPredictBars, rates_total - InpLookback);
+   if(oldestBar - startPred > maxPred)
+      startPred = oldestBar - maxPred;
+
+   int totalPredict = oldestBar - startPred + 1;
+   if(totalPredict <= 0) return;
+
+   if(g_ATRMean < _Point)
+      ComputeNormParams(rates_total, close, high, low);
+
+   int featNewest = startPred;
+   int featOldest = oldestBar + InpLookback;
+   if(featOldest >= rates_total) featOldest = rates_total - 1;
+   int featRange = featOldest - featNewest + 1;
+
+   uint t0 = GetTickCount();
+
+   double barFeats[];
+   BulkExtractFeatures(featNewest, featRange, open, high, low, close,
+                       tick_volume, rates_total, barFeats);
+
+   if(InpVerboseLog)
+      Print("Predict: feature extraction ", featRange, " bars in ",
+            GetTickCount() - t0, " ms");
+
+   int batchSize = InpPredictBatch;
+   int inDim     = InpLookback * FEAT_PER_BAR;
+
+   int processed = 0;
+   uint tPred = GetTickCount();
+
+   for(int batchStart = 0; batchStart < totalPredict; batchStart += batchSize)
+   {
+      int curBatch = MathMin(batchSize, totalPredict - batchStart);
+
+      int sampleBars[];
+      ArrayResize(sampleBars, curBatch);
+      for(int i = 0; i < curBatch; i++)
+         sampleBars[i] = startPred + batchStart + i;
+
+      double X[];
+      BuildSequenceInput(barFeats, featNewest, featRange,
+                         sampleBars, curBatch, InpLookback, X);
+
+      double Y[];
+      ArrayResize(Y, curBatch * OUTPUT_DIM);
+
+      if(!DN_PredictBatch(g_NetHandle, X, curBatch, inDim, 0, Y))
+      {
+         if(InpVerboseLog) Print("PredictBatch fail at offset ", batchStart);
+         break;
+      }
+
+      for(int i = 0; i < curBatch; i++)
+      {
+         int barIdx = sampleBars[i];
+         if(barIdx < 0 || barIdx >= rates_total) continue;
+
+         double predDir  = MathMax(-1.0, MathMin(1.0,  Y[i * OUTPUT_DIM + 0]));
+         double predMag  = MathMax(0.0,  MathMin(2.0,  Y[i * OUTPUT_DIM + 1]));
+         double predConf = MathMax(0.0,  MathMin(1.0,  Y[i * OUTPUT_DIM + 2]));
+
+         g_PredDirection[barIdx] = predDir;
+         g_Magnitude[barIdx]     = predMag;
+         g_Confidence[barIdx]    = predConf;
+
+         double atr = GetCachedATR(barIdx);
+         double move = predDir * predMag * atr;
+         g_PredictedPrice[barIdx] = close[barIdx] + move;
+
+         double bw = atr * (1.0 - predConf) * 2.0;
+         g_UpperBand[barIdx] = g_PredictedPrice[barIdx] + bw;
+         g_LowerBand[barIdx] = g_PredictedPrice[barIdx] - bw;
+
+         g_TrendStrength[barIdx] = predDir * predMag * predConf * 100;
+         g_TrendColor[barIdx]    = (predDir > 0) ? 0 : 1;
+
+         if(barIdx + InpPredictAhead < rates_total &&
+            MathAbs(g_PredDirection[barIdx]) >= 0.1)
+         {
+            int evalBar = barIdx - InpPredictAhead;
+            if(evalBar >= 0 && evalBar < rates_total)
+            {
+               double actualMove = close[evalBar] - close[barIdx];
+               bool correct = (g_PredDirection[barIdx] > 0 && actualMove > 0) ||
+                              (g_PredDirection[barIdx] < 0 && actualMove < 0);
+               g_TotalPred++;
+               if(correct) g_CorrectPred++;
+            }
+         }
+      }
+
+      processed += curBatch;
+   }
+
+   g_LastPredictedTo = startPred;
+
+   if(InpVerboseLog)
+      Print(StringFormat("Predicted %d bars in %d ms (%.0f bars/sec)",
+            processed, GetTickCount() - tPred,
+            processed * 1000.0 / MathMax(1, GetTickCount() - tPred)));
+}
+
+//+------------------------------------------------------------------+
+//| Draw future prediction                                            |
+//+------------------------------------------------------------------+
+void DrawFuturePrediction(int lastBar,
+                          const datetime &time[],
+                          const double &close[],
+                          const double &high[],
+                          const double &low[])
+{
+   ObjectsDeleteAll(0, g_FuturePrefix);
+   if(!InpShowFutureLine || !g_ModelReady) return;
+
+   double pDir  = g_PredDirection[lastBar];
+   double pMag  = g_Magnitude[lastBar];
+   double pConf = g_Confidence[lastBar];
+   if(MathAbs(pDir) < 0.05) return;
+
+   double curPrice = close[lastBar];
+   double atr = GetCachedATR(lastBar);
+
+   datetime curTime = time[lastBar];
+   int pSec = PeriodSeconds();
+
+   double prices[];
+   datetime times[];
+   ArrayResize(prices, InpFutureBars + 1);
+   ArrayResize(times,  InpFutureBars + 1);
+
+   prices[0] = curPrice;
+   times[0]  = curTime;
+
+   for(int i = 1; i <= InpFutureBars; i++)
+   {
+      double decay = MathExp(-0.1 * i);
+      prices[i] = prices[i-1] + pDir * pMag * atr * decay / InpPredictAhead;
+      times[i]  = curTime + i * pSec;
+   }
+
+   color lc = (pDir > 0) ? InpBullColor : InpBearColor;
+
+   for(int i = 0; i < InpFutureBars; i++)
+   {
+      string nm = g_FuturePrefix + "L" + IntegerToString(i);
+      ObjectCreate(0, nm, OBJ_TREND, 0, times[i], prices[i], times[i+1], prices[i+1]);
+      ObjectSetInteger(0, nm, OBJPROP_COLOR, lc);
+      ObjectSetInteger(0, nm, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, nm, OBJPROP_RAY_RIGHT, false);
+      ObjectSetInteger(0, nm, OBJPROP_SELECTABLE, false);
+   }
+
+   if(InpShowConfidence)
+   {
+      double bw = atr * (1.0 - pConf) * 2.0;
+      for(int i = 0; i < InpFutureBars; i++)
+      {
+         string nu = g_FuturePrefix + "U" + IntegerToString(i);
+         string nd = g_FuturePrefix + "D" + IntegerToString(i);
+         ObjectCreate(0, nu, OBJ_TREND, 0,
+                      times[i], prices[i]+bw, times[i+1], prices[i+1]+bw);
+         ObjectCreate(0, nd, OBJ_TREND, 0,
+                      times[i], prices[i]-bw, times[i+1], prices[i+1]-bw);
+         ObjectSetInteger(0, nu, OBJPROP_COLOR, lc);
+         ObjectSetInteger(0, nu, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, nu, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, nd, OBJPROP_COLOR, lc);
+         ObjectSetInteger(0, nd, OBJPROP_STYLE, STYLE_DOT);
+         ObjectSetInteger(0, nd, OBJPROP_SELECTABLE, false);
+      }
+   }
+
+   string an = g_FuturePrefix + "Arr";
+   ENUM_OBJECT at = (pDir > 0) ? OBJ_ARROW_UP : OBJ_ARROW_DOWN;
+   ObjectCreate(0, an, at, 0, times[InpFutureBars], prices[InpFutureBars]);
+   ObjectSetInteger(0, an, OBJPROP_COLOR, lc);
+   ObjectSetInteger(0, an, OBJPROP_WIDTH, 3);
+   ObjectSetInteger(0, an, OBJPROP_SELECTABLE, false);
+
+   string ln = g_FuturePrefix + "PL";
+   ObjectCreate(0, ln, OBJ_TEXT, 0, times[InpFutureBars], prices[InpFutureBars]);
+   ObjectSetString(0, ln, OBJPROP_TEXT,
+      StringFormat("%.5f (%.0f%%)", prices[InpFutureBars], pConf * 100));
+   ObjectSetInteger(0, ln, OBJPROP_COLOR, lc);
+   ObjectSetInteger(0, ln, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, ln, OBJPROP_ANCHOR, ANCHOR_LEFT);
+}
+
+//+------------------------------------------------------------------+
+//| Format seconds to readable string                                 |
+//+------------------------------------------------------------------+
+string FormatDuration(double seconds)
+{
+   int s = (int)MathRound(seconds);
+   if(s < 0) return "--:--";
+   if(s < 60)   return StringFormat("%ds", s);
+   if(s < 3600) return StringFormat("%dm%02ds", s / 60, s % 60);
+   return StringFormat("%dh%02dm", s / 3600, (s % 3600) / 60);
+}
+
+//+------------------------------------------------------------------+
+//| Progress bar                                                      |
+//+------------------------------------------------------------------+
+void CreateProgressBar()
+{
+   int yOff = 235;
+
+   string bg = g_ProgPrefix + "BG";
+   ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, bg, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, yOff);
+   ObjectSetInteger(0, bg, OBJPROP_XSIZE, InpProgressWidth);
+   ObjectSetInteger(0, bg, OBJPROP_YSIZE, InpProgressHeight);
+   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, C'40,40,50');
+   ObjectSetInteger(0, bg, OBJPROP_BORDER_COLOR, clrDimGray);
+   ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, bg, OBJPROP_HIDDEN, true);
+
+   string fi = g_ProgPrefix + "Fill";
+   ObjectCreate(0, fi, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, fi, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, fi, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, fi, OBJPROP_YDISTANCE, yOff);
+   ObjectSetInteger(0, fi, OBJPROP_XSIZE, 0);
+   ObjectSetInteger(0, fi, OBJPROP_YSIZE, InpProgressHeight);
+   ObjectSetInteger(0, fi, OBJPROP_BGCOLOR, clrDodgerBlue);
+   ObjectSetInteger(0, fi, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, fi, OBJPROP_WIDTH, 0);
+   ObjectSetInteger(0, fi, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, fi, OBJPROP_HIDDEN, true);
+
+   string tx = g_ProgPrefix + "Txt";
+   ObjectCreate(0, tx, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, tx, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, tx, OBJPROP_XDISTANCE, 15 + InpProgressWidth / 2);
+   ObjectSetInteger(0, tx, OBJPROP_YDISTANCE, yOff + 2);
+   ObjectSetInteger(0, tx, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, tx, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, tx, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, tx, OBJPROP_ANCHOR, ANCHOR_CENTER);
+   ObjectSetInteger(0, tx, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, tx, OBJPROP_HIDDEN, true);
+
+   string dt = g_ProgPrefix + "Det";
+   ObjectCreate(0, dt, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, dt, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, dt, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, dt, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 4);
+   ObjectSetInteger(0, dt, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, dt, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, dt, OBJPROP_COLOR, clrSilver);
+   ObjectSetInteger(0, dt, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, dt, OBJPROP_HIDDEN, true);
+
+   string ms = g_ProgPrefix + "MSE";
+   ObjectCreate(0, ms, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, ms, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, ms, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, ms, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 19);
+   ObjectSetInteger(0, ms, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, ms, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, ms, OBJPROP_COLOR, clrGold);
+   ObjectSetInteger(0, ms, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, ms, OBJPROP_HIDDEN, true);
+
+   // Extra line: LR + GradNorm
+   string lr = g_ProgPrefix + "LR";
+   ObjectCreate(0, lr, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, lr, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, lr, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, lr, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 34);
+   ObjectSetInteger(0, lr, OBJPROP_FONTSIZE, 8);
+   ObjectSetString(0, lr, OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, lr, OBJPROP_COLOR, clrCornflowerBlue);
+   ObjectSetInteger(0, lr, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, lr, OBJPROP_HIDDEN, true);
+
+   string tt = g_ProgPrefix + "Title";
+   ObjectCreate(0, tt, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, tt, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, tt, OBJPROP_XDISTANCE, 15);
+   ObjectSetInteger(0, tt, OBJPROP_YDISTANCE, yOff - 16);
+   ObjectSetInteger(0, tt, OBJPROP_FONTSIZE, 9);
+   ObjectSetString(0, tt, OBJPROP_FONT, "Arial Bold");
+   ObjectSetInteger(0, tt, OBJPROP_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, tt, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, tt, OBJPROP_HIDDEN, true);
+}
+
+void UpdateProgressBar()
+{
+   bool show = g_IsTraining ||
+               (g_TrainStartTime > 0 && TimeCurrent() - g_TrainStartTime < 5);
+
+   string names[] = { "BG","Fill","Txt","Det","MSE","LR","Title" };
+   for(int i = 0; i < ArraySize(names); i++)
+   {
+      string n = g_ProgPrefix + names[i];
+      ObjectSetInteger(0, n, OBJPROP_TIMEFRAMES,
+                       show ? OBJ_ALL_PERIODS : OBJ_NO_PERIODS);
+   }
+
+   if(!show) { ChartRedraw(); return; }
+
+   //--- Use GPU-side progress (accurate percentage from DLL)
+   double prog = g_ProgPercent / 100.0;
+   prog = MathMax(0.0, MathMin(1.0, prog));
+
+   // Fallback if GPU hasn't reported yet
+   if(prog < 0.001 && g_TargetEpochs > 0 && g_CurrentEpochs > 0)
+      prog = MathMin(1.0, (double)g_CurrentEpochs / g_TargetEpochs);
+
+   color fc;
+   if(prog < 0.33)      fc = clrOrangeRed;
+   else if(prog < 0.66) fc = clrGold;
+   else if(prog < 1.0)  fc = clrDodgerBlue;
+   else                 fc = clrLime;
+
+   int fw = (int)(InpProgressWidth * prog);
+   ObjectSetInteger(0, g_ProgPrefix + "Fill", OBJPROP_XSIZE, MathMax(0, fw));
+   ObjectSetInteger(0, g_ProgPrefix + "Fill", OBJPROP_BGCOLOR, fc);
+
+   ObjectSetString(0, g_ProgPrefix + "Txt", OBJPROP_TEXT,
+                   StringFormat("%.1f%%", prog * 100));
+
+   //--- Detail line: epoch + minibatch + ETA (from GPU-side timing)
+   string det;
+   if(g_ProgTotalEpochs > 0)
+   {
+      det = StringFormat("Ep %d/%d", g_ProgEpoch, g_ProgTotalEpochs);
+
+      if(g_ProgTotalMB > 0)
+         det += StringFormat(" | MB %d/%d", g_ProgMB, g_ProgTotalMB);
+
+      // ETA from GPU-side (much more accurate than MQL5 datetime)
+      if(g_ProgETASec > 0)
+         det += " | ETA " + FormatDuration(g_ProgETASec);
+
+      if(g_ProgElapsedSec > 0)
+         det += " | " + FormatDuration(g_ProgElapsedSec);
+   }
+   else
+   {
+      det = StringFormat("Epoch %d / %d", g_CurrentEpochs, g_TargetEpochs);
+   }
+   ObjectSetString(0, g_ProgPrefix + "Det", OBJPROP_TEXT, det);
+
+   //--- MSE line
+   string mseT = "";
+   if(g_ProgMSE > 0 || g_LastMSE > 0)
+   {
+      double dispMSE = (g_ProgMSE > 0) ? g_ProgMSE : g_LastMSE;
+      mseT = StringFormat("MSE: %.6f", dispMSE);
+      if(InpTargetMSE > 0)
+         mseT += StringFormat(" -> %.4f (%.0f%%)",
+                  InpTargetMSE, MathMin(100.0, InpTargetMSE / MathMax(1e-12, dispMSE) * 100));
+
+      double dispBest = (g_ProgBestMSE > 0 && g_ProgBestMSE < 1e10) ?
+                         g_ProgBestMSE : g_BestMSE;
+      if(dispBest < 1e9)
+         mseT += StringFormat(" | Best: %.6f", dispBest);
+   }
+   ObjectSetString(0, g_ProgPrefix + "MSE", OBJPROP_TEXT, mseT);
+
+   //--- LR + Grad norm line
+   string lrT = "";
+   if(g_ProgLR > 0)
+      lrT = StringFormat("LR: %.6f", g_ProgLR);
+   if(g_ProgGradNorm > 0)
+   {
+      if(StringLen(lrT) > 0) lrT += " | ";
+      lrT += StringFormat("GradNorm: %.4f", g_ProgGradNorm);
+   }
+   if(g_ProgTotalSteps > 0)
+   {
+      if(StringLen(lrT) > 0) lrT += " | ";
+      lrT += StringFormat("Step: %d", g_ProgTotalSteps); // FIX: use cached steps
+   }
+   ObjectSetString(0, g_ProgPrefix + "LR", OBJPROP_TEXT, lrT);
+
+   //--- Title
+   string ttl = "GPU Training";
+   if(g_IsTraining)
+   {
+      int d = ((int)(GetTickCount() / 400)) % 4;
+      ttl += StringSubstr("....", 0, d);
+   }
+   else if(prog >= 1.0)
+      ttl = "Training Complete!";
+
+   ObjectSetString(0, g_ProgPrefix + "Title", OBJPROP_TEXT, ttl);
+   ObjectSetInteger(0, g_ProgPrefix + "Title", OBJPROP_COLOR,
+                    g_IsTraining ? clrYellow : clrLime);
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Info panel                                                        |
+//+------------------------------------------------------------------+
+void CreateInfoPanel()
+{
+   string bg = g_InfoPrefix + "BG";
+   ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, bg, OBJPROP_CORNER, InpInfoCorner);
+   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, 30);
+   ObjectSetInteger(0, bg, OBJPROP_XSIZE, 290);
+   ObjectSetInteger(0, bg, OBJPROP_YSIZE, 195);
+   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, C'30,30,40');
+   ObjectSetInteger(0, bg, OBJPROP_BORDER_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, bg, OBJPROP_WIDTH, 2);
+   ObjectSetInteger(0, bg, OBJPROP_BACK, false);
+   ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
+
+   MakeLabel(g_InfoPrefix + "T", "LSTM-GPU Predictor v2.1",
+             15, 35, clrDodgerBlue, 11, true);
+}
+
+void UpdateInfoPanel()
+{
+   string st;
+   color sc;
+   if(g_IsTraining) { st = "GPU Training..."; sc = clrYellow; }
+   else if(g_ModelReady) { st = "Ready"; sc = clrLime; }
+   else { st = "Waiting"; sc = clrGray; }
+
+   MakeLabel(g_InfoPrefix + "St", "Status: " + st, 15, 55, sc, 9, false);
+
+   string arch = StringFormat("LSTM(%d->%d->%d", FEAT_PER_BAR, InpHiddenSize1, InpHiddenSize2);
+   if(InpHiddenSize3 > 0) arch += "->" + IntegerToString(InpHiddenSize3);
+   arch += ")->" + IntegerToString(OUTPUT_DIM);
+   MakeLabel(g_InfoPrefix + "Ar", arch, 15, 72, clrWhite, 9, false);
+
+   // Show live MSE during training from GPU
+   double dispMSE = g_LastMSE;
+   double dispBest = g_BestMSE;
+   if(g_IsTraining)
+   {
+      if(g_ProgMSE > 0) dispMSE = g_ProgMSE;
+      if(g_ProgBestMSE > 0 && g_ProgBestMSE < 1e10) dispBest = g_ProgBestMSE;
+   }
+   MakeLabel(g_InfoPrefix + "MSE",
+      StringFormat("MSE: %.6f (best: %.6f)", dispMSE, dispBest),
+      15, 89, clrSilver, 9, false);
+
+   MakeLabel(g_InfoPrefix + "Ep",
+      StringFormat("Epochs: %d | VRAM: ~%.0f MB", g_TotalEpochs, g_EstVRAM_MB),
+      15, 106, clrSilver, 9, false);
+
+   double acc = (g_TotalPred > 0) ? (double)g_CorrectPred / g_TotalPred * 100 : 0;
+   color ac = (acc > 55) ? clrLime : (acc > 50) ? clrYellow : clrOrangeRed;
+   MakeLabel(g_InfoPrefix + "Acc",
+      StringFormat("Accuracy: %.1f%% (%d/%d)", acc, g_CorrectPred, g_TotalPred),
+      15, 123, ac, 9, false);
+
+   int lb = g_TotalBars - 1;
+   if(lb >= 0 && g_ModelReady)
+   {
+      double dir = g_PredDirection[lb];
+      double conf = g_Confidence[lb];
+      double mag = g_Magnitude[lb];
+      string pt; color pc;
+
+      if(MathAbs(dir) < 0.1) { pt = "NEUTRAL"; pc = clrGray; }
+      else if(dir > 0) { pt = StringFormat("BULLISH (%.0f%%)", conf * 100); pc = clrLime; }
+      else { pt = StringFormat("BEARISH (%.0f%%)", conf * 100); pc = clrOrangeRed; }
+
+      MakeLabel(g_InfoPrefix + "Pr",
+         StringFormat("Next %d bars: %s", InpPredictAhead, pt),
+         15, 147, pc, 10, true);
+
+      MakeLabel(g_InfoPrefix + "Sg",
+         StringFormat("Dir: %.3f | Mag: %.3f | Conf: %.3f", dir, mag, conf),
+         15, 167, clrSilver, 9, false);
+
+      MakeLabel(g_InfoPrefix + "GP",
+         StringFormat("Batch: %d | Train: %d bars",
+                      InpPredictBatch, InpTrainBars),
+         15, 184, clrDarkGray, 8, false);
+   }
+   else
+   {
+      MakeLabel(g_InfoPrefix + "Pr", "Awaiting model...", 15, 147, clrGray, 9, false);
+      MakeLabel(g_InfoPrefix + "Sg", "", 15, 167, clrGray, 9, false);
+      MakeLabel(g_InfoPrefix + "GP", "", 15, 184, clrGray, 8, false);
+   }
+
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Label helper                                                      |
+//+------------------------------------------------------------------+
+void MakeLabel(string name, string text, int x, int y,
+               color clr, int sz, bool bold)
+{
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, InpInfoCorner);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, sz);
+   ObjectSetString(0, name, OBJPROP_FONT, bold ? "Arial Bold" : "Arial");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+//+------------------------------------------------------------------+
+//| Cleanup                                                           |
+//+------------------------------------------------------------------+
+void CleanupObjects()
+{
+   ObjectsDeleteAll(0, g_FuturePrefix);
+   ObjectsDeleteAll(0, g_InfoPrefix);
+   ObjectsDeleteAll(0, g_ProgPrefix);
+}
+
+//+------------------------------------------------------------------+
+//| DLL error                                                         |
+//+------------------------------------------------------------------+
+string GetDLLError()
+{
+   short buf[];
+   ArrayResize(buf, 512);
+   DN_GetError(buf, 512);
+   string s = "";
+   for(int i = 0; i < 512 && buf[i] != 0; i++)
+      s += ShortToString(buf[i]);
+   return s;
+}
+
+//+------------------------------------------------------------------+
+//| Save / Load model                                                 |
+//+------------------------------------------------------------------+
+bool SaveModel()
+{
+   if(g_NetHandle == 0) return false;
+   int sz = DN_SaveState(g_NetHandle);
+   if(sz <= 0) return false;
+   char buf[];
+   ArrayResize(buf, sz);
+   if(!DN_GetState(g_NetHandle, buf, sz)) return false;
+   int fh = FileOpen(InpModelFile, FILE_WRITE | FILE_BIN | FILE_COMMON);
+   if(fh == INVALID_HANDLE) return false;
+   FileWriteArray(fh, buf);
+   FileClose(fh);
+   Print("Model saved (", sz, " bytes)");
+   return true;
+}
+
+bool LoadModel()
+{
+   if(g_NetHandle == 0) return false;
+   int fh = FileOpen(InpModelFile, FILE_READ | FILE_BIN | FILE_COMMON);
+   if(fh == INVALID_HANDLE) return false;
+   ulong fs = FileSize(fh);
+   if(fs == 0 || fs > 100000000) { FileClose(fh); return false; }
+   char buf[];
+   ArrayResize(buf, (int)fs + 1);
+   FileReadArray(fh, buf);
+   FileClose(fh);
+   buf[(int)fs] = 0;
+   if(!DN_LoadState(g_NetHandle, buf))
+   { Print("LoadState fail: ", GetDLLError()); return false; }
+   return true;
 }
 //+------------------------------------------------------------------+
