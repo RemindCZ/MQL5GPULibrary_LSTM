@@ -1,6 +1,6 @@
-﻿// kernel.cu — LSTM DLL v1.3.0 (Async Support — Thread-Safe)
+// kernel.cu — LSTM DLL v1.4.0 (Async Support + Progress Reporting)
 // Pure LSTM implementation with CUDA acceleration
-// Features: Async training, Dropout, Multi-layer, Persistent buffers
+// Features: Async training, Dropout, Multi-layer, Persistent buffers, Progress
 // Build as: Dynamic Library (.dll)
 // ============================================================================
 //
@@ -51,6 +51,7 @@
 #include <numeric>
 #include <thread>
 #include <limits>
+#include <chrono>
 
 #pragma comment(lib, "cudart.lib")
 #pragma comment(lib, "cublas.lib")
@@ -252,8 +253,8 @@ struct GPUContext {
 
     void Destroy() {
         if (curand_gen) { curandDestroyGenerator(curand_gen); curand_gen = nullptr; }
-        if (blas) { cublasDestroy(blas); blas = nullptr; }
-        if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
+        if (blas) { cublasDestroy(blas);                blas = nullptr; }
+        if (stream) { cudaStreamDestroy(stream);          stream = nullptr; }
         ok = false;
     }
 };
@@ -270,6 +271,56 @@ static inline unsigned toU32(size_t v) {
 }
 
 // ============================================================================
+// Training Progress Structure (lock-free readable from MQL5)
+// ============================================================================
+struct TrainingProgress {
+    std::atomic<int>       current_epoch{ 0 };
+    std::atomic<int>       total_epochs{ 0 };
+    std::atomic<int>       current_minibatch{ 0 };
+    std::atomic<int>       total_minibatches{ 0 };
+    std::atomic<float>     current_lr{ 0.0f };
+    std::atomic<float>     last_mse{ 0.0f };
+    std::atomic<float>     best_mse{ std::numeric_limits<float>::max() };
+    std::atomic<float>     grad_norm{ 0.0f };
+    std::atomic<int>       total_steps{ 0 };
+    std::atomic<float>     progress_pct{ 0.0f };   // 0.0 — 100.0
+    std::atomic<long long> elapsed_ms{ 0 };
+    std::atomic<long long> eta_ms{ 0 };
+    std::atomic<long long> start_time_ms{ 0 };
+
+    void Reset() {
+        current_epoch.store(0);
+        total_epochs.store(0);
+        current_minibatch.store(0);
+        total_minibatches.store(0);
+        current_lr.store(0.0f);
+        last_mse.store(0.0f);
+        best_mse.store(std::numeric_limits<float>::max());
+        grad_norm.store(0.0f);
+        total_steps.store(0);
+        progress_pct.store(0.0f);
+        elapsed_ms.store(0);
+        eta_ms.store(0);
+        start_time_ms.store(0);
+    }
+
+    void UpdateTiming() {
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        long long start = start_time_ms.load();
+        if (start > 0) {
+            long long el = now_ms - start;
+            elapsed_ms.store(el);
+            float pct = progress_pct.load();
+            if (pct > 0.1f && pct < 100.0f) {
+                long long total_estimated = (long long)((double)el / (pct / 100.0));
+                eta_ms.store(std::max(0LL, total_estimated - el));
+            }
+        }
+    }
+};
+
+// ============================================================================
 // Warp reduction helpers
 // ============================================================================
 __device__ __forceinline__ float warpReduceSumFloat(float v) {
@@ -279,7 +330,7 @@ __device__ __forceinline__ float warpReduceSumFloat(float v) {
 }
 
 // ============================================================================
-// CUDA kernels (unchanged logic)
+// CUDA kernels
 // ============================================================================
 __global__ void kCopyD2F_vec4(int n, const double* __restrict__ in,
     float* __restrict__ out)
@@ -632,36 +683,29 @@ __global__ void kAddInplace(int n, float* __restrict__ dst,
 // LSTMLayer
 // ============================================================================
 struct LSTMLayer {
-    int input_size = 0;
-    int hidden_size = 0;
+    int  input_size = 0;
+    int  hidden_size = 0;
     bool is_valid = false;
 
-    // W: [concat_dim x gate_dim] column-major, lda = concat_dim
-    // b: [gate_dim]
     GPUMemory<float> W, b;
-    GPUMemory<float> mW, vW, mb, vb; // AdamW states
-    GPUMemory<float> dW, db;         // accumulated gradients
+    GPUMemory<float> mW, vW, mb, vb;
+    GPUMemory<float> dW, db;
 
     GPUMemory<float> W_best, b_best;
     bool has_snapshot = false;
 
-    // Per-timestep caches for BPTT
     std::vector<GPUMemory<float>> hx_cache;
     std::vector<GPUMemory<float>> f_cache, i_cache, g_cache, o_cache;
     std::vector<GPUMemory<float>> c_cache, h_cache;
     GPUMemory<float> h_init, c_init;
 
-    // Dropout
     bool  use_dropout = false;
     float dropout_rate = 0.0f;
     std::vector<GPUMemory<unsigned char>> dropout_mask;
-    std::vector<bool> dropout_mask_valid;
-    std::vector<GPUMemory<float>> h_drop_cache;
+    std::vector<bool>              dropout_mask_valid;
+    std::vector<GPUMemory<float>>  h_drop_cache;
 
-    // Persistent dropout random buffer (reused across timesteps)
     GPUMemory<float> dropout_rand;
-
-    // Input gradient buffer (filled by Backward, consumed by layer below)
     GPUMemory<float> dx_buf;
 
     LSTMLayer() = default;
@@ -696,12 +740,11 @@ struct LSTMLayer {
 
         if (!W.alloc(w_size))                      return MQL_FALSE;
         if (!b.alloc(gate_dim))                    return MQL_FALSE;
-        if (!mW.alloc(w_size) || !mW.zero())       return MQL_FALSE;
-        if (!vW.alloc(w_size) || !vW.zero())       return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero())      return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero())      return MQL_FALSE;
         if (!mb.alloc(gate_dim) || !mb.zero())     return MQL_FALSE;
         if (!vb.alloc(gate_dim) || !vb.zero())     return MQL_FALSE;
 
-        // Xavier init
         std::vector<float> hW(w_size);
         std::mt19937 gen(std::random_device{}());
         float stddev = sqrtf(2.0f / (float)(concat_dim + gate_dim));
@@ -709,7 +752,6 @@ struct LSTMLayer {
         for (float& w : hW) w = dist(gen);
         CUDA_CHECK_RET(cudaMemcpy(W.ptr, hW.data(), w_size * sizeof(float), cudaMemcpyHostToDevice));
 
-        // Forget gate bias = 1.0
         std::vector<float> hb(gate_dim, 0.0f);
         for (int j = 0; j < hidden_size; j++) hb[j] = 1.0f;
         CUDA_CHECK_RET(cudaMemcpy(b.ptr, hb.data(), gate_dim * sizeof(float), cudaMemcpyHostToDevice));
@@ -787,7 +829,6 @@ struct LSTMLayer {
         GPUMemory<float> gates_raw;
         if (!gates_raw.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
 
-        // Pre-alloc dropout RNG buffer once
         size_t rand_count = 0;
         if (use_dropout && training && dropout_rate > 0.0f && curand_gen) {
             rand_count = RoundUpEven(hb_size);
@@ -798,37 +839,33 @@ struct LSTMLayer {
 
         for (int t = 0; t < seq_len; t++) {
             if (!hx_cache[t].alloc((size_t)concat_dim * batch)) return MQL_FALSE;
-            if (!f_cache[t].alloc(hb_size)) return MQL_FALSE;
-            if (!i_cache[t].alloc(hb_size)) return MQL_FALSE;
-            if (!g_cache[t].alloc(hb_size)) return MQL_FALSE;
-            if (!o_cache[t].alloc(hb_size)) return MQL_FALSE;
-            if (!c_cache[t].alloc(hb_size)) return MQL_FALSE;
-            if (!h_cache[t].alloc(hb_size)) return MQL_FALSE;
+            if (!f_cache[t].alloc(hb_size))  return MQL_FALSE;
+            if (!i_cache[t].alloc(hb_size))  return MQL_FALSE;
+            if (!g_cache[t].alloc(hb_size))  return MQL_FALSE;
+            if (!o_cache[t].alloc(hb_size))  return MQL_FALSE;
+            if (!c_cache[t].alloc(hb_size))  return MQL_FALSE;
+            if (!h_cache[t].alloc(hb_size))  return MQL_FALSE;
 
             const float* h_prev = (t == 0) ? h_init.ptr : h_cache[t - 1].ptr;
             const float* c_prev = (t == 0) ? c_init.ptr : c_cache[t - 1].ptr;
             const float* x_t = X + (size_t)t * batch * I;
 
-            // hx = [h_prev; x_t]  → [concat_dim x batch] col-major
             int total_concat = concat_dim * batch;
             kConcatHX << <toU32((total_concat + 255) / 256), 256, 0, stream_h >> > (
                 H, I, batch, h_prev, x_t, hx_cache[t].ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            // gates = W^T * hx  → [gate_dim x batch]
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                 gate_dim, batch, concat_dim,
                 &alpha, W.ptr, concat_dim, hx_cache[t].ptr, concat_dim,
                 &beta_zero, gates_raw.ptr, gate_dim));
 
-            // + bias
             dim3 threads(16, 16);
             dim3 blocks_bias(toU32((batch + 15) / 16), toU32((gate_dim + 15) / 16));
             kAddBiasInplace << <blocks_bias, threads, 0, stream_h >> > (
                 gate_dim, batch, gates_raw.ptr, b.ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            // LSTM gate nonlinearities
             int total_hb = (int)hb_size;
             kLSTMGatesForward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
                 H, batch, gates_raw.ptr, c_prev,
@@ -837,7 +874,6 @@ struct LSTMLayer {
                 g_cache[t].ptr, o_cache[t].ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            // Dropout on h output (inverted, per-timestep mask)
             if (use_dropout && training && dropout_rate > 0.0f && curand_gen) {
                 CURAND_CHECK_RET(curandGenerateUniform(curand_gen,
                     dropout_rand.ptr, rand_count));
@@ -860,11 +896,6 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    // Backward pass.
-    // dh_last: gradient from output layer → last timestep only (or nullptr)
-    // dh_above_seq: gradient from layer above, all timesteps [H * batch * seq_len]
-    //               ALREADY has this layer's dropout backward applied by caller.
-    // No internal dropout backward — caller is responsible.
     MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
         const float* dh_last,
         const float* dh_above_seq,
@@ -887,9 +918,9 @@ struct LSTMLayer {
         GPUMemory<float> dh_cur, dc_cur, dgates_raw, dhx, dh_prev_tmp;
         if (!dh_cur.alloc(hb_size) || !dh_cur.zeroAsync(stream_h)) return MQL_FALSE;
         if (!dc_cur.alloc(hb_size) || !dc_cur.zeroAsync(stream_h)) return MQL_FALSE;
-        if (!dgates_raw.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
-        if (!dhx.alloc((size_t)concat_dim * batch))      return MQL_FALSE;
-        if (!dh_prev_tmp.alloc(hb_size))                 return MQL_FALSE;
+        if (!dgates_raw.alloc((size_t)gate_dim * batch))                return MQL_FALSE;
+        if (!dhx.alloc((size_t)concat_dim * batch))                     return MQL_FALSE;
+        if (!dh_prev_tmp.alloc(hb_size))                                return MQL_FALSE;
 
         GPUMemory<float> dh_inj;
         if (dh_above_seq) {
@@ -899,7 +930,6 @@ struct LSTMLayer {
         if (!dx_buf.alloc((size_t)I * batch * seq_len) || !dx_buf.zeroAsync(stream_h))
             return MQL_FALSE;
 
-        // Seed dh_cur from output layer gradient (last timestep)
         if (dh_last) {
             CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_last,
                 hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
@@ -908,7 +938,6 @@ struct LSTMLayer {
         float alpha = 1.0f, beta_zero = 0.0f, beta_one = 1.0f;
 
         for (int t = seq_len - 1; t >= 0; t--) {
-            // Inject gradient from layer above (all timesteps)
             if (dh_above_seq) {
                 const float* dh_src_t = dh_above_seq + (size_t)t * hb_size;
 
@@ -934,24 +963,20 @@ struct LSTMLayer {
                 dgates_raw.ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            // dW += hx * dgates^T
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
                 concat_dim, gate_dim, batch,
                 &alpha, hx_cache[t].ptr, concat_dim, dgates_raw.ptr, gate_dim,
                 &beta_one, dW.ptr, concat_dim));
 
-            // db += dgates * ones
             CUBLAS_CHECK_RET(cublasSgemv(blas_h, CUBLAS_OP_N, gate_dim, batch,
                 &alpha, dgates_raw.ptr, gate_dim, ones_ptr, 1,
                 &beta_one, db.ptr, 1));
 
-            // dhx = W * dgates
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
                 concat_dim, batch, gate_dim,
                 &alpha, W.ptr, concat_dim, dgates_raw.ptr, gate_dim,
                 &beta_zero, dhx.ptr, concat_dim));
 
-            // Split dhx → dh_prev, dx_t
             float* dx_t = dx_buf.ptr + (size_t)t * batch * I;
             int total_concat = concat_dim * batch;
             kSplitDHX << <toU32((total_concat + 255) / 256), 256, 0, stream_h >> > (
@@ -1020,7 +1045,6 @@ struct OutputLayer {
     int  out_dim = 0;
     bool is_valid = false;
 
-    // W: [in_dim x out_dim] col-major, lda = in_dim
     GPUMemory<float> W, b;
     GPUMemory<float> mW, vW, mb, vb;
     GPUMemory<float> dW, db;
@@ -1035,9 +1059,9 @@ struct OutputLayer {
 
         size_t w_size = (size_t)in_dim * out_dim;
         if (!W.alloc(w_size))                    return MQL_FALSE;
-        if (!b.alloc(out_dim) || !b.zero())      return MQL_FALSE;
-        if (!mW.alloc(w_size) || !mW.zero())     return MQL_FALSE;
-        if (!vW.alloc(w_size) || !vW.zero())     return MQL_FALSE;
+        if (!b.alloc(out_dim) || !b.zero())     return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero())    return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero())    return MQL_FALSE;
         if (!mb.alloc(out_dim) || !mb.zero())    return MQL_FALSE;
         if (!vb.alloc(out_dim) || !vb.zero())    return MQL_FALSE;
 
@@ -1060,8 +1084,8 @@ struct OutputLayer {
         size_t w_size = (size_t)in_dim * out_dim;
         if (!W.alloc(w_size))                    return MQL_FALSE;
         if (!b.alloc(out_dim))                   return MQL_FALSE;
-        if (!mW.alloc(w_size) || !mW.zero())     return MQL_FALSE;
-        if (!vW.alloc(w_size) || !vW.zero())     return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero())    return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero())    return MQL_FALSE;
         if (!mb.alloc(out_dim) || !mb.zero())    return MQL_FALSE;
         if (!vb.alloc(out_dim) || !vb.zero())    return MQL_FALSE;
 
@@ -1074,7 +1098,6 @@ struct OutputLayer {
     {
         if (!is_valid) return MQL_FALSE;
         float alpha = 1.0f, beta_val = 0.0f;
-        // Y = W^T * h  → [out_dim x batch]
         CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_T, CUBLAS_OP_N,
             out_dim, batch, in_dim, &alpha, W.ptr, in_dim, h, in_dim,
             &beta_val, Y, out_dim));
@@ -1092,18 +1115,15 @@ struct OutputLayer {
         if (!is_valid) return MQL_FALSE;
         float alpha = 1.0f, beta_val = 0.0f;
 
-        // dW = h * dY^T
         if (!dW.alloc((size_t)in_dim * out_dim)) return MQL_FALSE;
         CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
             in_dim, out_dim, batch, &alpha, h, in_dim, dY, out_dim,
             &beta_val, dW.ptr, in_dim));
 
-        // db = dY * ones
         if (!db.alloc(out_dim)) return MQL_FALSE;
         CUBLAS_CHECK_RET(cublasSgemv(blas_h, CUBLAS_OP_N, out_dim, batch,
             &alpha, dY, out_dim, ones_ptr, 1, &beta_val, db.ptr, 1));
 
-        // dh = W * dY
         if (dh_out) {
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
                 in_dim, batch, out_dim, &alpha, W.ptr, in_dim, dY, out_dim,
@@ -1192,6 +1212,9 @@ class LSTMNet {
     std::thread       m_worker;
     double            m_final_mse = 0.0;
     int               m_final_epochs = 0;
+
+    // Progress reporting
+    TrainingProgress m_progress;
 
     float GetScheduledLR(int current_step) const {
         float lr = base_lr;
@@ -1320,15 +1343,12 @@ class LSTMNet {
         return total_mse_sum / (double)total_out;
     }
 
-    // Apply dropout backward for a given layer's mask to a gradient buffer
-    // in-place, for all timesteps. Used when gradient flows from layer above
-    // through a dropout boundary.
     MQL_BOOL ApplyDropoutBackwardAllTimesteps(
         LSTMLayer* layer, float* grad_buf, int seq_len, int batch,
         cudaStream_t stream_h)
     {
         if (!layer->use_dropout || layer->dropout_rate <= 0.0f)
-            return MQL_TRUE; // nothing to do
+            return MQL_TRUE;
 
         size_t hb_size = (size_t)layer->hidden_size * batch;
         int total_hb = (int)hb_size;
@@ -1366,6 +1386,17 @@ class LSTMNet {
         total_schedule_steps = max_epochs * nMiniBatches;
         warmup_steps = std::min(500, std::max(1, total_schedule_steps / 10));
 
+        // ── Progress init ──────────────────────────────────────────────
+        m_progress.Reset();
+        m_progress.total_epochs.store(max_epochs);
+        m_progress.total_minibatches.store(nMiniBatches);
+        {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            m_progress.start_time_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+        }
+        // ───────────────────────────────────────────────────────────────
+
         GPUMemory<float> X_mb_ts, T_mb, Y_pred_mb, dLoss_mb, dh_buf_mb;
         GPUMemory<int>   mb_idx;
 
@@ -1379,7 +1410,6 @@ class LSTMNet {
         if (!dLoss_mb.alloc(max_mb_t))                         return MQL_FALSE;
         if (!dh_buf_mb.alloc((size_t)mini_batch_size * H_last)) return MQL_FALSE;
 
-        // Ensure ones buffer
         int max_b = std::max(batch, mini_batch_size);
         if (ones.count < (size_t)max_b) {
             if (!ones.alloc((size_t)max_b)) return MQL_FALSE;
@@ -1388,10 +1418,19 @@ class LSTMNet {
                 max_b * sizeof(float), cudaMemcpyHostToDevice, ctx.stream));
         }
 
+        // Reusable buffer for grad-norm measurement
+        GPUMemory<float> grad_norm_reduce;
+        if (!grad_norm_reduce.alloc(1)) return MQL_FALSE;
+
         int final_epoch = 0;
 
         for (int epoch = 1; epoch <= max_epochs; ++epoch) {
             if (m_stop_flag.load()) break;
+
+            // ── Progress: epoch start ──────────────────────────────────
+            m_progress.current_epoch.store(epoch);
+            m_progress.current_minibatch.store(0);
+            // ───────────────────────────────────────────────────────────
 
             std::shuffle(host_indices.begin(), host_indices.end(), host_rng);
 
@@ -1407,6 +1446,19 @@ class LSTMNet {
                 float c1 = 1.0f / (1.0f - b1_pow);
                 float c2 = 1.0f / (1.0f - b2_pow);
                 float cur_lr = GetScheduledLR((int)step);
+
+                // ── Progress: minibatch update ─────────────────────────
+                m_progress.current_minibatch.store(mb + 1);
+                m_progress.current_lr.store(cur_lr);
+                m_progress.total_steps.store((int)step);
+                {
+                    float done_epochs = (float)(epoch - 1)
+                        + (float)(mb + 1) / (float)nMiniBatches;
+                    m_progress.progress_pct.store(
+                        done_epochs / (float)max_epochs * 100.0f);
+                    m_progress.UpdateTiming();
+                }
+                // ───────────────────────────────────────────────────────
 
                 CUDA_CHECK_RET(cudaMemcpyAsync(mb_idx.ptr,
                     host_indices.data() + mb_start,
@@ -1434,15 +1486,13 @@ class LSTMNet {
                 // --- BACKWARD ---
                 LSTMLayer* last_lstm = lstm_layers.back().get();
                 const float* h_for_output = last_lstm->GetOutputH(seq_len - 1, true);
-                bool used_dropout_on_h = (h_for_output != last_lstm->h_cache[seq_len - 1].ptr);
+                bool used_dropout_on_h =
+                    (h_for_output != last_lstm->h_cache[seq_len - 1].ptr);
 
                 if (!output_layer->Backward(ctx.blas, ctx.stream, dLoss_mb.ptr,
                     h_for_output, dh_buf_mb.ptr, ones.ptr, mb_size))
                     return MQL_FALSE;
 
-                // Apply last layer's dropout backward to dh_buf_mb ONCE here
-                // (output layer computed dh w.r.t. dropout-applied h,
-                //  so gradient must pass through dropout backward)
                 if (used_dropout_on_h) {
                     size_t hb_size = (size_t)H_last * mb_size;
                     int total_hb = (int)hb_size;
@@ -1460,31 +1510,23 @@ class LSTMNet {
                     }
                 }
 
-                // Backward through LSTM layers (top to bottom)
                 for (int li = nLayers - 1; li >= 0; li--) {
                     LSTMLayer* layer = lstm_layers[li].get();
                     const float* dh_last_ptr = nullptr;
                     const float* dh_above = nullptr;
 
                     if (li == nLayers - 1) {
-                        // Last layer: gradient from output layer (dropout already handled above)
                         dh_last_ptr = dh_buf_mb.ptr;
                     }
                     else {
-                        // Get dx_buf from layer above = gradient w.r.t. this layer's output
                         LSTMLayer* next_layer = lstm_layers[li + 1].get();
-
-                        // next_layer->dx_buf is gradient w.r.t. input of next layer
-                        // = gradient w.r.t. output of THIS layer WITH dropout applied
-                        // So we must apply THIS layer's dropout backward to it.
                         if (!ApplyDropoutBackwardAllTimesteps(
-                            layer, next_layer->dx_buf.ptr, seq_len, mb_size, ctx.stream))
+                            layer, next_layer->dx_buf.ptr, seq_len, mb_size,
+                            ctx.stream))
                             return MQL_FALSE;
-
                         dh_above = next_layer->dx_buf.ptr;
                     }
 
-                    // layer->Backward does NOT apply any dropout backward internally
                     if (!layer->Backward(ctx.blas, ctx.stream, dh_last_ptr,
                         dh_above, seq_len, mb_size, ones.ptr))
                         return MQL_FALSE;
@@ -1492,24 +1534,60 @@ class LSTMNet {
 
                 // Update all layers
                 for (int li = 0; li < nLayers; li++)
-                    if (!lstm_layers[li]->Update(cur_lr, c1, c2, (float)wd, grad_clip, ctx.stream))
+                    if (!lstm_layers[li]->Update(cur_lr, c1, c2, (float)wd,
+                        grad_clip, ctx.stream))
                         return MQL_FALSE;
-                if (!output_layer->Update(cur_lr, c1, c2, (float)wd, grad_clip, ctx.stream))
+                if (!output_layer->Update(cur_lr, c1, c2, (float)wd,
+                    grad_clip, ctx.stream))
                     return MQL_FALSE;
+
+                // ── Progress: grad norm (every 10 minibatches) ─────────
+                if ((mb % 10) == 0) {
+                    if (output_layer->dW.ptr && output_layer->dW.count > 0) {
+                        CUDA_CHECK_RET(cudaMemsetAsync(grad_norm_reduce.ptr,
+                            0, sizeof(float), ctx.stream));
+                        int nW = (int)output_layer->dW.count;
+                        kL2NormReduceWarp << <std::min((nW + 255) / 256, 1024),
+                            256, 0, ctx.stream >> > (
+                                nW, output_layer->dW.ptr, grad_norm_reduce.ptr);
+                        float gn = 0.0f;
+                        cudaMemcpyAsync(&gn, grad_norm_reduce.ptr, sizeof(float),
+                            cudaMemcpyDeviceToHost, ctx.stream);
+                        cudaStreamSynchronize(ctx.stream);
+                        m_progress.grad_norm.store(sqrtf(gn));
+                    }
+                }
+                // ───────────────────────────────────────────────────────
             }
 
             final_epoch = epoch;
+
             bool collect = (epoch == 1 || epoch == max_epochs || (epoch % 50) == 0);
             if (collect) {
                 last_full_train_mse = ComputeFullTrainMSE(ctx);
+
+                // ── Progress: MSE update ───────────────────────────────
+                m_progress.last_mse.store((float)last_full_train_mse);
+                float cur_best = m_progress.best_mse.load();
+                if ((float)last_full_train_mse < cur_best)
+                    m_progress.best_mse.store((float)last_full_train_mse);
+                // ───────────────────────────────────────────────────────
+
                 if (target_mse > 0.0 && last_full_train_mse > 0.0 &&
                     last_full_train_mse <= target_mse)
                     break;
             }
         }
 
+        // ── Progress: final ────────────────────────────────────────────
+        m_progress.progress_pct.store(100.0f);
+        m_progress.UpdateTiming();
+        // ───────────────────────────────────────────────────────────────
+
         if (last_full_train_mse <= 0.0)
             last_full_train_mse = ComputeFullTrainMSE(ctx);
+
+        m_progress.last_mse.store((float)last_full_train_mse);
 
         m_final_mse = last_full_train_mse;
         m_final_epochs = final_epoch;
@@ -1517,11 +1595,6 @@ class LSTMNet {
     }
 
 public:
-    // Locking policy:
-    // - net_mtx is a shared_mutex
-    // - Training thread holds EXCLUSIVE lock for entire duration
-    // - All other exports acquire EXCLUSIVE lock (they mutate caches/temporaries)
-    // - GetStatus/GetResult/StopTraining are lock-free (atomics only)
     std::shared_mutex net_mtx;
 
     float GetOutputMin()  const { return 0.0f; }
@@ -1593,21 +1666,27 @@ public:
         m_stop_flag.store(true);
     }
 
-    // StartTrainingAsync:
-    // Called with net_mtx held exclusively by the caller (FindAndLockExclusive).
-    // We release the caller's lock, then the worker acquires exclusive lock itself.
+    // ── Progress getters (all lock-free) ───────────────────────────────
+    int       GetProgressEpoch()            const { return m_progress.current_epoch.load(); }
+    int       GetProgressTotalEpochs()      const { return m_progress.total_epochs.load(); }
+    int       GetProgressMiniBatch()        const { return m_progress.current_minibatch.load(); }
+    int       GetProgressTotalMiniBatches() const { return m_progress.total_minibatches.load(); }
+    float     GetProgressLR()               const { return m_progress.current_lr.load(); }
+    float     GetProgressMSE()              const { return m_progress.last_mse.load(); }
+    float     GetProgressBestMSE()          const { return m_progress.best_mse.load(); }
+    float     GetProgressGradNorm()         const { return m_progress.grad_norm.load(); }
+    int       GetProgressTotalSteps()       const { return m_progress.total_steps.load(); }
+    float     GetProgressPercent()          const { return m_progress.progress_pct.load(); }
+    long long GetProgressElapsedMs()        const { return m_progress.elapsed_ms.load(); }
+    long long GetProgressETAMs()            const { return m_progress.eta_ms.load(); }
+    // ───────────────────────────────────────────────────────────────────
+
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
         double lr, double wd)
     {
-        // Already hold exclusive lock from caller — check state
         if (m_state.load() == TS_TRAINING) return MQL_FALSE;
 
-        // Join previous worker if any
         if (m_worker.joinable()) {
-            // Must release our lock to avoid deadlock (worker holds lock too)
-            // But we're called with lock held... We need a different approach.
-            // Actually: if m_state != TS_TRAINING, the worker is done and
-            // has released the lock. So join is safe while we hold the lock.
             m_worker.join();
         }
 
@@ -1617,12 +1696,7 @@ public:
         m_stop_flag.store(false);
         m_state.store(TS_TRAINING);
 
-        // NOTE: We launch the thread while holding the caller's exclusive lock.
-        // The worker will try to acquire exclusive lock. The caller's lock
-        // will be released when the DN_TrainAsync export returns (unique_lock dtor).
-        // So the worker will block briefly until that happens.
         m_worker = std::thread([this, max_epochs, target_mse, lr, wd]() {
-            // Acquire exclusive lock for entire training duration
             std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
 
             GPUContext ctx;
@@ -1633,10 +1707,8 @@ public:
 
             MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse, lr, wd);
 
-            // Sync before destroying context
             if (ctx.stream) cudaStreamSynchronize(ctx.stream);
 
-            // Release lock, then set state
             excl_lock.unlock();
             m_state.store(result ? TS_COMPLETED : TS_ERROR);
             });
@@ -1917,7 +1989,6 @@ static std::map<int, std::unique_ptr<LSTMNet>> g_nets;
 static int        g_id = 1;
 static std::mutex g_map_mtx;
 
-// Find net and acquire exclusive lock. Blocks if training is running.
 static LSTMNet* FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
@@ -1927,7 +1998,6 @@ static LSTMNet* FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>&
     return net;
 }
 
-// Find net without locking (for atomic-only operations)
 static LSTMNet* FindNetNoLock(int h) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
@@ -1964,18 +2034,14 @@ DLL_EXPORT int DLL_CALL DN_Create() {
 }
 
 DLL_EXPORT void DLL_CALL DN_Free(int h) {
-    // Stop training first (lock-free)
     {
         LSTMNet* net = FindNetNoLock(h);
         if (net) net->StopTraining();
     }
-    // Now acquire exclusive lock to ensure worker has finished
     {
         std::unique_lock<std::shared_mutex> lk;
         FindAndLockExclusive(h, lk);
-        // Lock acquired means worker is done. Release before erasing.
     }
-    // Erase (destructor will join worker thread)
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     g_nets.erase(h);
 }
@@ -2055,15 +2121,11 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     std::unique_lock<std::shared_mutex> lk;
     LSTMNet* net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
-    // StartTrainingAsync_Locked is called while we hold the exclusive lock.
-    // The worker thread will acquire its own exclusive lock after we release ours.
     MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
-    // lk releases here → worker thread can acquire exclusive lock
     return result;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
-    // Lock-free: atomics only
     LSTMNet* net = FindNetNoLock(h);
     return net ? net->GetStatus() : -1;
 }
@@ -2071,7 +2133,6 @@ DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
 DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
     int* out_epochs)
 {
-    // Lock-free: atomics only
     LSTMNet* net = FindNetNoLock(h);
     if (net) {
         double m; int e;
@@ -2082,9 +2143,95 @@ DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
 }
 
 DLL_EXPORT void DLL_CALL DN_StopTraining(int h) {
-    // Lock-free: atomic flag
     LSTMNet* net = FindNetNoLock(h);
     if (net) net->StopTraining();
+}
+
+// --- Progress exports (ALL LOCK-FREE) ---
+
+DLL_EXPORT int DLL_CALL DN_GetProgressEpoch(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? net->GetProgressEpoch() : 0;
+}
+
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalEpochs(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? net->GetProgressTotalEpochs() : 0;
+}
+
+DLL_EXPORT int DLL_CALL DN_GetProgressMiniBatch(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? net->GetProgressMiniBatch() : 0;
+}
+
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalMiniBatches(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? net->GetProgressTotalMiniBatches() : 0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressLR(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressLR() : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressMSE(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressMSE() : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressBestMSE(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressBestMSE() : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressGradNorm(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressGradNorm() : 0.0;
+}
+
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalSteps(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? net->GetProgressTotalSteps() : 0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressPercent(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressPercent() : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressElapsedSec(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressElapsedMs() / 1000.0 : 0.0;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetProgressETASec(int h) {
+    LSTMNet* net = FindNetNoLock(h);
+    return net ? (double)net->GetProgressETAMs() / 1000.0 : 0.0;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
+    int* out_epoch, int* out_total_epochs,
+    int* out_mb, int* out_total_mb,
+    double* out_lr, double* out_mse, double* out_best_mse,
+    double* out_grad_norm, double* out_pct,
+    double* out_elapsed_sec, double* out_eta_sec)
+{
+    LSTMNet* net = FindNetNoLock(h);
+    if (!net) return MQL_FALSE;
+
+    if (out_epoch)        *out_epoch = net->GetProgressEpoch();
+    if (out_total_epochs) *out_total_epochs = net->GetProgressTotalEpochs();
+    if (out_mb)           *out_mb = net->GetProgressMiniBatch();
+    if (out_total_mb)     *out_total_mb = net->GetProgressTotalMiniBatches();
+    if (out_lr)           *out_lr = (double)net->GetProgressLR();
+    if (out_mse)          *out_mse = (double)net->GetProgressMSE();
+    if (out_best_mse)     *out_best_mse = (double)net->GetProgressBestMSE();
+    if (out_grad_norm)    *out_grad_norm = (double)net->GetProgressGradNorm();
+    if (out_pct)          *out_pct = (double)net->GetProgressPercent();
+    if (out_elapsed_sec)  *out_elapsed_sec = (double)net->GetProgressElapsedMs() / 1000.0;
+    if (out_eta_sec)      *out_eta_sec = (double)net->GetProgressETAMs() / 1000.0;
+
+    return MQL_TRUE;
 }
 
 // --- State / diagnostics ---
