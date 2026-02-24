@@ -1985,24 +1985,24 @@ public:
 // ============================================================================
 // DLL Exports
 // ============================================================================
-static std::map<int, std::unique_ptr<LSTMNet>> g_nets;
+static std::map<int, std::shared_ptr<LSTMNet>> g_nets;
 static int        g_id = 1;
 static std::mutex g_map_mtx;
 
-static LSTMNet* FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
+static std::shared_ptr<LSTMNet> FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
     if (it == g_nets.end()) return nullptr;
-    LSTMNet* net = it->second.get();
+    std::shared_ptr<LSTMNet> net = it->second;
     lk = std::unique_lock<std::shared_mutex>(net->net_mtx);
     return net;
 }
 
-static LSTMNet* FindNetNoLock(int h) {
+static std::shared_ptr<LSTMNet> FindNetNoLock(int h) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
     if (it == g_nets.end()) return nullptr;
-    return it->second.get();
+    return it->second;
 }
 
 static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n) {
@@ -2025,30 +2025,32 @@ static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n
 }
 
 DLL_EXPORT int DLL_CALL DN_Create() {
-    auto net = std::make_unique<LSTMNet>();
+    auto net = std::make_shared<LSTMNet>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
     int id = g_id++;
-    g_nets[id] = std::move(net);
+    g_nets[id] = net;
     return id;
 }
 
 DLL_EXPORT void DLL_CALL DN_Free(int h) {
+    std::shared_ptr<LSTMNet> victim;
     {
-        LSTMNet* net = FindNetNoLock(h);
-        if (net) net->StopTraining();
+        std::lock_guard<std::mutex> map_lk(g_map_mtx);
+        auto it = g_nets.find(h);
+        if (it == g_nets.end()) return;
+        victim = it->second;
+        g_nets.erase(it);
     }
+    victim->StopTraining();
     {
-        std::unique_lock<std::shared_mutex> lk;
-        FindAndLockExclusive(h, lk);
+        std::unique_lock<std::shared_mutex> lk(victim->net_mtx);
     }
-    std::lock_guard<std::mutex> map_lk(g_map_mtx);
-    g_nets.erase(h);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetSequenceLength(seq_len);
     return MQL_TRUE;
@@ -2056,7 +2058,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetMiniBatchSize(int h, int mbs) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetMiniBatchSize(mbs);
     return MQL_TRUE;
@@ -2066,13 +2068,13 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_AddLayerEx(int h, int in, int out, int act,
     int ln, double drop)
 {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->AddLayer(in, out, act, ln, (float)drop) : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetGradClip((float)clip);
     return MQL_TRUE;
@@ -2080,7 +2082,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     return net->SetOutputLayer(out_dim);
 }
@@ -2089,7 +2091,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
     const double* T, int batch, int in, int out, int l)
 {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->LoadBatch(X, T, batch, in, out, l) : MQL_FALSE;
 }
 
@@ -2097,19 +2099,19 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_PredictBatch(int h, const double* X,
     int batch, int in, int l, double* Y)
 {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->PredictBatch(X, batch, in, l, Y) : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SnapshotWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->SnapshotWeights() : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_RestoreWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->RestoreWeights() : MQL_FALSE;
 }
 
@@ -2119,21 +2121,21 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     double target_mse, double lr, double wd)
 {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
     return result;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetStatus() : -1;
 }
 
 DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
     int* out_epochs)
 {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     if (net) {
         double m; int e;
         net->GetResult(m, e);
@@ -2143,69 +2145,69 @@ DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
 }
 
 DLL_EXPORT void DLL_CALL DN_StopTraining(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     if (net) net->StopTraining();
 }
 
 // --- Progress exports (ALL LOCK-FREE) ---
 
 DLL_EXPORT int DLL_CALL DN_GetProgressEpoch(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetProgressEpoch() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalEpochs(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalEpochs() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressMiniBatch(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetProgressMiniBatch() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalMiniBatches(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalMiniBatches() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressLR(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressLR() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressMSE(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressMSE() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressBestMSE(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressBestMSE() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressGradNorm(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressGradNorm() : 0.0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalSteps(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalSteps() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressPercent(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressPercent() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressElapsedSec(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressElapsedMs() / 1000.0 : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressETASec(int h) {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressETAMs() / 1000.0 : 0.0;
 }
 
@@ -2216,7 +2218,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
     double* out_grad_norm, double* out_pct,
     double* out_elapsed_sec, double* out_eta_sec)
 {
-    LSTMNet* net = FindNetNoLock(h);
+    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
     if (!net) return MQL_FALSE;
 
     if (out_epoch)        *out_epoch = net->GetProgressEpoch();
@@ -2238,25 +2240,25 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
 
 DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->GetLayerCount() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetLayerWeightNorm(l) : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetGradNorm() : 0.0;
 }
 
 DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return 0;
     if (!net->Save(net->serialize_buf)) return 0;
     return (int)net->serialize_buf.size() + 1;
@@ -2264,7 +2266,7 @@ DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     const auto& s = net->serialize_buf;
     if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
@@ -2275,7 +2277,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadState(int h, const char* buf) {
     std::unique_lock<std::shared_mutex> lk;
-    LSTMNet* net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->Load(buf) : MQL_FALSE;
 }
 
