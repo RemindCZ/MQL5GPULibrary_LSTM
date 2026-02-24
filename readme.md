@@ -5,6 +5,8 @@
 
 Open-source CUDA DLL pro MetaTrader 5, která implementuje vícevrstvou LSTM síť s asynchronním tréninkem, dropoutem, checkpointy, serializací stavu a **průběžným progress reportingem (v1.4.0)**.
 
+Aktuálně je knihovna připravená i pro novější indikátory typu **LSTM_RealTimePredictor.mq5 v2.1**, které používají rozšířené live metriky tréninku (MSE/LR/grad norm), přesnější ETA z GPU-side timing a jednotné čtení progresu přes `DN_GetProgressAll()`.
+
 ## Co je v repozitáři
 
 - `kernel.cu` – hlavní implementace DLL API (CUDA + cuBLAS + cuRAND).
@@ -35,6 +37,20 @@ Aktuální hlavička jádra deklaruje:
 8. **Textová serializace modelu** (`DN_SaveState`, `DN_GetState`, `DN_LoadState`) s hlavičkou `LSTM_V1`.
 9. **Progress reporting v reálném čase** přes lock-free API (`DN_GetProgress*`, `DN_GetProgressAll`).
 10. **Centrální chybový kanál** (`DN_GetError(short*...)`).
+11. **Single-call telemetry** pro UI panely (`DN_GetProgressAll`) bez potřeby vícenásobného lockingu při každém `OnTimer` ticku.
+
+## Ukázkový indikátor (doporučený pro novou verzi)
+
+Vedle `MQL5/Indicators/LSTMTrendStart.mq5` je vhodný i modernější příklad:
+
+- `LSTM_RealTimePredictor.mq5` **v2.1** (GPU-optimized real-time predictor), který demonstruje:
+  - nové pollování progressu přes `DN_GetProgressAll()` (epoch, minibatch, %, elapsed, ETA),
+  - zobrazení živých metrik během tréninku (`MSE`, `Best MSE`, `LR`, `GradNorm`, `Step`),
+  - přesnější ETA díky `DN_GetProgressElapsedSec()` a `DN_GetProgressETASec()`,
+  - vylepšený progress bar + info panel,
+  - asynchronní trénink na GPU a dávkovou predikci (`DN_PredictBatch`) pro vysoký výkon.
+
+> Pozn.: Tento příklad může být veden mimo tento repozitář jako samostatný `.mq5` soubor, ale API mapování níže je s ním plně kompatibilní.
 
 ## Matematický kontrakt a layout paměti
 
@@ -100,6 +116,8 @@ Lock-free telemetry (vhodná pro polling v `OnTimer`):
 - `double DN_GetProgressElapsedSec(int h);`
 - `double DN_GetProgressETASec(int h);`
 - `MQL_BOOL DN_GetProgressAll(...);` – bulk getter všech hlavních metrik jedním voláním.
+
+Praktické doporučení pro nové indikátory: v `OnTimer` preferuj `DN_GetProgressAll()` jako primární zdroj metrik a `DN_GetProgressTotalSteps()` jako doplňkový údaj pro detailní UI.
 
 ### 7) Diagnostika
 
