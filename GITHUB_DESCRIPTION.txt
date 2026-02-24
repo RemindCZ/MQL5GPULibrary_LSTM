@@ -1,1 +1,1 @@
-CUDA-accelerated open-source LSTM DLL for MetaTrader 5 with asynchronous training, dropout, checkpointing, and model serialization.
+CUDA-accelerated open-source LSTM DLL for MetaTrader 5 with asynchronous training, lock-free progress reporting, dropout, checkpointing, and model serialization.
