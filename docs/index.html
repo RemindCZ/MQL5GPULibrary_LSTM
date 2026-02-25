@@ -156,6 +156,51 @@
       box-shadow: 0 6px 16px rgba(126,197,255,0.35);
     }
 
+    .video-wrap {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      margin-bottom: 12px;
+      background: rgba(4, 10, 27, 0.92);
+    }
+
+    .video-wrap iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+
+    .video-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .video-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #cce3ff;
+      text-decoration: none;
+      border: 1px solid rgba(99, 179, 255, 0.45);
+      border-radius: 999px;
+      padding: 5px 12px;
+      background: rgba(20, 37, 80, 0.55);
+    }
+
+    .video-link:hover {
+      border-color: rgba(154, 125, 255, 0.6);
+      background: rgba(32, 47, 94, 0.8);
+    }
+
     footer { color: #91a9de; padding: 24px 0 40px; font-size: .9rem; }
   </style>
 </head>
@@ -178,6 +223,22 @@
       <h2>Architektura a tok dat</h2>
       <img src="./lstm-flow.svg" alt="Tok dat a API orchestrace LSTM DLL" class="flow-img"/>
       <p class="lead">Model pracuje se sekvencemi o délce <code>seq_len</code>, používá sloupcově orientované matice (column-major) pro cuBLAS a drží trénovací data v persistentních GPU bufferech. Každá instance modelu má vlastní handle, vlastní synchronizační primitiva a bezpečný lifecycle při uvolnění.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="video-demo-title">
+      <h2 id="video-demo-title">Video walkthrough projektu</h2>
+      <div class="video-wrap">
+        <iframe
+          src="https://www.youtube.com/embed/N_wc1mEvQP4"
+          title="MQL5GPULibrary_LSTM video walkthrough"
+          loading="lazy"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+          allowfullscreen></iframe>
+      </div>
+      <div class="video-meta">
+        <span>Praktická ukázka nasazení DLL v prostředí MetaTrader 5.</span>
+        <a class="video-link" href="https://youtu.be/N_wc1mEvQP4" target="_blank" rel="noopener noreferrer">▶ Otevřít video na YouTube</a>
+      </div>
     </section>
 
     <section class="grid" id="feature-cards"></section>

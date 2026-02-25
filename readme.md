@@ -7,6 +7,8 @@
 
 The current runtime is aligned with **LSTM DLL v1.4.0** and is compatible with newer indicator patterns (for example `LSTM_RealTimePredictor.mq5 v2.1`) that rely on unified progress polling through `DN_GetProgressAll()`.
 
+🎬 **Video walkthrough:** https://youtu.be/N_wc1mEvQP4
+
 ---
 
 ## Repository Contents
