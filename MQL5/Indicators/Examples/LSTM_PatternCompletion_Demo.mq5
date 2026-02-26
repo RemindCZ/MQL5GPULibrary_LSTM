@@ -1,9 +1,19 @@
 //+------------------------------------------------------------------+
 //| LSTM_PatternCompletion_Demo.mq5                                  |
-//| Demonstrates pattern-completion training using candle tokens.    |
-//| The indicator builds a symbolic sequence from OHLC, trains a     |
-//| small LSTM model through MQL5GPULibrary_LSTM.dll, and predicts   |
-//| bullish/bearish completion scores in [0..1].                     |
+//| Demonstrates pattern-completion training using candle features.   |
+//| Builds a window of SeqLen bars (series arrays: 0=current forming) |
+//| Trains small LSTM via MQL5GPULibrary_LSTM.dll and predicts        |
+//| bullish/bearish completion scores in [0..1].                      |
+//|                                                                  |
+//| IMPORTANT INDEXING (MQL5 series arrays):                          |
+//|   index 0 = current forming bar                                   |
+//|   index 1 = last closed bar                                       |
+//|   index increases into the past                                   |
+//|                                                                  |
+//| This demo:                                                       |
+//|   - trains from past windows that END at bar_end >= 1+PredK       |
+//|   - target looks "forward" K bars (towards the present)           |
+//|     meaning indices decrease: bar_end-1, bar_end-2, ...           |
 //+------------------------------------------------------------------+
 #property strict
 #property indicator_separate_window
@@ -31,79 +41,78 @@
    int    DN_SetMiniBatchSize(int h, int mbs);
    int    DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
    int    DN_SetOutputDim(int h, int out_dim);
+
    int    DN_LoadBatch(int h, const double &X[], const double &T[],
                        int batch, int in_dim, int out_dim, int layout);
+
    int    DN_TrainAsync(int h, int epochs, double target_mse,
                         double lr, double wd);
    int    DN_GetTrainingStatus(int h);
    void   DN_StopTraining(int h);
+
    int    DN_GetProgressAll(int h,
              int &epoch, int &total_epochs,
              int &mb, int &total_mb,
              double &lr, double &mse, double &best_mse,
              double &grad_norm, double &pct,
              double &elapsed_sec, double &eta_sec);
+
    int    DN_PredictBatch(int h, const double &X[], int batch,
                           int in_dim, int layout, double &Y[]);
+
    void   DN_GetError(short &buf[], int len);
 #import
 
+// -------------------- Inputs --------------------
 input group "Pattern Encoding"
 input int      InpSeqLen            = 20;     // Sequence length (bars)
-input int      InpPredK             = 5;      // Future bars to score
+input int      InpPredK             = 5;      // Future bars to score (towards present)
 input bool     InpUseDirectionFlag  = true;   // Add bullish/bearish flag
 input bool     InpNormalizeFeatures = true;   // Min-max normalize per window
 input double   InpNormEps           = 1e-8;   // Epsilon for safe division
 
 input group "Training"
-input int      InpHistoryBars       = 1500;   // Training history depth
+input int      InpHistoryBars       = 1500;   // Training history depth (bars into past)
 input int      InpMaxSamples        = 1200;   // Max training samples
 input int      InpHiddenSize1       = 32;     // LSTM layer 1 hidden size
 input int      InpHiddenSize2       = 16;     // LSTM layer 2 hidden size (0=off)
 input double   InpDropout           = 0.05;   // Dropout rate
 input int      InpTrainEpochs       = 25;     // Training epochs
-input double   InpTargetMSE         = 0.01;   // Target MSE
+input double   InpTargetMSE         = 0.01;   // Target MSE (DLL uses MSE)
 input double   InpLearningRate      = 0.001;  // Learning rate
 input double   InpWeightDecay       = 0.0001; // Weight decay
 input int      InpRetrainEveryBars  = 20;     // Retrain interval (new bars)
 input int      InpMiniBatch         = 32;     // Mini-batch size
 
-//+------------------------------------------------------------------+
-//| Globals                                                           |
-//+------------------------------------------------------------------+
+// -------------------- Globals --------------------
 double g_BullishBuffer[];
 double g_BearishBuffer[];
 
-int      g_NetHandle          = 0;
-bool     g_ModelReady         = false;
-bool     g_IsTraining         = false;
-int      g_BarsSinceTrain     = 0;
-datetime g_LastBarTime        = 0;
+int      g_NetHandle      = 0;
+bool     g_ModelReady     = false;
+bool     g_IsTraining     = false;
+int      g_BarsSinceTrain = 0;
+datetime g_LastClosedTime = 0;   // time[1] (last closed bar)
 
 // GPU progress
-int      g_ProgEpoch          = 0;
-int      g_ProgTotalEpochs    = 0;
-int      g_ProgMB             = 0;
-int      g_ProgTotalMB        = 0;
-double   g_ProgLR             = 0.0;
-double   g_ProgMSE            = 0.0;
-double   g_ProgBestMSE        = 0.0;
-double   g_ProgGradNorm       = 0.0;
-double   g_ProgPercent        = 0.0;
-double   g_ProgElapsedSec     = 0.0;
-double   g_ProgETASec         = 0.0;
+int      g_ProgEpoch       = 0;
+int      g_ProgTotalEpochs = 0;
+int      g_ProgMB          = 0;
+int      g_ProgTotalMB     = 0;
+double   g_ProgLR          = 0.0;
+double   g_ProgMSE         = 0.0;
+double   g_ProgBestMSE     = 0.0;
+double   g_ProgGradNorm    = 0.0;
+double   g_ProgPercent     = 0.0;
+double   g_ProgElapsedSec  = 0.0;
+double   g_ProgETASec      = 0.0;
 
-//+------------------------------------------------------------------+
-//| Feature dimension per bar                                         |
-//+------------------------------------------------------------------+
+// -------------------- Helpers --------------------
 int FeatureDim()
 {
    return (InpUseDirectionFlag ? 4 : 3);
 }
 
-//+------------------------------------------------------------------+
-//| Get DLL error string                                              |
-//+------------------------------------------------------------------+
 string GetDLLError()
 {
    short buf[];
@@ -120,17 +129,11 @@ string GetDLLError()
    return s;
 }
 
-//+------------------------------------------------------------------+
-//| Safe value check                                                  |
-//+------------------------------------------------------------------+
 bool IsFiniteValue(double v)
 {
    return (MathIsValidNumber(v) && v > -1e300 && v < 1e300);
 }
 
-//+------------------------------------------------------------------+
-//| Safe division                                                     |
-//+------------------------------------------------------------------+
 double SafeDiv(double num, double den, double eps)
 {
    if(!IsFiniteValue(num))
@@ -144,9 +147,6 @@ double SafeDiv(double num, double den, double eps)
    return out;
 }
 
-//+------------------------------------------------------------------+
-//| Format seconds to readable string                                 |
-//+------------------------------------------------------------------+
 string FormatDuration(double seconds)
 {
    int s = (int)MathRound(seconds);
@@ -156,9 +156,18 @@ string FormatDuration(double seconds)
    return StringFormat("%dh%02dm", s / 3600, (s % 3600) / 60);
 }
 
-//+------------------------------------------------------------------+
-//| Initialize LSTM network                                           |
-//+------------------------------------------------------------------+
+// Sigmoid keeps outputs sane even if linear head is unbounded.
+// (Your DLL output layer is linear.)
+double Sigmoid(double x)
+{
+   if(!IsFiniteValue(x)) return 0.5;
+   // clamp for numeric sanity
+   if(x > 60.0)  return 1.0;
+   if(x < -60.0) return 0.0;
+   return 1.0 / (1.0 + MathExp(-x));
+}
+
+// -------------------- Network init --------------------
 bool InitNetwork()
 {
    g_NetHandle = DN_Create();
@@ -209,54 +218,56 @@ bool InitNetwork()
       return false;
    }
 
-   Print(StringFormat("Network: %d -> LSTM(%d) -> LSTM(%d) -> 2",
+   Print(StringFormat("Network: feat=%d -> LSTM(%d)%s -> 2",
          FeatureDim(), InpHiddenSize1,
-         InpHiddenSize2 > 0 ? InpHiddenSize2 : InpHiddenSize1));
+         (InpHiddenSize2 > 0 ? StringFormat(" -> LSTM(%d)", InpHiddenSize2) : "")));
 
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Build features for one window of InpSeqLen bars                   |
-//| chrono_start = chronological index (0 = oldest available bar)     |
-//| Output: flat[InpSeqLen * FeatureDim] — oldest first               |
-//+------------------------------------------------------------------+
+// -------------------- Feature builder --------------------
+// Build features for a window that ENDS at bar_end (series index).
+// Window covers bars: bar_end, bar_end+1, ..., bar_end+SeqLen-1 (older)
+// Output flat[] length = SeqLen*feat_dim, ordered oldest->newest (chronological).
 bool BuildWindowFeatures(const int rates_total,
                          const double &open[],
                          const double &high[],
                          const double &low[],
                          const double &close[],
-                         const int chrono_start,
+                         const int bar_end,
                          double &flat[])
 {
    const int feat_dim = FeatureDim();
    const int in_dim = InpSeqLen * feat_dim;
    ArrayResize(flat, in_dim);
 
-   //--- Find window range for normalization
+   // Need full window
+   int oldest = bar_end + (InpSeqLen - 1);
+   if(oldest >= rates_total) return false;
+   if(bar_end < 0) return false;
+
+   // Window hi/lo for normalization
    double win_hi = -1e300;
    double win_lo =  1e300;
 
    for(int i = 0; i < InpSeqLen; i++)
    {
-      // Convert chronological index to series-indexed arrays
-      // In OnCalculate, arrays are NOT as-series by default
-      // chrono_start+i is direct index into the arrays
-      int idx = chrono_start + i;
-      if(idx < 0 || idx >= rates_total)
-         return false;
-      if(high[idx] > win_hi) win_hi = high[idx];
-      if(low[idx]  < win_lo) win_lo = low[idx];
+      int idx = bar_end + i;
+      double h = high[idx];
+      double l = low[idx];
+      if(h > win_hi) win_hi = h;
+      if(l < win_lo) win_lo = l;
    }
 
    double win_range = win_hi - win_lo;
    if(!IsFiniteValue(win_range) || win_range <= InpNormEps)
       win_range = InpNormEps;
 
-   //--- Extract features for each bar in window
-   for(int i = 0; i < InpSeqLen; i++)
+   // Fill chronological order: oldest first.
+   // oldest index = bar_end+SeqLen-1, newest = bar_end
+   for(int t = 0; t < InpSeqLen; t++)
    {
-      int idx = chrono_start + i;
+      int idx = bar_end + (InpSeqLen - 1 - t); // maps t=0 -> oldest
       double o = open[idx];
       double h = high[idx];
       double l = low[idx];
@@ -266,7 +277,7 @@ bool BuildWindowFeatures(const int rates_total,
       double upper = SafeDiv(h - MathMax(o, c), win_range, InpNormEps);
       double lower = SafeDiv(MathMin(o, c) - l, win_range, InpNormEps);
 
-      int base = i * feat_dim;
+      int base = t * feat_dim;
       flat[base + 0] = body;
       flat[base + 1] = upper;
       flat[base + 2] = lower;
@@ -274,20 +285,19 @@ bool BuildWindowFeatures(const int rates_total,
          flat[base + 3] = (c >= o ? 1.0 : 0.0);
    }
 
-   //--- Optional min-max normalization per feature channel
+   // Optional min-max normalization per channel inside this window
    if(InpNormalizeFeatures)
    {
       for(int f = 0; f < feat_dim; f++)
       {
-         // Skip binary direction flag
-         if(InpUseDirectionFlag && f == 3)
+         if(InpUseDirectionFlag && f == 3) // binary channel, keep as is
             continue;
 
          double mn =  1e300;
          double mx = -1e300;
-         for(int i = 0; i < InpSeqLen; i++)
+         for(int t = 0; t < InpSeqLen; t++)
          {
-            double v = flat[i * feat_dim + f];
+            double v = flat[t * feat_dim + f];
             if(v < mn) mn = v;
             if(v > mx) mx = v;
          }
@@ -296,9 +306,9 @@ bool BuildWindowFeatures(const int rates_total,
          if(!IsFiniteValue(den) || den <= InpNormEps)
             den = InpNormEps;
 
-         for(int i = 0; i < InpSeqLen; i++)
+         for(int t = 0; t < InpSeqLen; t++)
          {
-            int pos = i * feat_dim + f;
+            int pos = t * feat_dim + f;
             flat[pos] = SafeDiv(flat[pos] - mn, den, InpNormEps);
          }
       }
@@ -307,26 +317,26 @@ bool BuildWindowFeatures(const int rates_total,
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Build target for K bars starting at future_start                  |
-//| Uses direct array indexing (arrays are NOT as-series)             |
-//+------------------------------------------------------------------+
+// -------------------- Target builder --------------------
+// Target looks "forward" K bars from bar_end towards present (smaller indices).
+// future bars are: bar_end-1, bar_end-2, ..., bar_end-K
 void BuildTarget(const int rates_total,
                  const double &open[],
                  const double &close[],
-                 const int future_start,
+                 const int bar_end,
                  double &bullish,
                  double &bearish)
 {
    int up = 0;
    int count = 0;
-   for(int i = 0; i < InpPredK; i++)
+
+   for(int k = 1; k <= InpPredK; k++)
    {
-      int idx = future_start + i;
-      if(idx < 0 || idx >= rates_total)
-         continue;
-      if(close[idx] > open[idx])
-         up++;
+      int idx = bar_end - k;
+      if(idx < 1) break;             // avoid 0 (forming) and negative
+      if(idx >= rates_total) continue;
+
+      if(close[idx] > open[idx]) up++;
       count++;
    }
 
@@ -345,11 +355,12 @@ void BuildTarget(const int rates_total,
    bearish = MathMin(1.0, MathMax(0.0, bearish));
 }
 
-//+------------------------------------------------------------------+
-//| Build training dataset from history                               |
-//| X: [batch, seq_len * feat_dim] row-major, oldest timestep first  |
-//| T: [batch, 2] bullish/bearish scores                             |
-//+------------------------------------------------------------------+
+// -------------------- Training set builder --------------------
+// Builds samples from windows ending at bar_end in [min_end .. max_end].
+// bar_end must satisfy: bar_end >= 1+PredK (enough future closed bars)
+// and bar_end+SeqLen-1 < rates_total (enough past bars).
+// X layout expected by DLL: row-major [batch, in_dim] where in_dim=SeqLen*feat_dim.
+// Each row is chronological timestep order (oldest->newest) which we already ensure.
 bool BuildTrainingSet(const int rates_total,
                       const double &open[],
                       const double &high[],
@@ -364,30 +375,32 @@ bool BuildTrainingSet(const int rates_total,
    in_dim = InpSeqLen * feat_dim;
    batch = 0;
 
-   // Need at least: InpSeqLen bars for input + InpPredK bars for target
-   // Plus some margin. We use bar indices [0..rates_total-1] directly.
-   // Last usable window start: rates_total - InpSeqLen - InpPredK
-   int last_window_start = rates_total - InpSeqLen - InpPredK;
-   if(last_window_start < 0)
-      return false;
+   // Max possible end index so that window has enough past bars:
+   // bar_end + (SeqLen-1) <= rates_total-1  => bar_end <= rates_total-SeqLen
+   int max_end = rates_total - InpSeqLen;
+   // Min end index so that we have K future closed bars (towards present):
+   // bar_end - K >= 1  => bar_end >= 1+K
+   int min_end = 1 + InpPredK;
 
-   // Limit history depth
-   int first_window_start = MathMax(0, last_window_start - InpHistoryBars + 1);
+   if(max_end < min_end) return false;
 
-   int possible = last_window_start - first_window_start + 1;
-   if(possible <= 0)
-      return false;
+   // Limit by history depth: end indices from min_end..max_end, but only last InpHistoryBars
+   // "History depth" counts bars into past from the most recent usable end.
+   // The most recent usable end is min(max_end, some big), but in series indexing,
+   // smaller index = more recent. So "most recent end" is actually min_end, not max_end.
+   // We'll instead cap the OLDEST end (largest index) by history depth from min_end.
+   int oldest_allowed = min_end + MathMax(0, InpHistoryBars - 1);
+   if(oldest_allowed > max_end) oldest_allowed = max_end;
+
+   // candidate end indices: bar_end in [min_end .. oldest_allowed]
+   int possible = oldest_allowed - min_end + 1;
+   if(possible <= 0) return false;
 
    int wanted = MathMin(possible, InpMaxSamples);
 
-   // Take the most recent 'wanted' samples
-   int actual_first = last_window_start - wanted + 1;
-   if(actual_first < first_window_start)
-      actual_first = first_window_start;
-
-   wanted = last_window_start - actual_first + 1;
-   if(wanted <= 0)
-      return false;
+   // Use the most recent 'wanted' ends: min_end .. min_end+wanted-1
+   int start_end = min_end;
+   int end_end   = min_end + wanted - 1;
 
    ArrayResize(X, wanted * in_dim);
    ArrayResize(T, wanted * 2);
@@ -395,10 +408,9 @@ bool BuildTrainingSet(const int rates_total,
    double sample[];
    for(int s = 0; s < wanted; s++)
    {
-      int win_start = actual_first + s;
+      int bar_end = start_end + s;
 
-      if(!BuildWindowFeatures(rates_total, open, high, low, close,
-                              win_start, sample))
+      if(!BuildWindowFeatures(rates_total, open, high, low, close, bar_end, sample))
          continue;
 
       int xoff = batch * in_dim;
@@ -406,18 +418,15 @@ bool BuildTrainingSet(const int rates_total,
          X[xoff + i] = sample[i];
 
       double bull = 0.5, bear = 0.5;
-      int future_start = win_start + InpSeqLen;
-      BuildTarget(rates_total, open, close, future_start, bull, bear);
+      BuildTarget(rates_total, open, close, bar_end, bull, bear);
 
       T[batch * 2 + 0] = bull;
       T[batch * 2 + 1] = bear;
       batch++;
    }
 
-   if(batch <= 0)
-      return false;
+   if(batch <= 0) return false;
 
-   // Trim arrays if some samples were skipped
    if(batch < wanted)
    {
       ArrayResize(X, batch * in_dim);
@@ -427,9 +436,7 @@ bool BuildTrainingSet(const int rates_total,
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Start async training                                              |
-//+------------------------------------------------------------------+
+// -------------------- Training control --------------------
 bool StartTraining(const int rates_total,
                    const double &open[],
                    const double &high[],
@@ -444,39 +451,41 @@ bool StartTraining(const int rates_total,
    int batch = 0;
    int in_dim = 0;
 
-   if(!BuildTrainingSet(rates_total, open, high, low, close,
-                        X, T, batch, in_dim))
+   if(!BuildTrainingSet(rates_total, open, high, low, close, X, T, batch, in_dim))
    {
-      Print("Training set build failed: insufficient data");
+      Print("Training set build failed: insufficient data (rates_total=", rates_total, ")");
       return false;
    }
 
    Print(StringFormat("Training: %d samples, in_dim=%d (seq=%d x feat=%d)",
-         batch, in_dim, InpSeqLen, FeatureDim()));
+                      batch, in_dim, InpSeqLen, FeatureDim()));
 
-   // layout=0: standard row-major flat format
+   // layout=0: DLL expects row-major flat, and internally transposes to timestep-major.
    if(!DN_LoadBatch(g_NetHandle, X, T, batch, in_dim, 2, 0))
    {
       Print("DN_LoadBatch failed: ", GetDLLError());
       return false;
    }
 
-   if(!DN_TrainAsync(g_NetHandle, InpTrainEpochs, InpTargetMSE,
-                     InpLearningRate, InpWeightDecay))
+   if(!DN_TrainAsync(g_NetHandle, InpTrainEpochs, InpTargetMSE, InpLearningRate, InpWeightDecay))
    {
       Print("DN_TrainAsync failed: ", GetDLLError());
       return false;
    }
 
-   g_IsTraining = true;
-   g_ProgPercent = 0;
-   g_ProgMSE = 0;
+   g_IsTraining   = true;
+   g_ProgPercent  = 0.0;
+   g_ProgMSE      = 0.0;
+   g_ProgBestMSE  = 0.0;
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Predict latest bar                                                |
-//+------------------------------------------------------------------+
+// Predict on latest closed bar (index=1) using window ending at bar_end=1+PredK
+// Why 1+PredK? Because target definition needs K future closed bars; for live prediction
+// we only need the window; but we want consistency with training distribution.
+// For "completion" we score how the pattern tends to resolve; so we end at last closed bar 1,
+// and don't require target existence. We'll end at bar_end=1 for live prediction.
+// (We keep the window shape identical.)
 bool PredictLatest(const int rates_total,
                    const double &open[],
                    const double &high[],
@@ -488,67 +497,58 @@ bool PredictLatest(const int rates_total,
    bull = 0.5;
    bear = 0.5;
 
-   // Build window ending at the last completed bar
-   // Last completed bar index = rates_total - 2
-   // (index rates_total-1 is current forming bar)
-   int last_completed = rates_total - 2;
-   if(last_completed < InpSeqLen - 1)
-      return false;
-
-   int win_start = last_completed - InpSeqLen + 1;
-   if(win_start < 0)
-      return false;
+   int bar_end = 1; // last closed bar
+   int oldest  = bar_end + (InpSeqLen - 1);
+   if(oldest >= rates_total) return false;
 
    double X[];
-   if(!BuildWindowFeatures(rates_total, open, high, low, close,
-                           win_start, X))
+   if(!BuildWindowFeatures(rates_total, open, high, low, close, bar_end, X))
       return false;
 
    int in_dim = InpSeqLen * FeatureDim();
 
    double Y[];
    ArrayResize(Y, 2);
+   ArrayInitialize(Y, 0.0);
 
-   // layout=0: standard format
    if(!DN_PredictBatch(g_NetHandle, X, 1, in_dim, 0, Y))
    {
       Print("DN_PredictBatch failed: ", GetDLLError());
       return false;
    }
 
-   bull = Y[0];
-   bear = Y[1];
+   // Map linear outputs -> (0..1) via sigmoid, then renormalize
+   double b0 = Sigmoid(Y[0]);
+   double b1 = Sigmoid(Y[1]);
+
+   double sum = b0 + b1;
+   if(sum > InpNormEps)
+   {
+      bull = b0 / sum;
+      bear = b1 / sum;
+   }
+   else
+   {
+      bull = 0.5;
+      bear = 0.5;
+   }
 
    if(!IsFiniteValue(bull)) bull = 0.5;
    if(!IsFiniteValue(bear)) bear = 0.5;
 
    bull = MathMin(1.0, MathMax(0.0, bull));
    bear = MathMin(1.0, MathMax(0.0, bear));
-
-   // Normalize to sum = 1
-   double sum = bull + bear;
-   if(sum > InpNormEps)
-   {
-      bull = bull / sum;
-      bear = bear / sum;
-   }
-
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Update comment with training progress                             |
-//+------------------------------------------------------------------+
+// -------------------- UI --------------------
 void UpdateProgressComment()
 {
    string line = "";
 
    if(g_IsTraining)
    {
-      line = StringFormat("Training: Ep %d/%d | MB %d/%d | "
-                          "MSE: %.6f | %.1f%% | "
-                          "LR: %.6f | GradN: %.4f | "
-                          "Elapsed: %s | ETA: %s",
+      line = StringFormat("Training: Ep %d/%d | MB %d/%d | MSE: %.6f | %.1f%% | LR: %.6f | GradN: %.4f | Elapsed: %s | ETA: %s",
                           g_ProgEpoch, g_ProgTotalEpochs,
                           g_ProgMB, g_ProgTotalMB,
                           g_ProgMSE,
@@ -560,10 +560,9 @@ void UpdateProgressComment()
    }
    else if(g_ModelReady)
    {
-      line = StringFormat("Model ready | Last MSE: %.6f | "
-                          "Retrain in %d bars",
-                          g_ProgBestMSE > 0 ? g_ProgBestMSE : g_ProgMSE,
-                          MathMax(0, InpRetrainEveryBars - g_BarsSinceTrain));
+      int left = MathMax(0, InpRetrainEveryBars - g_BarsSinceTrain);
+      double mse_show = (g_ProgBestMSE > 0.0 ? g_ProgBestMSE : g_ProgMSE);
+      line = StringFormat("Model ready | Best MSE: %.6f | Retrain in %d bars", mse_show, left);
    }
    else
    {
@@ -573,35 +572,27 @@ void UpdateProgressComment()
    Comment(line);
 }
 
-//+------------------------------------------------------------------+
-//| OnInit                                                            |
-//+------------------------------------------------------------------+
+// -------------------- Events --------------------
 int OnInit()
 {
    SetIndexBuffer(0, g_BullishBuffer, INDICATOR_DATA);
    SetIndexBuffer(1, g_BearishBuffer, INDICATOR_DATA);
 
-   // Do NOT set as series — use direct chronological indexing
-   // (consistent with how OnCalculate provides arrays)
    PlotIndexSetDouble(0, PLOT_EMPTY_VALUE, EMPTY_VALUE);
    PlotIndexSetDouble(1, PLOT_EMPTY_VALUE, EMPTY_VALUE);
-
-   IndicatorSetString(INDICATOR_SHORTNAME, "LSTM Pattern Completion");
+   IndicatorSetString(INDICATOR_SHORTNAME, "LSTM Pattern Completion (GPU)");
 
    if(!InitNetwork())
       return INIT_FAILED;
 
    EventSetMillisecondTimer(250);
 
-   Print(StringFormat("PatternCompletion: seq=%d pred_k=%d feat=%d hist=%d",
-         InpSeqLen, InpPredK, FeatureDim(), InpHistoryBars));
+   Print(StringFormat("PatternCompletion: seq=%d pred_k=%d feat=%d hist=%d maxS=%d",
+                      InpSeqLen, InpPredK, FeatureDim(), InpHistoryBars, InpMaxSamples));
 
    return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| OnDeinit                                                          |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    EventKillTimer();
@@ -619,15 +610,11 @@ void OnDeinit(const int reason)
    }
 }
 
-//+------------------------------------------------------------------+
-//| OnTimer — poll GPU training progress                              |
-//+------------------------------------------------------------------+
 void OnTimer()
 {
    if(!g_IsTraining || g_NetHandle <= 0)
       return;
 
-   //--- Read all progress in one DLL call (lock-free)
    DN_GetProgressAll(g_NetHandle,
                      g_ProgEpoch, g_ProgTotalEpochs,
                      g_ProgMB, g_ProgTotalMB,
@@ -642,15 +629,14 @@ void OnTimer()
    if(st == 1) // TS_TRAINING
       return;
 
-   //--- Training finished
    g_IsTraining = false;
 
    if(st == 2) // TS_COMPLETED
    {
-      g_ModelReady = true;
+      g_ModelReady     = true;
       g_BarsSinceTrain = 0;
       Print(StringFormat("Training complete: MSE=%.6f best=%.6f elapsed=%.1fs",
-            g_ProgMSE, g_ProgBestMSE, g_ProgElapsedSec));
+                         g_ProgMSE, g_ProgBestMSE, g_ProgElapsedSec));
    }
    else // TS_ERROR
    {
@@ -660,9 +646,6 @@ void OnTimer()
    UpdateProgressComment();
 }
 
-//+------------------------------------------------------------------+
-//| OnCalculate                                                       |
-//+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
                 const int prev_calculated,
                 const datetime &time[],
@@ -674,52 +657,52 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
 {
-   int min_bars = InpSeqLen + InpPredK + 50;
-   if(rates_total < min_bars)
+   // Need enough bars for:
+   // - training: bar_end up to rates_total-SeqLen, and bar_end min=1+PredK
+   // - prediction: window ending at bar_end=1 => oldest=1+SeqLen-1
+   int min_bars = (1 + InpSeqLen - 1) + 1; // simplest: rates_total > SeqLen
+   if(rates_total < MathMax(min_bars, InpSeqLen + InpPredK + 10))
       return 0;
 
-   //--- Initialize empty values for new bars
-   int start = (prev_calculated > 0) ? prev_calculated - 1 : 0;
+   // Ensure buffers are series to match chart indexing (0=current)
+   ArraySetAsSeries(g_BullishBuffer, true);
+   ArraySetAsSeries(g_BearishBuffer, true);
+
+   int start = (prev_calculated > 0 ? prev_calculated - 1 : 0);
+   start = MathMax(start, 0);
    for(int i = start; i < rates_total; i++)
    {
       g_BullishBuffer[i] = EMPTY_VALUE;
       g_BearishBuffer[i] = EMPTY_VALUE;
    }
 
-   //--- Detect new bar (time[] is chronological: [0]=oldest, [last]=newest)
-   datetime newest_time = time[rates_total - 1];
-   bool new_bar = (g_LastBarTime != newest_time);
-   if(new_bar)
+   // New closed bar detection: use time[1] in series arrays
+   datetime last_closed = time[1];
+   bool new_closed_bar = (g_LastClosedTime != last_closed);
+   if(new_closed_bar)
    {
-      g_LastBarTime = newest_time;
+      g_LastClosedTime = last_closed;
       g_BarsSinceTrain++;
 
-      //--- Trigger training if needed
       if(!g_IsTraining && (!g_ModelReady || g_BarsSinceTrain >= InpRetrainEveryBars))
       {
          if(StartTraining(rates_total, open, high, low, close))
-            Print(StringFormat("Training started (%d bars since last)",
-                  g_BarsSinceTrain));
+            Print(StringFormat("Training started (bars since last=%d)", g_BarsSinceTrain));
       }
    }
 
-   //--- Predict on latest completed bar
+   // Predict on last closed bar
    if(g_ModelReady && !g_IsTraining)
    {
       double bull = 0.5, bear = 0.5;
       if(PredictLatest(rates_total, open, high, low, close, bull, bear))
       {
-         // Write to the last completed bar (rates_total - 2)
-         int last_completed = rates_total - 2;
-         if(last_completed >= 0 && last_completed < rates_total)
-         {
-            g_BullishBuffer[last_completed] = bull;
-            g_BearishBuffer[last_completed] = bear;
-         }
+         g_BullishBuffer[1] = bull;
+         g_BearishBuffer[1] = bear;
 
-         // Also write to current forming bar for visual continuity
-         g_BullishBuffer[rates_total - 1] = bull;
-         g_BearishBuffer[rates_total - 1] = bear;
+         // optional continuity on forming bar:
+         g_BullishBuffer[0] = bull;
+         g_BearishBuffer[0] = bear;
       }
    }
 
