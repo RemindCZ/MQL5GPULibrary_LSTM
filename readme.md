@@ -20,6 +20,22 @@ The current runtime is aligned with **LSTM DLL v1.4.0** and is compatible with n
 
 ---
 
+
+## Pattern Completion Demo (MQL5)
+
+A new indicator example is available at `MQL5/Indicators/Examples/LSTM_PatternCompletion_Demo.mq5`.
+
+It demonstrates a pattern-completion workflow:
+
+- Candle windows are converted into symbolic features (body, upper wick, lower wick, optional direction flag).
+- A training dataset is built from sliding windows over recent chart history (`SEQ_LEN` input, `PRED_K` future bars).
+- Targets are regression values in `[0..1]`: `bullish_score` and `bearish_score = 1 - bullish_score`.
+- The indicator runs short asynchronous training rounds with the existing `DN_*` DLL API and then performs inference on the latest window.
+- Two lines are plotted in a separate indicator window: BullishScore and BearishScore.
+
+This is a demonstration of the data flow and DLL integration, not a trading system.
+
+---
 ## Runtime Profile (from `kernel.cu`)
 
 The runtime currently provides:
