@@ -17,6 +17,7 @@ The current runtime is aligned with **LSTM DLL v1.4.0** and is compatible with n
 - `MQL5/Indicators/LSTMTrendStart.mq5` — sample MT5 indicator.
 - `docs/index.html`, `docs/app.js`, `docs/lstm-flow.svg` — interactive documentation assets.
 - `MQL5GPULibrary_LSTM.sln`, `MQL5GPULibrary_LSTM.vcxproj` — Visual Studio build configuration.
+- `unit_tests/` — C++ executable API unit test proposal for the DLL exports.
 
 ---
 
