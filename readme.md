@@ -404,6 +404,12 @@ Open `docs/index.html` in your browser.
 <img width="361" height="363" alt="image" src="https://github.com/user-attachments/assets/9492f727-f41f-4ed3-b9bd-fc82c8c0a96a" />
 <img width="382" height="348" alt="image" src="https://github.com/user-attachments/assets/4f69ab82-1751-4b96-ae96-7bb1156e70f1" />
 <img width="319" height="262" alt="image" src="https://github.com/user-attachments/assets/876df9e0-2bae-40a3-b920-8e126b164b9b" />
+<img width="1853" height="997" alt="image" src="https://github.com/user-attachments/assets/cb5b26da-16b7-4a74-a2df-8b6f0755e3e6" />
+<img width="2549" height="1028" alt="image" src="https://github.com/user-attachments/assets/10b5d7b2-6b9f-4a20-93b6-a20a1223dd75" />
+<img width="2560" height="1078" alt="image" src="https://github.com/user-attachments/assets/be98b176-a6dc-496f-8931-80118c8ecadd" />
+
+
+
 
 
 
