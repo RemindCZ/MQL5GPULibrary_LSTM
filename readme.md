@@ -399,6 +399,9 @@ Open `docs/index.html` in your browser.
 - https://remind.cz/DLL/MQL5GPULibrary_LSTM.html
 - https://remind.cz/
 
+- <img width="2560" height="1080" alt="image" src="https://github.com/user-attachments/assets/3a7391f5-f7e0-4e15-b1f3-2e05890276fd" />
+
+
 ---
 
 ## License
