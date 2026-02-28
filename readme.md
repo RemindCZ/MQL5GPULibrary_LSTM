@@ -403,6 +403,8 @@ Open `docs/index.html` in your browser.
 <img width="374" height="423" alt="image" src="https://github.com/user-attachments/assets/a3c5c639-3f5d-48c7-a5bf-264a75878d54" />
 <img width="361" height="363" alt="image" src="https://github.com/user-attachments/assets/9492f727-f41f-4ed3-b9bd-fc82c8c0a96a" />
 <img width="382" height="348" alt="image" src="https://github.com/user-attachments/assets/4f69ab82-1751-4b96-ae96-7bb1156e70f1" />
+<img width="319" height="262" alt="image" src="https://github.com/user-attachments/assets/876df9e0-2bae-40a3-b920-8e126b164b9b" />
+
 
 
 
