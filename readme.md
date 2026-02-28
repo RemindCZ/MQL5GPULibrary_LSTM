@@ -400,6 +400,12 @@ Open `docs/index.html` in your browser.
 - https://remind.cz/
 
 - <img width="2560" height="1080" alt="image" src="https://github.com/user-attachments/assets/3a7391f5-f7e0-4e15-b1f3-2e05890276fd" />
+<img width="374" height="423" alt="image" src="https://github.com/user-attachments/assets/a3c5c639-3f5d-48c7-a5bf-264a75878d54" />
+<img width="361" height="363" alt="image" src="https://github.com/user-attachments/assets/9492f727-f41f-4ed3-b9bd-fc82c8c0a96a" />
+<img width="382" height="348" alt="image" src="https://github.com/user-attachments/assets/4f69ab82-1751-4b96-ae96-7bb1156e70f1" />
+
+
+
 
 
 ---
