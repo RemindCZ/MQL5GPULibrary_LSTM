@@ -910,6 +910,9 @@ void BulkPredict(int rates_total,
   {
    if(!g_ModelReady || g_NetHandle == 0 || g_IsTraining) return;
 
+   // Formující bar [0] nikdy nekreslíme.
+   g_ProbPct[0] = EMPTY_VALUE;
+
    int newestPredBar = 1;
    int oldestPredBar = MathMin(rates_total - 1 - InpLookback,
                                newestPredBar + InpMaxPredictBars - 1);
@@ -918,6 +921,14 @@ void BulkPredict(int rates_total,
       if(InpVerboseLog) Print("BulkPredict: oldestPredBar < newestPredBar");
       return;
      }
+
+   // Starší historie mimo predikční okno musí být prázdná, ne 0.0.
+   for(int bar = oldestPredBar + 1; bar < rates_total; bar++)
+      g_ProbPct[bar] = EMPTY_VALUE;
+
+   // Celé aktivní okno inicializujeme na neutrálních 50 %.
+   for(int bar = newestPredBar; bar <= oldestPredBar; bar++)
+      g_ProbPct[bar] = 50.0;
 
    int startPred = newestPredBar;
    int lastPred  = oldestPredBar;
@@ -930,13 +941,6 @@ void BulkPredict(int rates_total,
    if(g_ATRMean < _Point) ComputeATRMean(rates_total, close, high, low);
    BulkComputeATRWilder(startPred, totalPredict + InpLookback + 10,
                         14, high, low, close, rates_total);
-
-   for(int i = 0; i < totalPredict; i++)
-     {
-      int bar = startPred + i;
-      if(bar >= 1 && bar < rates_total)
-         g_ProbPct[bar] = 50.0;
-     }
 
    int lstmBars[];
    ArrayResize(lstmBars, 0);
