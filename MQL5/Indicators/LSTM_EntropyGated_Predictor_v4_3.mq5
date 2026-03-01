@@ -39,38 +39,14 @@
 #property indicator_levelcolor clrDimGray
 #property indicator_levelstyle STYLE_DOT
 
-#property indicator_buffers 8
-#property indicator_plots   5
+#property indicator_buffers 3
+#property indicator_plots   1
 
-#property indicator_label1  "P(Bullish)"
+#property indicator_label1  "Noise"
 #property indicator_type1   DRAW_LINE
-#property indicator_color1  clrLime
+#property indicator_color1  clrGold
 #property indicator_style1  STYLE_SOLID
 #property indicator_width1  2
-
-#property indicator_label2  "P(Bearish)"
-#property indicator_type2   DRAW_LINE
-#property indicator_color2  clrRed
-#property indicator_style2  STYLE_SOLID
-#property indicator_width2  2
-
-#property indicator_label3  "Entropy"
-#property indicator_type3   DRAW_LINE
-#property indicator_color3  clrGold
-#property indicator_style3  STYLE_DOT
-#property indicator_width3  1
-
-#property indicator_label4  "Entropy Threshold"
-#property indicator_type4   DRAW_LINE
-#property indicator_color4  clrDarkOrange
-#property indicator_style4  STYLE_DASH
-#property indicator_width4  1
-
-#property indicator_label5  "Regime"
-#property indicator_type5   DRAW_HISTOGRAM
-#property indicator_color5  clrLime,clrDimGray
-#property indicator_style5  STYLE_SOLID
-#property indicator_width5  3
 
 //+------------------------------------------------------------------+
 //| DLL Import                                                        |
@@ -154,13 +130,9 @@ input int      InpMaxPredictBars   = 2000;
 input int      InpPredictAhead     = 5;
 
 input group "=== Display ==="
-input color    InpBullColor        = clrLime;
-input color    InpBearColor        = clrRed;
-input color    InpNoiseColor       = clrDimGray;
-input color    InpEntropyColor     = clrGold;
-input int      InpInfoCorner       = 0;
-input int      InpProgressWidth    = 280;
-input int      InpProgressHeight   = 18;
+input bool     InpLogToTerminal    = true;
+input bool     InpDrawOnChart      = false;
+input int      InpMaxChartMarks    = 200;
 
 input group "=== Advanced ==="
 input double   InpGradClip         = 5.0;
@@ -179,9 +151,6 @@ input bool     InpVerboseLog       = false;
 double g_BullProb[];
 double g_BearProb[];
 double g_Entropy[];        // smoothed Shannon entropy, init=1.0 (max noise)
-double g_EntropyThresh[];
-double g_Regime[];
-double g_RegimeColor[];
 double g_RawEntropy[];
 double g_SymbolSeq[];
 
@@ -233,8 +202,10 @@ int    g_LowEntropyBars   = 0;
 int    g_HighEntropyBars  = 0;
 double g_AvgEntropyRecent = 0.0;
 
-string g_InfoPrefix = "EL_I_";
-string g_ProgPrefix = "EL_P_";
+string g_ChartPrefix = "EL4_";
+string g_PanelBG  = "EL4_PANEL_BG";
+string g_PanelTXT = "EL4_PANEL_TXT";
+datetime g_MarkTimes[];
 
 //+------------------------------------------------------------------+
 //| Init                                                              |
@@ -244,21 +215,13 @@ int OnInit()
    Print("=== Entropy-Gated LSTM v4.30 (GPU) ===");
    Print("Konvence: index 0=nejnovejsi, vetsi index=starsi bar");
 
-   SetIndexBuffer(0, g_BullProb,      INDICATOR_DATA);
-   SetIndexBuffer(1, g_BearProb,      INDICATOR_DATA);
-   SetIndexBuffer(2, g_Entropy,       INDICATOR_DATA);
-   SetIndexBuffer(3, g_EntropyThresh, INDICATOR_DATA);
-   SetIndexBuffer(4, g_Regime,        INDICATOR_DATA);
-   SetIndexBuffer(5, g_RegimeColor,   INDICATOR_COLOR_INDEX);
-   SetIndexBuffer(6, g_RawEntropy,    INDICATOR_CALCULATIONS);
-   SetIndexBuffer(7, g_SymbolSeq,     INDICATOR_CALCULATIONS);
+   SetIndexBuffer(0, g_Entropy,       INDICATOR_DATA);
+   SetIndexBuffer(1, g_RawEntropy,    INDICATOR_CALCULATIONS);
+   SetIndexBuffer(2, g_SymbolSeq,     INDICATOR_CALCULATIONS);
 
    ArraySetAsSeries(g_BullProb, true);
    ArraySetAsSeries(g_BearProb, true);
    ArraySetAsSeries(g_Entropy, true);
-   ArraySetAsSeries(g_EntropyThresh, true);
-   ArraySetAsSeries(g_Regime, true);
-   ArraySetAsSeries(g_RegimeColor, true);
    ArraySetAsSeries(g_RawEntropy, true);
    ArraySetAsSeries(g_SymbolSeq, true);
 
@@ -266,7 +229,7 @@ int OnInit()
    // Bary, pro které se entropie ještě nepočítala, tak nikdy
    // nevypadají jako "structured" (H=0 by bylo chybné).
    // PlotIndexSetDouble nastaví "prázdnou" hodnotu pro vykreslování.
-   for(int i = 0; i < 5; i++)
+   for(int i = 0; i < 1; i++)
       PlotIndexSetDouble(i, PLOT_EMPTY_VALUE, 0.0);
 
    IndicatorSetString(INDICATOR_SHORTNAME,
@@ -298,8 +261,7 @@ int OnInit()
    g_CalcStart           = 0;
    g_CalcEnd             = 0;
 
-   CreateInfoPanel();
-   CreateProgressBar();
+   ArrayResize(g_MarkTimes, 0);
    EventSetMillisecondTimer(100);
    return INIT_SUCCEEDED;
   }
@@ -322,7 +284,7 @@ void OnDeinit(const int reason)
       DN_Free(g_NetHandle);
       g_NetHandle = 0;
      }
-   CleanupObjects();
+   ObjectsDeleteAll(0, g_ChartPrefix);
   }
 
 //+------------------------------------------------------------------+
@@ -561,6 +523,17 @@ int OnCalculate(const int rates_total,
    if(rates_total < minBars) return 0;
 
    g_TotalBars = rates_total;
+   if(ArraySize(g_BullProb) != rates_total)
+     {
+      ArrayResize(g_BullProb, rates_total);
+      ArraySetAsSeries(g_BullProb, true);
+     }
+   if(ArraySize(g_BearProb) != rates_total)
+     {
+      ArrayResize(g_BearProb, rates_total);
+      ArraySetAsSeries(g_BearProb, true);
+     }
+
 
    // Nový uzavřený bar? (detekce vždy podle time[1])
    bool newClosedBar = false;
@@ -600,9 +573,6 @@ int OnCalculate(const int rates_total,
      {
       ArrayInitialize(g_Entropy, 1.0);
       ArrayInitialize(g_RawEntropy, 1.0);
-      ArrayInitialize(g_EntropyThresh, InpEntropyThreshold);
-      ArrayInitialize(g_Regime, 0.0);
-      ArrayInitialize(g_RegimeColor, 1.0);
       ArrayInitialize(g_BullProb, 0.0);
       ArrayInitialize(g_BearProb, 0.0);
       g_EntropySmoothState = -1.0;
@@ -613,16 +583,10 @@ int OnCalculate(const int rates_total,
    // Formující bar [0] a první nevalidní starší bar hned za vypočteným rozsahem držíme v NOISE.
    g_RawEntropy[0]    = 1.0;
    g_Entropy[0]       = 1.0;
-   g_EntropyThresh[0] = InpEntropyThreshold;
-   g_Regime[0]        = 0.0;
-   g_RegimeColor[0]   = 1;
    if(endBar + 1 < rates_total)
      {
       g_RawEntropy[endBar + 1]    = 1.0;
       g_Entropy[endBar + 1]       = 1.0;
-      g_EntropyThresh[endBar + 1] = InpEntropyThreshold;
-      g_Regime[endBar + 1]        = 0.0;
-      g_RegimeColor[endBar + 1]   = 1;
      }
 
    // Kódujeme symboly jen pro bary nutné pro entropy rozsah [1..endBar]
@@ -648,9 +612,6 @@ int OnCalculate(const int rates_total,
         {
          g_RawEntropy[i] = 1.0;
          g_Entropy[i]    = 1.0;
-         g_EntropyThresh[i] = InpEntropyThreshold;
-         g_Regime[i]      = 0.0;
-         g_RegimeColor[i] = 1;
          continue;
         }
 
@@ -660,11 +621,7 @@ int OnCalculate(const int rates_total,
       double smoothH = SmoothEntropy(rawH, smoothState, InpEntropySmooth);
       smoothState    = smoothH;
       g_Entropy[i]   = smoothH;
-      g_EntropyThresh[i] = InpEntropyThreshold;
-
       bool lowEntropy  = (smoothH < InpEntropyThreshold);
-      g_Regime[i]      = lowEntropy ? 0.05 : 0.0;
-      g_RegimeColor[i] = lowEntropy ? 0 : 1;
 
       // Statistiky posledních 200 barů (indexy 1..200 = nejnovější uzavřené)
       if(i >= 1 && i <= 200)
@@ -705,8 +662,8 @@ int OnCalculate(const int rates_total,
       g_BearProb[0] = 0.0;
      }
 
-   UpdateInfoPanel();
-   UpdateProgressBar();
+   if(newClosedBar)
+      LogAndDrawClosedBar(time, high, low);
    return rates_total;
   }
 
@@ -719,7 +676,7 @@ void OnTimer()
 
    PollGPUProgress();
    int st = DN_GetTrainingStatus(g_NetHandle);
-   if(st == 1) { UpdateInfoPanel(); UpdateProgressBar(); return; }
+   if(st == 1) { return; }
 
    g_IsTraining = false;
    double mse = 0;
@@ -744,8 +701,6 @@ void OnTimer()
       DN_RestoreWeights(g_NetHandle);
      }
 
-   UpdateInfoPanel();
-   UpdateProgressBar();
   }
 
 //+------------------------------------------------------------------+
@@ -925,7 +880,6 @@ bool StartTraining(int rates_total,
 
    Print(StringFormat("Training: %d vzorků x %d epoch | feature bars [%d..%d] | shuffled",
                       maxSamples, g_TargetEpochs, featNewest, featOldest));
-   UpdateProgressBar();
    return true;
   }
 
@@ -1245,304 +1199,167 @@ void ComputeATRMean(int rates_total,
   }
 
 //+------------------------------------------------------------------+
-//| Info Panel                                                        |
-//+------------------------------------------------------------------+
-void CreateInfoPanel()
+string SigArrowName(datetime t)
   {
-   string bg = g_InfoPrefix + "BG";
-   ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, bg, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, 30);
-   ObjectSetInteger(0, bg, OBJPROP_XSIZE, 345);
-   ObjectSetInteger(0, bg, OBJPROP_YSIZE, 280);
-   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, C'30,30,40');
-   ObjectSetInteger(0, bg, OBJPROP_BORDER_COLOR, clrDodgerBlue);
-   ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, bg, OBJPROP_WIDTH, 2);
-   ObjectSetInteger(0, bg, OBJPROP_BACK, false);
-   ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
-   MakeLabel(g_InfoPrefix + "T", "Entropy-Gated LSTM v4.30",
-             15, 35, clrDodgerBlue, 10, true);
+   return g_ChartPrefix + "SIG_ARROW_" + IntegerToString((int)t);
   }
 
 //+------------------------------------------------------------------+
-void UpdateInfoPanel()
+string SigTextName(datetime t)
   {
-   string st; color sc;
-   if(g_IsTraining)      { st = "GPU Training..."; sc = clrYellow; }
-   else if(g_ModelReady) { st = "Ready";           sc = clrLime;   }
-   else                  { st = "Waiting";         sc = clrGray;   }
-   MakeLabel(g_InfoPrefix + "St", "Status: " + st, 15, 55, sc, 9, false);
+   return g_ChartPrefix + "SIG_TEXT_" + IntegerToString((int)t);
+  }
 
-   string arch = StringFormat("Symbolic(%d) -> LSTM(%d->%d",
-                              FEAT_PER_BAR, InpHiddenSize1, InpHiddenSize2);
-   if(InpHiddenSize3 > 0) arch += "->" + IntegerToString(InpHiddenSize3);
-   arch += ") -> P(bull,bear)";
-   MakeLabel(g_InfoPrefix + "Ar", arch, 15, 72, clrWhite, 8, false);
-
-   double dispMSE  = (g_IsTraining && g_ProgMSE > 0) ? g_ProgMSE : g_LastMSE;
-   double dispBest = (g_IsTraining && g_ProgBestMSE > 0 && g_ProgBestMSE < 1e10)
-                     ? g_ProgBestMSE : g_BestMSE;
-   MakeLabel(g_InfoPrefix + "MSE",
-             StringFormat("MSE: %.6f (best: %.6f)", dispMSE, dispBest),
-             15, 89, clrSilver, 9, false);
-   MakeLabel(g_InfoPrefix + "Ep",
-             StringFormat("Epochs: %d | VRAM: ~%.0f MB", g_TotalEpochs, g_EstVRAM_MB),
-             15, 106, clrSilver, 9, false);
-
-   double acc = (g_TotalPred > 0) ? (double)g_CorrectPred / g_TotalPred * 100.0 : 0;
-   color  ac  = (acc > 55) ? clrLime : (acc > 50) ? clrYellow : clrOrangeRed;
-   string accStr = (g_TotalPred == 0)
-                   ? "Direction accuracy: -- (zatím žádné predikce)"
-                   : StringFormat("Direction accuracy: %.1f%% (%d/%d)",
-                                  acc, g_CorrectPred, g_TotalPred);
-   MakeLabel(g_InfoPrefix + "Acc", accStr, 15, 123, ac, 9, false);
-
-   MakeLabel(g_InfoPrefix + "EntTitle", "── Entropy Gate ──", 15, 143, clrGold, 9, true);
-
-   // Nejnovější uzavřený bar = index 1.
-   // curInNoise = true pokud:
-   //   - entropie je nad prahem (skutečný noise)
-   //   - NEBO bar[1] není v aktuálně spočítaném rozsahu entropie
-   double curEntropy = g_Entropy[1];
-   bool   notComputed = (g_CalcStart == 0 || 1 < g_CalcStart || 1 > g_CalcEnd);
-   bool   curInNoise  = notComputed || (curEntropy >= InpEntropyThreshold);
-   string regStr = curInNoise ? "NOISE — LSTM OFF" : "STRUCTURED — LSTM ACTIVE";
-   color  regClr = curInNoise ? clrOrangeRed : clrLime;
-   MakeLabel(g_InfoPrefix + "Regime",
-             StringFormat("Regime: %s", regStr), 15, 160, regClr, 10, true);
-   MakeLabel(g_InfoPrefix + "EntVal",
-             StringFormat("H=%.3f / %.2f thr | alpha=%d win=%d | calcFrom=%d",
-                          curEntropy, InpEntropyThreshold,
-                          InpSymbolAlphabet, InpEntropyWindow, g_CalcStart),
-             15, 178, clrSilver, 8, false);
-
-   int totalRegime = g_LowEntropyBars + g_HighEntropyBars;
-   double pctStruct = (totalRegime > 0) ? (double)g_LowEntropyBars / totalRegime * 100.0 : 0;
-   MakeLabel(g_InfoPrefix + "RegDist",
-             StringFormat("Posl. 200: %.0f%% structured, %.0f%% noise (avg H=%.3f)",
-                          pctStruct, 100 - pctStruct, g_AvgEntropyRecent),
-             15, 194, clrDarkGray, 8, false);
-
-   if(g_ModelReady && !curInNoise)
+//+------------------------------------------------------------------+
+void EnforceMarkLimit()
+  {
+   int maxMarks = MathMax(0, InpMaxChartMarks);
+   while(ArraySize(g_MarkTimes) > maxMarks)
      {
-      double pb  = g_BullProb[1];
-      double pbr = g_BearProb[1];
-      string predStr; color predClr;
-      if(pb > 0.6)       { predStr = StringFormat("BULLISH %.0f%%", pb*100);  predClr = InpBullColor; }
-      else if(pbr > 0.6) { predStr = StringFormat("BEARISH %.0f%%", pbr*100); predClr = InpBearColor; }
-      else               { predStr = StringFormat("NEUTRAL %.0f%%/%.0f%%", pb*100, pbr*100); predClr = InpNoiseColor; }
-      MakeLabel(g_InfoPrefix + "Pred",
-                StringFormat("Next %d bars: %s", InpPredictAhead, predStr),
-                15, 215, predClr, 10, true);
-      MakeLabel(g_InfoPrefix + "PredD",
-                StringFormat("P(bull)=%.3f  P(bear)=%.3f", pb, pbr),
-                15, 233, clrSilver, 9, false);
+      datetime tOld = g_MarkTimes[0];
+      ObjectDelete(0, SigArrowName(tOld));
+      ObjectDelete(0, SigTextName(tOld));
+      int n = ArraySize(g_MarkTimes);
+      for(int i = 1; i < n; i++)
+         g_MarkTimes[i - 1] = g_MarkTimes[i];
+      ArrayResize(g_MarkTimes, n - 1);
      }
-   else if(g_ModelReady && curInNoise)
+  }
+
+//+------------------------------------------------------------------+
+void UpdateMainChartPanel(datetime tBar, double entropy, bool curInNoise,
+                          bool hasPred, double pBull, double pBear, string direction)
+  {
+   if(!InpDrawOnChart) return;
+
+   if(ObjectFind(0, g_PanelBG) < 0)
      {
-      MakeLabel(g_InfoPrefix + "Pred",  "Predikce: POZASTAVENA (noise)", 15, 215, clrDimGray, 9, false);
-      MakeLabel(g_InfoPrefix + "PredD", "H příliš vysoká — kompas v magnetické bouři", 15, 233, clrDimGray, 8, false);
+      ObjectCreate(0, g_PanelBG, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_XSIZE, 360);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_YSIZE, 64);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_BGCOLOR, C'25,25,35');
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_BORDER_COLOR, clrSlateGray);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, g_PanelBG, OBJPROP_HIDDEN, true);
+     }
+
+   if(ObjectFind(0, g_PanelTXT) < 0)
+     {
+      ObjectCreate(0, g_PanelTXT, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_XDISTANCE, 18);
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_YDISTANCE, 28);
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, g_PanelTXT, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, g_PanelTXT, OBJPROP_HIDDEN, true);
+     }
+
+   string regime = curInNoise ? "NOISE" : "STRUCTURED";
+   string txt = StringFormat("%s | H=%.3f thr=%.2f | %s",
+                             TimeToString(tBar, TIME_DATE|TIME_MINUTES), entropy, InpEntropyThreshold, regime);
+   if(hasPred)
+      txt += StringFormat(" | Pbull=%.3f Pbear=%.3f | %s", pBull, pBear, direction);
+   txt += StringFormat(" | MSE=%.6f", g_LastMSE);
+
+   ObjectSetString(0, g_PanelTXT, OBJPROP_TEXT, txt);
+   ObjectSetInteger(0, g_PanelTXT, OBJPROP_COLOR, curInNoise ? clrOrangeRed : clrLime);
+
+   ChartRedraw();
+  }
+
+//+------------------------------------------------------------------+
+void UpdateSignalMark(datetime tBar, double pBull, double pBear,
+                      const double &high[], const double &low[])
+  {
+   if(!InpDrawOnChart) return;
+
+   double diff = pBull - pBear;
+   if(MathAbs(diff) <= 0.1) return;
+
+   string aName = SigArrowName(tBar);
+   string tName = SigTextName(tBar);
+   bool exists = (ObjectFind(0, aName) >= 0);
+
+   int barShift = iBarShift(_Symbol, _Period, tBar, false);
+   if(barShift < 1) return;
+
+   bool bullish = (diff > 0.0);
+   double price = bullish ? (low[barShift] - 6 * _Point) : (high[barShift] + 6 * _Point);
+
+   if(!exists)
+     {
+      ObjectCreate(0, aName, OBJ_ARROW, 0, tBar, price);
+      ObjectSetInteger(0, aName, OBJPROP_ARROWCODE, bullish ? 233 : 234);
+      ObjectSetInteger(0, aName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, aName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, aName, OBJPROP_HIDDEN, true);
+
+      ObjectCreate(0, tName, OBJ_TEXT, 0, tBar, bullish ? (price - 10 * _Point) : (price + 10 * _Point));
+      ObjectSetInteger(0, tName, OBJPROP_FONTSIZE, 8);
+      ObjectSetString(0, tName, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, tName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, tName, OBJPROP_HIDDEN, true);
+
+      int n = ArraySize(g_MarkTimes);
+      ArrayResize(g_MarkTimes, n + 1);
+      g_MarkTimes[n] = tBar;
+      EnforceMarkLimit();
      }
    else
      {
-      MakeLabel(g_InfoPrefix + "Pred",  "Čekám na model...", 15, 215, clrGray, 9, false);
-      MakeLabel(g_InfoPrefix + "PredD", "", 15, 233, clrGray, 8, false);
+      ObjectMove(0, aName, 0, tBar, price);
+      ObjectMove(0, tName, 0, tBar, bullish ? (price - 10 * _Point) : (price + 10 * _Point));
+      ObjectSetInteger(0, aName, OBJPROP_ARROWCODE, bullish ? 233 : 234);
      }
 
-   MakeLabel(g_InfoPrefix + "SrcBar",
-             StringFormat("Source: bar[1] (%s) | bar0=forming",
-                          TimeToString(g_LastClosedBarTime, TIME_DATE | TIME_MINUTES)),
-             15, 258, clrDarkGray, 8, false);
-   ChartRedraw();
+   ObjectSetInteger(0, aName, OBJPROP_COLOR, bullish ? clrLime : clrTomato);
+   ObjectSetString(0, tName, OBJPROP_TEXT, StringFormat("%.0f/%.0f", pBull * 100.0, pBear * 100.0));
+   ObjectSetInteger(0, tName, OBJPROP_COLOR, bullish ? clrLime : clrTomato);
   }
 
 //+------------------------------------------------------------------+
-void MakeLabel(string name, string text, int x, int y,
-               color clr, int sz, bool bold)
+void LogAndDrawClosedBar(const datetime &time[], const double &high[], const double &low[])
   {
-   if(ObjectFind(0, name) < 0)
+   if(ArraySize(time) < 2) return;
+
+   double curEntropy = g_Entropy[1];
+   bool   notComputed = (g_CalcStart == 0 || 1 < g_CalcStart || 1 > g_CalcEnd);
+   bool   curInNoise  = notComputed || (curEntropy >= InpEntropyThreshold);
+   string regime      = curInNoise ? "NOISE" : "STRUCTURED";
+
+   double pBull = g_BullProb[1];
+   double pBear = g_BearProb[1];
+   bool hasPred = (g_ModelReady && !curInNoise);
+
+   string direction = "neutral";
+   if(hasPred)
      {
-      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, name, OBJPROP_CORNER, InpInfoCorner);
-      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      double diff = pBull - pBear;
+      if(diff > 0.1) direction = "bull";
+      else if(diff < -0.1) direction = "bear";
      }
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, sz);
-   ObjectSetString(0, name, OBJPROP_FONT, bold ? "Arial Bold" : "Arial");
-   ObjectSetString(0, name, OBJPROP_TEXT, text);
-  }
 
-//+------------------------------------------------------------------+
-//| Progress Bar                                                      |
-//+------------------------------------------------------------------+
-void CreateProgressBar()
-  {
-   int yOff = 335;
-   struct ObjDef { string suffix; int type; };
-   // Bg, Fill, Txt, Det, MSE, LR, Title
-   string bg = g_ProgPrefix + "BG";
-   ObjectCreate(0, bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, bg, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, bg, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, bg, OBJPROP_YDISTANCE, yOff);
-   ObjectSetInteger(0, bg, OBJPROP_XSIZE, InpProgressWidth);
-   ObjectSetInteger(0, bg, OBJPROP_YSIZE, InpProgressHeight);
-   ObjectSetInteger(0, bg, OBJPROP_BGCOLOR, C'40,40,50');
-   ObjectSetInteger(0, bg, OBJPROP_BORDER_COLOR, clrDimGray);
-   ObjectSetInteger(0, bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, bg, OBJPROP_HIDDEN, true);
-
-   string fi = g_ProgPrefix + "Fill";
-   ObjectCreate(0, fi, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, fi, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, fi, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, fi, OBJPROP_YDISTANCE, yOff);
-   ObjectSetInteger(0, fi, OBJPROP_XSIZE, 0);
-   ObjectSetInteger(0, fi, OBJPROP_YSIZE, InpProgressHeight);
-   ObjectSetInteger(0, fi, OBJPROP_BGCOLOR, clrDodgerBlue);
-   ObjectSetInteger(0, fi, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSetInteger(0, fi, OBJPROP_WIDTH, 0);
-   ObjectSetInteger(0, fi, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, fi, OBJPROP_HIDDEN, true);
-
-   string tx = g_ProgPrefix + "Txt";
-   ObjectCreate(0, tx, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, tx, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, tx, OBJPROP_XDISTANCE, 15 + InpProgressWidth / 2);
-   ObjectSetInteger(0, tx, OBJPROP_YDISTANCE, yOff + 2);
-   ObjectSetInteger(0, tx, OBJPROP_FONTSIZE, 9);
-   ObjectSetString(0, tx, OBJPROP_FONT, "Arial Bold");
-   ObjectSetInteger(0, tx, OBJPROP_COLOR, clrWhite);
-   ObjectSetInteger(0, tx, OBJPROP_ANCHOR, ANCHOR_CENTER);
-   ObjectSetInteger(0, tx, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, tx, OBJPROP_HIDDEN, true);
-
-   string dt = g_ProgPrefix + "Det";
-   ObjectCreate(0, dt, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, dt, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, dt, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, dt, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 4);
-   ObjectSetInteger(0, dt, OBJPROP_FONTSIZE, 8);
-   ObjectSetString(0, dt, OBJPROP_FONT, "Arial");
-   ObjectSetInteger(0, dt, OBJPROP_COLOR, clrSilver);
-   ObjectSetInteger(0, dt, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, dt, OBJPROP_HIDDEN, true);
-
-   string ms = g_ProgPrefix + "MSE";
-   ObjectCreate(0, ms, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, ms, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, ms, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, ms, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 19);
-   ObjectSetInteger(0, ms, OBJPROP_FONTSIZE, 8);
-   ObjectSetString(0, ms, OBJPROP_FONT, "Arial");
-   ObjectSetInteger(0, ms, OBJPROP_COLOR, clrGold);
-   ObjectSetInteger(0, ms, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, ms, OBJPROP_HIDDEN, true);
-
-   string lr = g_ProgPrefix + "LR";
-   ObjectCreate(0, lr, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, lr, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, lr, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, lr, OBJPROP_YDISTANCE, yOff + InpProgressHeight + 34);
-   ObjectSetInteger(0, lr, OBJPROP_FONTSIZE, 8);
-   ObjectSetString(0, lr, OBJPROP_FONT, "Arial");
-   ObjectSetInteger(0, lr, OBJPROP_COLOR, clrCornflowerBlue);
-   ObjectSetInteger(0, lr, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, lr, OBJPROP_HIDDEN, true);
-
-   string tt = g_ProgPrefix + "Title";
-   ObjectCreate(0, tt, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, tt, OBJPROP_CORNER, InpInfoCorner);
-   ObjectSetInteger(0, tt, OBJPROP_XDISTANCE, 15);
-   ObjectSetInteger(0, tt, OBJPROP_YDISTANCE, yOff - 16);
-   ObjectSetInteger(0, tt, OBJPROP_FONTSIZE, 9);
-   ObjectSetString(0, tt, OBJPROP_FONT, "Arial Bold");
-   ObjectSetInteger(0, tt, OBJPROP_COLOR, clrDodgerBlue);
-   ObjectSetInteger(0, tt, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, tt, OBJPROP_HIDDEN, true);
-  }
-
-//+------------------------------------------------------------------+
-void UpdateProgressBar()
-  {
-   bool show = g_IsTraining ||
-               (g_TrainStartTime > 0 && TimeCurrent() - g_TrainStartTime < 5);
-   string names[] = {"BG","Fill","Txt","Det","MSE","LR","Title"};
-   for(int i = 0; i < ArraySize(names); i++)
-      ObjectSetInteger(0, g_ProgPrefix + names[i], OBJPROP_TIMEFRAMES,
-                       show ? OBJ_ALL_PERIODS : OBJ_NO_PERIODS);
-   if(!show) { ChartRedraw(); return; }
-
-   double prog = g_ProgPercent / 100.0;
-   prog = MathMax(0.0, MathMin(1.0, prog));
-   if(prog < 0.001 && g_TargetEpochs > 0 && g_CurrentEpochs > 0)
-      prog = MathMin(1.0, (double)g_CurrentEpochs / g_TargetEpochs);
-
-   color fc;
-   if(prog < 0.33)      fc = clrOrangeRed;
-   else if(prog < 0.66) fc = clrGold;
-   else if(prog < 1.0)  fc = clrDodgerBlue;
-   else                 fc = clrLime;
-
-   ObjectSetInteger(0, g_ProgPrefix+"Fill", OBJPROP_XSIZE, MathMax(0,(int)(InpProgressWidth*prog)));
-   ObjectSetInteger(0, g_ProgPrefix+"Fill", OBJPROP_BGCOLOR, fc);
-   ObjectSetString(0,  g_ProgPrefix+"Txt", OBJPROP_TEXT, StringFormat("%.1f%%", prog*100));
-
-   string det = "";
-   if(g_ProgTotalEpochs > 0)
+   if(InpLogToTerminal)
      {
-      det = StringFormat("Ep %d/%d", g_ProgEpoch, g_ProgTotalEpochs);
-      if(g_ProgTotalMB > 0)   det += StringFormat(" | MB %d/%d", g_ProgMB, g_ProgTotalMB);
-      if(g_ProgETASec > 0)    det += " | ETA " + FormatDuration(g_ProgETASec);
-      if(g_ProgElapsedSec > 0) det += " | " + FormatDuration(g_ProgElapsedSec);
+      string line = StringFormat("bar[1]=%s | H=%.3f thr=%.2f | %s | model=%s | MSE=%.6f",
+                                 TimeToString(time[1], TIME_DATE|TIME_MINUTES),
+                                 curEntropy, InpEntropyThreshold, regime,
+                                 g_ModelReady ? "ready" : "not-ready", g_LastMSE);
+      if(hasPred)
+         line += StringFormat(" | Pbull=%.3f Pbear=%.3f dir=%s", pBull, pBear, direction);
+      Print(line);
      }
-   else det = StringFormat("Epoch %d / %d", g_CurrentEpochs, g_TargetEpochs);
-   ObjectSetString(0, g_ProgPrefix+"Det", OBJPROP_TEXT, det);
 
-   string mseT = "";
-   if(g_ProgMSE > 0 || g_LastMSE > 0)
+   if(InpDrawOnChart)
      {
-      double dm = (g_ProgMSE > 0) ? g_ProgMSE : g_LastMSE;
-      mseT = StringFormat("MSE: %.6f -> %.4f", dm, InpTargetMSE);
-      double db = (g_ProgBestMSE > 0 && g_ProgBestMSE < 1e9) ? g_ProgBestMSE : g_BestMSE;
-      if(db < 1e9) mseT += StringFormat(" | Best: %.6f", db);
+      UpdateMainChartPanel(time[1], curEntropy, curInNoise, hasPred, pBull, pBear, direction);
+      if(hasPred && !curInNoise)
+         UpdateSignalMark(time[1], pBull, pBear, high, low);
      }
-   ObjectSetString(0, g_ProgPrefix+"MSE", OBJPROP_TEXT, mseT);
-
-   string lrT = "";
-   if(g_ProgLR > 0) lrT = StringFormat("LR: %.6f", g_ProgLR);
-   if(g_ProgGradNorm > 0) lrT += (StringLen(lrT)>0?" | ":"") + StringFormat("GradNorm: %.4f", g_ProgGradNorm);
-   ObjectSetString(0, g_ProgPrefix+"LR", OBJPROP_TEXT, lrT);
-
-   string ttl = "GPU Training (entropy-gated, shuffled)";
-   if(g_IsTraining) ttl += StringSubstr("....", 0, ((int)(GetTickCount()/400))%4);
-   else if(prog >= 1.0) ttl = "Training Complete!";
-   ObjectSetString(0, g_ProgPrefix+"Title", OBJPROP_TEXT, ttl);
-   ObjectSetInteger(0, g_ProgPrefix+"Title", OBJPROP_COLOR, g_IsTraining ? clrYellow : clrLime);
-   ChartRedraw();
-  }
-
-//+------------------------------------------------------------------+
-string FormatDuration(double seconds)
-  {
-   int s = (int)MathRound(seconds);
-   if(s < 0)    return "--:--";
-   if(s < 60)   return StringFormat("%ds", s);
-   if(s < 3600) return StringFormat("%dm%02ds", s/60, s%60);
-   return StringFormat("%dh%02dm", s/3600, (s%3600)/60);
-  }
-
-//+------------------------------------------------------------------+
-void CleanupObjects()
-  {
-   ObjectsDeleteAll(0, g_InfoPrefix);
-   ObjectsDeleteAll(0, g_ProgPrefix);
   }
 
 //+------------------------------------------------------------------+
