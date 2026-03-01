@@ -557,16 +557,6 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
   {
-   // MQL5 vstupní timeseries nastavíme explicitně na as-series (0=nejnovější).
-   ArraySetAsSeries(time, true);
-   ArraySetAsSeries(open, true);
-   ArraySetAsSeries(high, true);
-   ArraySetAsSeries(low, true);
-   ArraySetAsSeries(close, true);
-   ArraySetAsSeries(tick_volume, true);
-   ArraySetAsSeries(volume, true);
-   ArraySetAsSeries(spread, true);
-
    int minBars = InpLookback + InpEntropyWindow + InpPredictAhead + 100;
    if(rates_total < minBars) return 0;
 
@@ -598,8 +588,11 @@ int OnCalculate(const int rates_total,
    // Původní chyba: firstValidEntropyBar = InpEntropyWindow = 20,
    // takže smyčka začínala od indexu 20 a bar[1] zůstával na 1.0 (noise).
    int calcStart = 1;
+   int needForPredict = 1 + InpMaxPredictBars + InpLookback + InpEntropyWindow + 32;
+   int minBar = InpPredictAhead + 1;
+   int needForTrain = (minBar + InpTrainBars - 1) + InpEntropyWindow;
    int endBar = MathMin(rates_total - InpEntropyWindow,
-                        1 + InpMaxPredictBars + InpEntropyWindow + 32);
+                        MathMax(needForPredict, needForTrain));
    if(endBar < calcStart)
       endBar = 0;
 
@@ -1311,13 +1304,10 @@ void UpdateInfoPanel()
    // Nejnovější uzavřený bar = index 1.
    // curInNoise = true pokud:
    //   - entropie je nad prahem (skutečný noise)
-   //   - NEBO entropie ještě nebyla spočítána (RawEntropy = 1.0 = init hodnota)
-   // OPRAVA: odstraněna podmínka (1 < g_CalcStart) — ta byla vždy TRUE
-   // když g_CalcStart=20, takže bar[1] byl vždy označen jako noise.
-   // g_CalcStart je nyní 1, takže tato podmínka je zbytečná.
+   //   - NEBO bar[1] není v aktuálně spočítaném rozsahu entropie
    double curEntropy = g_Entropy[1];
-   bool   curInNoise = (curEntropy >= InpEntropyThreshold) ||
-                       (g_RawEntropy[1] >= 1.0);
+   bool   notComputed = (g_CalcStart == 0 || 1 < g_CalcStart || 1 > g_CalcEnd);
+   bool   curInNoise  = notComputed || (curEntropy >= InpEntropyThreshold);
    string regStr = curInNoise ? "NOISE — LSTM OFF" : "STRUCTURED — LSTM ACTIVE";
    color  regClr = curInNoise ? clrOrangeRed : clrLime;
    MakeLabel(g_InfoPrefix + "Regime",
