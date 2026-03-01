@@ -548,20 +548,17 @@ int OnCalculate(const int rates_total,
 
    g_TotalBars = rates_total;
 
-   // Nový uzavřený bar?
+   // Nový uzavřený bar? (detekce vždy podle time[1])
    bool newClosedBar = false;
    if(rates_total >= 2)
      {
-      datetime t = time[rates_total - 2]; // nejstarší bar v poli = [rates_total-2]?
-      // NE — time[0] je nejnovější. Uzavřený bar = time[1].
-      // Ale při první inicializaci je time[1] právě uzavřený.
-      // Správně: poslední uzavřený = time[1] (nejnovější uzavřený = nejmenší index != 0).
-      // Jenže "nový bar" poznáme tak, že se změnil time[1] oproti g_LastClosedBarTime.
-      t = time[1]; // index 1 = poslední uzavřený bar
+      datetime t = time[1];
       if(t != g_LastClosedBarTime)
         {
          g_LastClosedBarTime = t;
          newClosedBar = true;
+         // as-series posun indexů při novém baru => indexově kotvené inkrementy reset
+         g_LastPredictedTo = -1;
         }
      }
 
@@ -575,37 +572,36 @@ int OnCalculate(const int rates_total,
    // OPRAVA: firstValidEntropyBar = 1, NE InpEntropyWindow.
    // Původní chyba: firstValidEntropyBar = InpEntropyWindow = 20,
    // takže smyčka začínala od indexu 20 a bar[1] zůstával na 1.0 (noise).
-   int firstValidEntropyBar = 1; // nejnovější bar s plným oknem do minulosti
+   int calcStart = 1;
+   int endBar = MathMin(rates_total - InpEntropyWindow,
+                        1 + InpMaxPredictBars + InpEntropyWindow + 32);
+   if(endBar < calcStart)
+      endBar = 0;
 
-   int calcStart;
    if(prev_calculated == 0)
      {
-      // Při full recalc: buffer na 1.0 (max noise) pro bary mimo smyčku.
-      // Potřebujeme zakódovat symboly i pro bary, které tvoří okno bar[1]:
-      // tj. bary [1 .. 1 + InpEntropyWindow - 1] = [1 .. InpEntropyWindow].
-      // Smyčka symbolů tedy začíná od 1 a jde do rates_total-1.
       ArrayInitialize(g_Entropy, 1.0);
       ArrayInitialize(g_RawEntropy, 1.0);
       g_EntropySmoothState = -1.0;
-      calcStart   = firstValidEntropyBar; // = 1
-      g_CalcStart = calcStart;
      }
-   else
+   g_CalcStart = calcStart;
+
+   // Bary mimo aktuální deterministic rozsah držíme v NOISE defaultu
+   for(int i = 0; i < rates_total; i++)
      {
-      // Inkrementální: přepočítáme jen nové bary + overlap
-      calcStart = MathMax(prev_calculated - 3, firstValidEntropyBar);
-      // Obnovíme smooth state z bufferu baru těsně "staršího" než calcStart
-      // (starší = větší index = calcStart + 1, protože EMA jde od staršího k novějšímu)
-      if(calcStart > firstValidEntropyBar && g_EntropySmoothState < 0.0)
-         g_EntropySmoothState = g_Entropy[calcStart + 1];
-      // g_CalcStart = 1 se nemění
+      if(i < calcStart || i > endBar)
+        {
+         g_RawEntropy[i]    = 1.0;
+         g_Entropy[i]       = 1.0;
+         g_EntropyThresh[i] = InpEntropyThreshold;
+         g_Regime[i]        = 0.0;
+         g_RegimeColor[i]   = 1;
+        }
      }
 
-   // Kódujeme symboly pro celý výpočetní rozsah včetně okna entropie
-   // Potřebujeme symboly pro [calcStart .. calcStart + InpEntropyWindow + trochu navíc]
-   // ale bezpečně jedeme do rates_total - 1.
+   // Kódujeme symboly jen pro bary nutné pro entropy rozsah [1..endBar]
    int symStart = calcStart;
-   int symEnd   = rates_total - 1;
+   int symEnd   = MathMin(rates_total - 1, endBar + InpEntropyWindow - 1);
    for(int i = symStart; i <= symEnd; i++)
       g_SymbolSeq[i] = (double)EncodeCandle(open[i], high[i], low[i], close[i]);
 
@@ -614,9 +610,10 @@ int OnCalculate(const int rates_total,
    g_HighEntropyBars = 0;
    double entropySum = 0.0;
    int    entropyCnt = 0;
-   double smoothState = g_EntropySmoothState;
+   double smoothState = (endBar + 1 < rates_total) ? g_Entropy[endBar + 1] : 1.0;
+   if(smoothState < 0.0) smoothState = 1.0;
 
-   for(int i = calcStart; i < rates_total; i++)
+   for(int i = endBar; i >= calcStart; i--)
      {
       // Okno entropie: bary [i .. i + window - 1] (do minulosti = větší indexy).
       // Guard: potřebujeme i + InpEntropyWindow - 1 < rates_total.
@@ -652,11 +649,8 @@ int OnCalculate(const int rates_total,
          entropyCnt++;
         }
 
-      if(prev_calculated == 0 || i <= prev_calculated - 1)
-        {
-         g_BullProb[i] = 0.0;
-         g_BearProb[i] = 0.0;
-        }
+      g_BullProb[i] = 0.0;
+      g_BearProb[i] = 0.0;
      }
 
    g_EntropySmoothState = smoothState;
@@ -949,10 +943,10 @@ void BulkPredict(int rates_total,
       return;
      }
 
-   // Inkrementální aktualizace — přepočítáme jen nové + overlap
+   // Inkrementální aktualizace s as-series resetem po novém baru.
    int startPred = newestPredBar;
    int lastPred  = oldestPredBar;
-   if(g_LastPredictedTo > 0 && prev_calculated > 0)
+   if(g_LastPredictedTo != -1)
       lastPred = MathMin(oldestPredBar, g_LastPredictedTo + 2);
 
    int totalPredict = lastPred - startPred + 1;
@@ -968,13 +962,15 @@ void BulkPredict(int rates_total,
    int lstmBars[];
    ArrayResize(lstmBars, 0);
 
+   int entropyEndBar = MathMin(rates_total - InpEntropyWindow,
+                               1 + InpMaxPredictBars + InpEntropyWindow + 32);
+
    for(int i = 0; i < totalPredict; i++)
      {
       int bar = startPred + i; // startPred=1 (novější), roste do minulosti
       if(bar < 1 || bar >= rates_total) continue;
 
-      // FIX 2+3: jen bary s platně spočítanou entropií
-      bool validEntropy = (bar >= g_CalcStart && g_RawEntropy[bar] > 0.0);
+      bool validEntropy = (bar >= 1 && bar <= entropyEndBar);
       bool lowEntropy   = validEntropy && (g_Entropy[bar] < InpEntropyThreshold);
 
       if(lowEntropy)
@@ -1139,7 +1135,7 @@ void BulkComputeATRWilder(int startBar, int count, int period,
                           const double &close[],
                           int rates_total)
   {
-   if(count <= 0) return;
+   if(count <= 0 || period <= 0) return;
 
    // Zkontroluj zda cache pokrývá celý požadovaný rozsah
    if(g_ATRCacheStart == startBar && g_ATRCachedBars >= count) return;
@@ -1149,47 +1145,42 @@ void BulkComputeATRWilder(int startBar, int count, int period,
    g_ATRCacheStart = startBar;
    g_ATRCachedBars = totalNeeded;
 
-   // Pracujeme od nejstaršího baru (startBar + count - 1) k nejnovějšímu (startBar).
-   // Wilder ATR:
-   //   Inicializace: první ATR = SMA prvních `period` TR hodnot
-   //   Rekurence: ATR[i] = (ATR[i+1] * (period-1) + TR[i]) / period
-   //   kde i roste směrem do minulosti (větší index = starší)
-   //   ale tady iterujeme od starší k novější (od vysokého indexu k nízkému)
+   ArrayInitialize(g_ATRCache, _Point * 100);
 
-   int oldestBar = startBar + count - 1; // nejstarší bar
-   if(oldestBar >= rates_total - 1) oldestBar = rates_total - 2;
+   int oldestBar = startBar + count - 1;
+   if(oldestBar > rates_total - 2) oldestBar = rates_total - 2; // bar+1 musí existovat
+   if(startBar < 1 || oldestBar < startBar) return;
 
-   // Inicializace Wildera: SMA prvních `period` TR od nejstaršího baru
-   double atrInit = 0.0;
-   int initCount  = 0;
-   for(int k = 0; k < period && (oldestBar - k) >= 1; k++)
+   // Init ATR jako SMA z TR na nejstarším baru rozsahu přes `period` hodnot k novějším.
+   double sumTR = 0.0;
+   int trCount = 0;
+   for(int b = oldestBar; b >= startBar && trCount < period; b--)
      {
-      int b  = oldestBar - k;         // od nejstaršího k novějšímu (klesající index)
+      if(b + 1 >= rates_total) continue;
       double h  = high[b];
       double l  = low[b];
-      double pc = close[b + 1];       // předchozí close = starší = větší index b+1
+      double pc = close[b + 1];
       double tr = MathMax(h - l, MathMax(MathAbs(h - pc), MathAbs(l - pc)));
-      atrInit += tr;
-      initCount++;
+      sumTR += tr;
+      trCount++;
      }
-   if(initCount == 0) { ArrayInitialize(g_ATRCache, _Point * 100); return; }
-   double atr = atrInit / initCount;
+   if(trCount <= 0) return;
 
-   // Naplníme ATR pro nejstarší bary (kde Wilderova init ještě dobíhá)
-   // a pak rekurenci pro zbytek. Výsledky uložíme do cache.
-   // Cache index: cache[bar - startBar] = ATR pro bar
+   double atr = sumTR / trCount;
+   int cOldest = oldestBar - startBar;
+   if(cOldest >= 0 && cOldest < totalNeeded)
+      g_ATRCache[cOldest] = atr;
 
-   // Začneme od nejstaršího možného a jedeme k nejnovějšímu
-   for(int bar = oldestBar; bar >= startBar; bar--)
+   // Wilder rekurence: od staršího k novějšímu (index klesá)
+   for(int bar = oldestBar - 1; bar >= startBar; bar--)
      {
-      if(bar < 1 || bar >= rates_total) continue;
+      if(bar + 1 >= rates_total) continue;
       double h  = high[bar];
       double l  = low[bar];
-      double pc = (bar + 1 < rates_total) ? close[bar + 1] : close[bar];
+      double pc = close[bar + 1];
       double tr = MathMax(h - l, MathMax(MathAbs(h - pc), MathAbs(l - pc)));
-      // Wilderova rekurence (od staršího k novějšímu)
-      if(bar < oldestBar - period + 1)
-         atr = (atr * (period - 1) + tr) / period;
+      atr = (atr * (period - 1) + tr) / period;
+
       int cIdx = bar - startBar;
       if(cIdx >= 0 && cIdx < totalNeeded)
          g_ATRCache[cIdx] = atr;
