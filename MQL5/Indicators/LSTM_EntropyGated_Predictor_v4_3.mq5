@@ -222,7 +222,8 @@ int    g_ATRCacheStart    = -1;
 int    g_ATRCachedBars    = 0;
 
 int    g_LastPredictedTo  = -1;
-int    g_CalcStart        = 0;   // první bar kde g_Entropy je skutečně spočítaná
+int    g_CalcStart        = 0;   // nejnovější bar kde g_Entropy je skutečně spočítaná
+int    g_CalcEnd          = 0;   // nejstarší bar kde g_Entropy je skutečně spočítaná
 
 // Entropy smooth state
 double g_EntropySmoothState = -1.0;
@@ -240,7 +241,7 @@ string g_ProgPrefix = "EL_P_";
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   Print("=== Entropy-Gated LSTM v4.2 (GPU) ===");
+   Print("=== Entropy-Gated LSTM v4.30 (GPU) ===");
    Print("Konvence: index 0=nejnovejsi, vetsi index=starsi bar");
 
    SetIndexBuffer(0, g_BullProb,      INDICATOR_DATA);
@@ -251,6 +252,15 @@ int OnInit()
    SetIndexBuffer(5, g_RegimeColor,   INDICATOR_COLOR_INDEX);
    SetIndexBuffer(6, g_RawEntropy,    INDICATOR_CALCULATIONS);
    SetIndexBuffer(7, g_SymbolSeq,     INDICATOR_CALCULATIONS);
+
+   ArraySetAsSeries(g_BullProb, true);
+   ArraySetAsSeries(g_BearProb, true);
+   ArraySetAsSeries(g_Entropy, true);
+   ArraySetAsSeries(g_EntropyThresh, true);
+   ArraySetAsSeries(g_Regime, true);
+   ArraySetAsSeries(g_RegimeColor, true);
+   ArraySetAsSeries(g_RawEntropy, true);
+   ArraySetAsSeries(g_SymbolSeq, true);
 
    // FIX 2: g_Entropy inicializujeme na 1.0 (maximum noise).
    // Bary, pro které se entropie ještě nepočítala, tak nikdy
@@ -286,6 +296,7 @@ int OnInit()
    g_EntropySmoothState  = -1.0;
    g_LastPredictedTo     = -1;
    g_CalcStart           = 0;
+   g_CalcEnd             = 0;
 
    CreateInfoPanel();
    CreateProgressBar();
@@ -559,6 +570,7 @@ int OnCalculate(const int rates_total,
          newClosedBar = true;
          // as-series posun indexů při novém baru => indexově kotvené inkrementy reset
          g_LastPredictedTo = -1;
+         g_EntropySmoothState = -1.0;
         }
      }
 
@@ -582,21 +594,29 @@ int OnCalculate(const int rates_total,
      {
       ArrayInitialize(g_Entropy, 1.0);
       ArrayInitialize(g_RawEntropy, 1.0);
+      ArrayInitialize(g_EntropyThresh, InpEntropyThreshold);
+      ArrayInitialize(g_Regime, 0.0);
+      ArrayInitialize(g_RegimeColor, 1.0);
+      ArrayInitialize(g_BullProb, 0.0);
+      ArrayInitialize(g_BearProb, 0.0);
       g_EntropySmoothState = -1.0;
      }
-   g_CalcStart = calcStart;
+   g_CalcStart = (endBar >= calcStart) ? calcStart : 0;
+   g_CalcEnd   = (endBar >= calcStart) ? endBar   : 0;
 
-   // Bary mimo aktuální deterministic rozsah držíme v NOISE defaultu
-   for(int i = 0; i < rates_total; i++)
+   // Formující bar [0] a první nevalidní starší bar hned za vypočteným rozsahem držíme v NOISE.
+   g_RawEntropy[0]    = 1.0;
+   g_Entropy[0]       = 1.0;
+   g_EntropyThresh[0] = InpEntropyThreshold;
+   g_Regime[0]        = 0.0;
+   g_RegimeColor[0]   = 1;
+   if(endBar + 1 < rates_total)
      {
-      if(i < calcStart || i > endBar)
-        {
-         g_RawEntropy[i]    = 1.0;
-         g_Entropy[i]       = 1.0;
-         g_EntropyThresh[i] = InpEntropyThreshold;
-         g_Regime[i]        = 0.0;
-         g_RegimeColor[i]   = 1;
-        }
+      g_RawEntropy[endBar + 1]    = 1.0;
+      g_Entropy[endBar + 1]       = 1.0;
+      g_EntropyThresh[endBar + 1] = InpEntropyThreshold;
+      g_Regime[endBar + 1]        = 0.0;
+      g_RegimeColor[endBar + 1]   = 1;
      }
 
    // Kódujeme symboly jen pro bary nutné pro entropy rozsah [1..endBar]
@@ -649,8 +669,6 @@ int OnCalculate(const int rates_total,
          entropyCnt++;
         }
 
-      g_BullProb[i] = 0.0;
-      g_BearProb[i] = 0.0;
      }
 
    g_EntropySmoothState = smoothState;
@@ -674,7 +692,7 @@ int OnCalculate(const int rates_total,
    if(g_ModelReady && !g_IsTraining)
      {
       if(newClosedBar || prev_calculated == 0)
-         BulkPredict(rates_total, prev_calculated, open, high, low, close, tick_volume);
+         BulkPredict(rates_total, open, high, low, close, tick_volume);
 
       // Formující bar [0] = vždy prázdný
       g_BullProb[0] = 0.0;
@@ -800,9 +818,9 @@ bool StartTraining(int rates_total,
    for(int bar = minBar; bar <= maxBar; bar++)
      {
       // FIX 3: bar musí být >= g_CalcStart (entropie je skutečně spočítána)
-      if(bar < g_CalcStart) continue;
+      if(bar < g_CalcStart || bar > g_CalcEnd) continue;
       // FIX 3: g_RawEntropy[bar] > 0 jako další pojistka
-      if(g_RawEntropy[bar] <= 0.0) continue;
+      if(g_RawEntropy[bar] <= 0.0 || g_RawEntropy[bar] >= 1.0) continue;
       if(g_Entropy[bar] < InpEntropyThreshold)
         {
          int sz = ArraySize(candidates);
@@ -821,8 +839,8 @@ bool StartTraining(int rates_total,
          ArrayResize(candidates, 0);
          for(int bar = minBar; bar <= maxBar; bar++)
            {
-            if(bar < g_CalcStart) continue;
-            if(g_RawEntropy[bar] <= 0.0) continue;
+            if(bar < g_CalcStart || bar > g_CalcEnd) continue;
+            if(g_RawEntropy[bar] <= 0.0 || g_RawEntropy[bar] >= 1.0) continue;
             int sz = ArraySize(candidates);
             ArrayResize(candidates, sz + 1);
             candidates[sz] = bar;
@@ -849,7 +867,7 @@ bool StartTraining(int rates_total,
       if(candidates[s] < featNewest) featNewest = candidates[s];
       if(candidates[s] > featOldest) featOldest = candidates[s];
      }
-   featOldest = MathMin(featOldest + InpLookback, rates_total - 2);
+   featOldest = MathMin(featOldest + InpLookback - 1, rates_total - 2);
    int featRange = featOldest - featNewest + 1;
    if(featRange <= 0) { Print("StartTraining: featRange <= 0"); return false; }
 
@@ -920,7 +938,6 @@ bool StartTraining(int rates_total,
 //|   evalBar = barIdx - InpPredictAhead < barIdx (novější = menší)  |
 //+------------------------------------------------------------------+
 void BulkPredict(int rates_total,
-                 int prev_calculated,
                  const double &open[],
                  const double &high[],
                  const double &low[],
@@ -962,15 +979,13 @@ void BulkPredict(int rates_total,
    int lstmBars[];
    ArrayResize(lstmBars, 0);
 
-   int entropyEndBar = MathMin(rates_total - InpEntropyWindow,
-                               1 + InpMaxPredictBars + InpEntropyWindow + 32);
 
    for(int i = 0; i < totalPredict; i++)
      {
       int bar = startPred + i; // startPred=1 (novější), roste do minulosti
       if(bar < 1 || bar >= rates_total) continue;
 
-      bool validEntropy = (bar >= 1 && bar <= entropyEndBar);
+      bool validEntropy = (bar >= g_CalcStart && bar <= g_CalcEnd && g_RawEntropy[bar] > 0.0 && g_RawEntropy[bar] < 1.0);
       bool lowEntropy   = validEntropy && (g_Entropy[bar] < InpEntropyThreshold);
 
       if(lowEntropy)
@@ -997,7 +1012,7 @@ void BulkPredict(int rates_total,
 
    // Feature rozsah — po shufflu v tréninku jsou lstmBars rostoucí (od novějšího ke staršímu)
    int featNewest = lstmBars[0];                             // nejmenší index = nejnovější
-   int featOldest = lstmBars[nLSTM - 1] + InpLookback;      // nejstarší + history
+   int featOldest = lstmBars[nLSTM - 1] + InpLookback - 1;      // nejstarší + history
    featOldest = MathMin(featOldest, rates_total - 1);
    int featRange  = featOldest - featNewest + 1;
    if(featRange <= 0) { Print("BulkPredict: featRange <= 0"); return; }
@@ -1239,7 +1254,7 @@ void CreateInfoPanel()
    ObjectSetInteger(0, bg, OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, bg, OBJPROP_BACK, false);
    ObjectSetInteger(0, bg, OBJPROP_SELECTABLE, false);
-   MakeLabel(g_InfoPrefix + "T", "Entropy-Gated LSTM v4.2",
+   MakeLabel(g_InfoPrefix + "T", "Entropy-Gated LSTM v4.30",
              15, 35, clrDodgerBlue, 10, true);
   }
 
@@ -1287,7 +1302,7 @@ void UpdateInfoPanel()
    // g_CalcStart je nyní 1, takže tato podmínka je zbytečná.
    double curEntropy = g_Entropy[1];
    bool   curInNoise = (curEntropy >= InpEntropyThreshold) ||
-                       (g_RawEntropy[1] >= 1.0 && g_TotalBars < InpEntropyWindow + 5);
+                       (g_RawEntropy[1] >= 1.0);
    string regStr = curInNoise ? "NOISE — LSTM OFF" : "STRUCTURED — LSTM ACTIVE";
    color  regClr = curInNoise ? clrOrangeRed : clrLime;
    MakeLabel(g_InfoPrefix + "Regime",
