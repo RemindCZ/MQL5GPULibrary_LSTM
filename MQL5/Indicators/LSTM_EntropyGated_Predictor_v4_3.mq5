@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| LSTM_EntropyGated_Predictor.mq5                      v4.3        |
+//| LSTM_EntropyGated_Predictor.mq5                      v4.30       |
 //| Entropy-first, LSTM-second architecture                          |
 //| GPU-optimized via MQL5GPULibrary_LSTM.dll                        |
 //|                                                                  |
@@ -10,7 +10,7 @@
 //|   "budoucnost" od baru X = menší index (X - N)                  |
 //|   "minulost"  od baru X = větší index (X + N)                   |
 //|                                                                  |
-//| FIX v4.3 (hlavní bug z v4.2):                                   |
+//| FIX v4.30 (hlavní bug z v4.2):                                  |
 //|  Symptom: H=1.000, NOISE pořád, žádné predikce.                 |
 //|  Příčina: firstValidEntropyBar = InpEntropyWindow = 20           |
 //|    → smyčka entropy začínala od indexu 20                        |
@@ -26,7 +26,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Tomáš Bělák"
 #property link      "https://remind.cz/"
-#property description "Entropy-Gated LSTM v4.3: Fixed firstValidEntropyBar=1, entropy okno guard, curInNoise oprava"
+#property description "Entropy-Gated LSTM v4.30: as-series indexing + robust entropy gating/prediction alignment"
 #property version   "4.30"
 #property strict
 
@@ -357,6 +357,9 @@ int EncodeCandle(double open, double high, double low, double close)
       else if(upperShadow > lowerShadow)  return 2; // weak bear, upper shadow
       else                                return 3; // weak bear, lower shadow
      }
+
+   // Fallback (ochrana proti krajním FP anomáliím)
+   return 4;
   }
 
 //+------------------------------------------------------------------+
@@ -554,6 +557,16 @@ int OnCalculate(const int rates_total,
                 const long &volume[],
                 const int &spread[])
   {
+   // MQL5 vstupní timeseries nastavíme explicitně na as-series (0=nejnovější).
+   ArraySetAsSeries(time, true);
+   ArraySetAsSeries(open, true);
+   ArraySetAsSeries(high, true);
+   ArraySetAsSeries(low, true);
+   ArraySetAsSeries(close, true);
+   ArraySetAsSeries(tick_volume, true);
+   ArraySetAsSeries(volume, true);
+   ArraySetAsSeries(spread, true);
+
    int minBars = InpLookback + InpEntropyWindow + InpPredictAhead + 100;
    if(rates_total < minBars) return 0;
 
@@ -985,7 +998,9 @@ void BulkPredict(int rates_total,
       int bar = startPred + i; // startPred=1 (novější), roste do minulosti
       if(bar < 1 || bar >= rates_total) continue;
 
-      bool validEntropy = (bar >= g_CalcStart && bar <= g_CalcEnd && g_RawEntropy[bar] > 0.0 && g_RawEntropy[bar] < 1.0);
+      // Entropii bereme jako validní, pokud bar leží ve spočítaném rozsahu.
+      // Neomezujeme podle hodnoty rawH (může být legitimně 0.0 i 1.0).
+      bool validEntropy = (g_CalcStart > 0 && bar >= g_CalcStart && bar <= g_CalcEnd);
       bool lowEntropy   = validEntropy && (g_Entropy[bar] < InpEntropyThreshold);
 
       if(lowEntropy)
