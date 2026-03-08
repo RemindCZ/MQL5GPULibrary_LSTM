@@ -1464,8 +1464,10 @@ class SequenceModel {
         int H_last = lstm_layers.back()->hidden_size;
 
         int nMiniBatches = (batch + mini_batch_size - 1) / mini_batch_size;
-        int total_schedule_steps = max_epochs * nMiniBatches;
-        int warmup_steps = std::min(500, std::max(1, total_schedule_steps / 10));
+        const int total_schedule_steps = max_epochs * nMiniBatches;
+        int warmup_steps = total_schedule_steps / 10;
+        if (warmup_steps < 1) warmup_steps = 1;
+        if (warmup_steps > 500) warmup_steps = 500;
         if (auto* cosine = dynamic_cast<CosineWarmupScheduler*>(lr_scheduler.get())) {
             cosine->total_steps = std::max(1, total_schedule_steps);
             cosine->warmup_steps = warmup_steps;
