@@ -579,11 +579,11 @@ __global__ void kAdamW(int n, float* __restrict__ p,
     float* __restrict__ m, float* __restrict__ v,
     const float* __restrict__ g,
     float lr, float b1, float b2, float eps,
-    float wd, float c1, float c2, float clip_val)
+    float wd, float c1, float c2, float grad_scale)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float gi = fminf(fmaxf(g[i], -clip_val), clip_val);
+        float gi = g[i] / grad_scale;
         float mi = b1 * m[i] + (1.0f - b1) * gi;
         float vi = b2 * v[i] + (1.0f - b2) * (gi * gi);
         m[i] = mi; v[i] = vi;
@@ -742,7 +742,7 @@ struct LSTMLayer {
         input_size = in_sz;
         hidden_size = hid_sz;
         use_dropout = (drop_rate > 0.0f);
-        dropout_rate = drop_rate;
+        dropout_rate = std::min(drop_rate, 0.999f);
 
         if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
 
@@ -777,7 +777,7 @@ struct LSTMLayer {
         input_size = in_sz;
         hidden_size = hid_sz;
         use_dropout = (drop_rate > 0.0f);
-        dropout_rate = drop_rate;
+        dropout_rate = std::min(drop_rate, 0.999f);
 
         if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
 
@@ -1005,7 +1005,7 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    MQL_BOOL Update(float lr, float c1, float c2, float wd, float clip,
+    MQL_BOOL Update(float lr, float c1, float c2, float wd, float grad_scale,
         cudaStream_t stream_h)
     {
         if (!is_valid || !stream_h) return MQL_FALSE;
@@ -1017,12 +1017,12 @@ struct LSTMLayer {
 
         kAdamW << <toU32((nW + 255) / 256), 256, 0, stream_h >> > (
             nW, W.ptr, mW.ptr, vW.ptr, dW.ptr,
-            lr, b1, b2, eps, wd, c1, c2, clip);
+            lr, b1, b2, eps, wd, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
 
         kAdamW << <toU32((gate_dim + 255) / 256), 256, 0, stream_h >> > (
             gate_dim, b.ptr, mb.ptr, vb.ptr, db.ptr,
-            lr, b1, b2, eps, 0.0f, c1, c2, clip);
+            lr, b1, b2, eps, 0.0f, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
 
         return MQL_TRUE;
@@ -1145,7 +1145,7 @@ struct OutputLayer {
         return MQL_TRUE;
     }
 
-    MQL_BOOL Update(float lr, float c1, float c2, float wd, float clip,
+    MQL_BOOL Update(float lr, float c1, float c2, float wd, float grad_scale,
         cudaStream_t stream_h)
     {
         if (!is_valid) return MQL_FALSE;
@@ -1153,11 +1153,11 @@ struct OutputLayer {
         int nW = in_dim * out_dim;
         kAdamW << <toU32((nW + 255) / 256), 256, 0, stream_h >> > (
             nW, W.ptr, mW.ptr, vW.ptr, dW.ptr,
-            lr, b1, b2, eps, wd, c1, c2, clip);
+            lr, b1, b2, eps, wd, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
         kAdamW << <toU32((out_dim + 255) / 256), 256, 0, stream_h >> > (
             out_dim, b.ptr, mb.ptr, vb.ptr, db.ptr,
-            lr, b1, b2, eps, 0.0f, c1, c2, clip);
+            lr, b1, b2, eps, 0.0f, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
         return MQL_TRUE;
     }
@@ -1545,13 +1545,60 @@ class LSTMNet {
                         return MQL_FALSE;
                 }
 
+                float grad_scale = 1.0f;
+                if (grad_clip > 0.0f) {
+                    CUDA_CHECK_RET(cudaMemsetAsync(grad_norm_reduce.ptr,
+                        0, sizeof(float), ctx.stream));
+
+                    for (int li = 0; li < nLayers; li++) {
+                        LSTMLayer* layer = lstm_layers[li].get();
+                        if (layer->dW.ptr && layer->dW.count > 0) {
+                            int nDW = (int)layer->dW.count;
+                            kL2NormReduceWarp << <std::min((nDW + 255) / 256, 1024),
+                                256, 0, ctx.stream >> > (
+                                    nDW, layer->dW.ptr, grad_norm_reduce.ptr);
+                            CUDA_CHECK_KERNEL_RET();
+                        }
+                        if (layer->db.ptr && layer->db.count > 0) {
+                            int nDb = (int)layer->db.count;
+                            kL2NormReduceWarp << <std::min((nDb + 255) / 256, 1024),
+                                256, 0, ctx.stream >> > (
+                                    nDb, layer->db.ptr, grad_norm_reduce.ptr);
+                            CUDA_CHECK_KERNEL_RET();
+                        }
+                    }
+
+                    if (output_layer->dW.ptr && output_layer->dW.count > 0) {
+                        int nDW = (int)output_layer->dW.count;
+                        kL2NormReduceWarp << <std::min((nDW + 255) / 256, 1024),
+                            256, 0, ctx.stream >> > (
+                                nDW, output_layer->dW.ptr, grad_norm_reduce.ptr);
+                        CUDA_CHECK_KERNEL_RET();
+                    }
+                    if (output_layer->db.ptr && output_layer->db.count > 0) {
+                        int nDb = (int)output_layer->db.count;
+                        kL2NormReduceWarp << <std::min((nDb + 255) / 256, 1024),
+                            256, 0, ctx.stream >> > (
+                                nDb, output_layer->db.ptr, grad_norm_reduce.ptr);
+                        CUDA_CHECK_KERNEL_RET();
+                    }
+
+                    float global_grad_sq_sum = 0.0f;
+                    CUDA_CHECK_RET(cudaMemcpyAsync(&global_grad_sq_sum,
+                        grad_norm_reduce.ptr, sizeof(float),
+                        cudaMemcpyDeviceToHost, ctx.stream));
+                    CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
+                    float global_norm = sqrtf(std::max(global_grad_sq_sum, 0.0f));
+                    grad_scale = std::max(1.0f, global_norm / grad_clip);
+                }
+
                 // Update all layers
                 for (int li = 0; li < nLayers; li++)
                     if (!lstm_layers[li]->Update(cur_lr, c1, c2, (float)wd,
-                        grad_clip, ctx.stream))
+                        grad_scale, ctx.stream))
                         return MQL_FALSE;
                 if (!output_layer->Update(cur_lr, c1, c2, (float)wd,
-                    grad_clip, ctx.stream))
+                    grad_scale, ctx.stream))
                     return MQL_FALSE;
 
                 // ── Progress: grad norm (every 10 minibatches) ─────────
@@ -1782,7 +1829,7 @@ public:
         else {
             l->input_size = 0; l->hidden_size = hidden_size;
             l->is_valid = false; l->use_dropout = (dropout > 0.0f);
-            l->dropout_rate = dropout;
+            l->dropout_rate = std::min(dropout, 0.999f);
         }
         lstm_layers.push_back(std::move(l));
         return MQL_TRUE;
@@ -2034,7 +2081,8 @@ static std::shared_ptr<LSTMNet> FindAndLockExclusive(int h, std::unique_lock<std
     auto it = g_nets.find(h);
     if (it == g_nets.end()) return nullptr;
     std::shared_ptr<LSTMNet> net = it->second;
-    lk = std::unique_lock<std::shared_mutex>(net->net_mtx);
+    lk = std::unique_lock<std::shared_mutex>(net->net_mtx, std::try_to_lock);
+    if (!lk.owns_lock()) return nullptr;
     return net;
 }
 
@@ -2321,8 +2369,9 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
     if (!net) return MQL_FALSE;
     const auto& s = net->serialize_buf;
     if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
-    memcpy(buf, s.c_str(), s.size());
-    buf[s.size()] = 0;
+    int copy_len = std::min((int)s.size(), max_len - 1);
+    memcpy(buf, s.c_str(), copy_len);
+    buf[copy_len] = '\0';
     return MQL_TRUE;
 }
 
