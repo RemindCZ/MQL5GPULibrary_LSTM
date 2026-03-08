@@ -1,4 +1,4 @@
-// kernel.cu — LSTM DLL v1.4.0 (Async Support + Progress Reporting)
+// kernel.cu — LSTM DLL v2.1.0 (Async Support + Progress Reporting)
 // Pure LSTM implementation with CUDA acceleration
 // Features: Async training, Dropout, Multi-layer, Persistent buffers, Progress
 // Build as: Dynamic Library (.dll)
