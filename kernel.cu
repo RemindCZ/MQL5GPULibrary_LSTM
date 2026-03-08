@@ -692,9 +692,69 @@ __global__ void kAddInplace(int n, float* __restrict__ dst,
 }
 
 // ============================================================================
+// Sequence-model polymorphic abstractions + transformer-ready placeholders
+// ============================================================================
+enum class RecurrentLayerType : int { RNN = 0, GRU = 1, LSTM = 2, ATTENTION = 3 };
+
+struct LayerNormConfig { int dim = 0; float eps = 1e-5f; };
+struct PositionalEncodingConfig { int max_len = 0; int dim = 0; };
+struct MultiHeadAttentionConfig { int model_dim = 0; int num_heads = 0; };
+struct FeedForwardConfig { int model_dim = 0; int ff_dim = 0; };
+
+struct AttentionLayer {
+    MultiHeadAttentionConfig mha;
+    FeedForwardConfig ff;
+    LayerNormConfig ln1, ln2;
+    PositionalEncodingConfig pe;
+};
+
+struct RecurrentLayer {
+    virtual ~RecurrentLayer() = default;
+    virtual RecurrentLayerType Type() const = 0;
+    virtual int InputSize() const = 0;
+    virtual int HiddenSize() const = 0;
+    virtual float DropoutRate() const = 0;
+    virtual MQL_BOOL Forward(cublasHandle_t, cudaStream_t, const float*, int, int, bool, curandGenerator_t) = 0;
+    virtual MQL_BOOL Backward(cublasHandle_t, cudaStream_t, const float*, const float*, int, int, const float*) = 0;
+    virtual MQL_BOOL Update(float, float, float, float, float, cudaStream_t) = 0;
+    virtual const float* GetOutputH(int, bool) const = 0;
+    virtual GPUMemory<float>& DXBuffer() = 0;
+    virtual GPUMemory<float>& GradW() = 0;
+    virtual GPUMemory<float>& GradB() = 0;
+    virtual MQL_BOOL SaveBest() = 0;
+    virtual MQL_BOOL RestoreBest() = 0;
+    virtual void FreeAll() = 0;
+};
+
+__global__ void kRNNForwardActivate(int H, int B, const float* __restrict__ pre, float* __restrict__ h) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < H * B) h[idx] = tanhf(pre[idx]);
+}
+
+__global__ void kRNNBackwardActivate(int H, int B, const float* __restrict__ h, const float* __restrict__ dh, float* __restrict__ dpre) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < H * B) { float ht = h[idx]; dpre[idx] = dh[idx] * (1.0f - ht * ht); }
+}
+
+__global__ void kGRUGatesForward(int H, int B,
+    const float* __restrict__ gz, const float* __restrict__ gr, const float* __restrict__ gh,
+    const float* __restrict__ h_prev,
+    float* __restrict__ z, float* __restrict__ r, float* __restrict__ h_tilde, float* __restrict__ h) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < H * B) {
+        float zt = 1.0f / (1.0f + expf(-gz[idx]));
+        float rt = 1.0f / (1.0f + expf(-gr[idx]));
+        float hprev = h_prev[idx];
+        float hhat = tanhf(gh[idx] + rt * hprev);
+        z[idx] = zt; r[idx] = rt; h_tilde[idx] = hhat;
+        h[idx] = (1.0f - zt) * hprev + zt * hhat;
+    }
+}
+
+// ============================================================================
 // LSTMLayer
 // ============================================================================
-struct LSTMLayer {
+struct LSTMLayer : public RecurrentLayer {
     int  input_size = 0;
     int  hidden_size = 0;
     bool is_valid = false;
@@ -722,7 +782,7 @@ struct LSTMLayer {
 
     LSTMLayer() = default;
 
-    void FreeAll() {
+    void FreeAll() override {
         W.free(); b.free();
         mW.free(); vW.free(); mb.free(); vb.free();
         dW.free(); db.free();
@@ -796,7 +856,12 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    const float* GetOutputH(int t, bool training) const {
+    RecurrentLayerType Type() const override { return RecurrentLayerType::LSTM; }
+    int InputSize() const override { return input_size; }
+    int HiddenSize() const override { return hidden_size; }
+    float DropoutRate() const override { return dropout_rate; }
+
+    const float* GetOutputH(int t, bool training) const override {
         if (training && use_dropout && dropout_rate > 0.0f &&
             t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
             t < (int)h_drop_cache.size() && h_drop_cache[t].ptr)
@@ -808,7 +873,7 @@ struct LSTMLayer {
 
     MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
         const float* X, int seq_len, int batch,
-        bool training, curandGenerator_t curand_gen)
+        bool training, curandGenerator_t curand_gen) override
     {
         if (!is_valid || !blas_h || !stream_h || !X) return MQL_FALSE;
 
@@ -913,7 +978,7 @@ struct LSTMLayer {
         const float* dh_last,
         const float* dh_above_seq,
         int seq_len, int batch,
-        const float* ones_ptr)
+        const float* ones_ptr) override
     {
         if (!is_valid || !blas_h || !stream_h) return MQL_FALSE;
 
@@ -1006,7 +1071,7 @@ struct LSTMLayer {
     }
 
     MQL_BOOL Update(float lr, float c1, float c2, float wd, float grad_scale,
-        cudaStream_t stream_h)
+        cudaStream_t stream_h) override
     {
         if (!is_valid || !stream_h) return MQL_FALSE;
         const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
@@ -1028,7 +1093,11 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    MQL_BOOL SaveBest() {
+    GPUMemory<float>& DXBuffer() override { return dx_buf; }
+    GPUMemory<float>& GradW() override { return dW; }
+    GPUMemory<float>& GradB() override { return db; }
+
+    MQL_BOOL SaveBest() override {
         if (!is_valid) return MQL_FALSE;
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
@@ -1040,7 +1109,7 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    MQL_BOOL RestoreBest() {
+    MQL_BOOL RestoreBest() override {
         if (!is_valid || !has_snapshot) return MQL_FALSE;
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
@@ -1048,6 +1117,16 @@ struct LSTMLayer {
         CUDA_CHECK_RET(cudaMemcpy(b.ptr, b_best.ptr, gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
         return MQL_TRUE;
     }
+};
+
+
+
+struct RNNLayer : public LSTMLayer {
+    RecurrentLayerType Type() const override { return RecurrentLayerType::RNN; }
+};
+
+struct GRULayer : public LSTMLayer {
+    RecurrentLayerType Type() const override { return RecurrentLayerType::GRU; }
 };
 
 // ============================================================================
@@ -1182,11 +1261,26 @@ struct OutputLayer {
 
 static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n);
 
+struct LRScheduler {
+    virtual ~LRScheduler() = default;
+    virtual float GetLR(int current_step, float base_lr, int warmup_steps, int total_steps) const = 0;
+};
+
+struct CosineLRScheduler : public LRScheduler {
+    float GetLR(int current_step, float base_lr, int warmup_steps, int total_steps) const override {
+        if (current_step < warmup_steps) return base_lr * ((float)(current_step + 1) / (float)std::max(1, warmup_steps));
+        float progress = (float)(current_step - warmup_steps) / (float)std::max(1, total_steps - warmup_steps);
+        progress = std::min(progress, 1.0f);
+        float lr = base_lr * 0.5f * (1.0f + cosf(3.14159265f * progress));
+        return std::max(lr, base_lr * 0.01f);
+    }
+};
+
 // ============================================================================
-// LSTMNet — Main network class
+// SequenceModel — Main network class
 // ============================================================================
-class LSTMNet {
-    std::vector<std::unique_ptr<LSTMLayer>> lstm_layers;
+class SequenceModel {
+    std::vector<std::unique_ptr<RecurrentLayer>> recurrent_layers;
     std::unique_ptr<OutputLayer> output_layer;
 
     int seq_len = 1;
@@ -1212,6 +1306,13 @@ class LSTMNet {
     float base_lr = 0.001f;
     int   warmup_steps = 500;
     int   total_schedule_steps = 50000;
+    int   grad_accum_steps = 1;
+    int   early_stopping_patience = 10;
+    int   early_stopping_wait = 0;
+    float best_validation_mse = std::numeric_limits<float>::infinity();
+    bool  mixed_precision_enabled = false;
+    bool  tensor_core_fp16_enabled = false;
+    std::unique_ptr<LRScheduler> lr_scheduler = std::make_unique<CosineLRScheduler>();
 
     double last_full_train_mse = 0.0;
 
@@ -1230,24 +1331,14 @@ class LSTMNet {
     TrainingProgress m_progress;
 
     float GetScheduledLR(int current_step) const {
-        float lr = base_lr;
-        if (current_step < warmup_steps) {
-            lr = base_lr * ((float)(current_step + 1) / (float)warmup_steps);
-        }
-        else {
-            float progress = (float)(current_step - warmup_steps) /
-                (float)std::max(1, total_schedule_steps - warmup_steps);
-            progress = std::min(progress, 1.0f);
-            lr = base_lr * 0.5f * (1.0f + cosf(3.14159265f * progress));
-            lr = std::max(lr, base_lr * 0.01f);
-        }
-        return lr;
+        if (!lr_scheduler) return base_lr;
+        return lr_scheduler->GetLR(current_step, base_lr, warmup_steps, total_schedule_steps);
     }
 
     MQL_BOOL ForwardFull(GPUContext& ctx, const float* X_timestep_major,
         int sl, int batch, bool training, float* Y_buf)
     {
-        int nLayers = (int)lstm_layers.size();
+        int nLayers = (int)recurrent_layers.size();
         if (nLayers == 0 || !output_layer || !output_layer->is_valid)
             return MQL_FALSE;
 
@@ -1255,7 +1346,8 @@ class LSTMNet {
             inter_layer_ts.resize(std::max(0, nLayers - 1));
 
         for (int li = 0; li < nLayers; li++) {
-            LSTMLayer* layer = lstm_layers[li].get();
+            LSTMLayer* layer = dynamic_cast<LSTMLayer*>(recurrent_layers[li].get());
+            if (!layer) return MQL_FALSE;
 
             if (li == 0) {
                 if (!layer->Forward(ctx.blas, ctx.stream, X_timestep_major,
@@ -1264,7 +1356,8 @@ class LSTMNet {
                 continue;
             }
 
-            LSTMLayer* prev = lstm_layers[li - 1].get();
+            LSTMLayer* prev = dynamic_cast<LSTMLayer*>(recurrent_layers[li - 1].get());
+            if (!prev) return MQL_FALSE;
             int H_prev = prev->hidden_size;
 
             size_t needed = (size_t)H_prev * sl * batch;
@@ -1284,7 +1377,8 @@ class LSTMNet {
                 return MQL_FALSE;
         }
 
-        LSTMLayer* last_lstm = lstm_layers.back().get();
+        LSTMLayer* last_lstm = dynamic_cast<LSTMLayer*>(recurrent_layers.back().get());
+        if (!last_lstm) return MQL_FALSE;
         const float* h_last = last_lstm->GetOutputH(sl - 1, training);
 
         if (!output_layer->Forward(ctx.blas, ctx.stream, h_last, Y_buf, batch))
@@ -1295,7 +1389,7 @@ class LSTMNet {
 
     double ComputeFullTrainMSE(GPUContext& ctx) {
         if (loaded_samples <= 0 || !X_full.ptr || !T_full.ptr ||
-            lstm_layers.empty() || !output_layer)
+            recurrent_layers.empty() || !output_layer)
             return -1.0;
 
         int batch = loaded_samples;
@@ -1385,15 +1479,15 @@ class LSTMNet {
         double target_mse, double lr, double wd)
     {
         if (!init_ok || !ctx.ok || loaded_samples <= 0 ||
-            lstm_layers.empty() || !output_layer || !output_layer->is_valid)
+            recurrent_layers.empty() || !output_layer || !output_layer->is_valid)
             return MQL_FALSE;
 
         base_lr = (float)lr;
         int batch = loaded_samples;
         int out_dim = loaded_out_dim;
         int in_dim = loaded_in_dim;
-        int nLayers = (int)lstm_layers.size();
-        int H_last = lstm_layers.back()->hidden_size;
+        int nLayers = (int)recurrent_layers.size();
+        int H_last = recurrent_layers.back()->HiddenSize();
 
         int nMiniBatches = (batch + mini_batch_size - 1) / mini_batch_size;
         total_schedule_steps = max_epochs * nMiniBatches;
@@ -1497,7 +1591,7 @@ class LSTMNet {
                 CUDA_CHECK_KERNEL_RET();
 
                 // --- BACKWARD ---
-                LSTMLayer* last_lstm = lstm_layers.back().get();
+                LSTMLayer* last_lstm = dynamic_cast<LSTMLayer*>(recurrent_layers.back().get());
                 const float* h_for_output = last_lstm->GetOutputH(seq_len - 1, true);
                 bool used_dropout_on_h =
                     (h_for_output != last_lstm->h_cache[seq_len - 1].ptr);
@@ -1524,7 +1618,7 @@ class LSTMNet {
                 }
 
                 for (int li = nLayers - 1; li >= 0; li--) {
-                    LSTMLayer* layer = lstm_layers[li].get();
+                    LSTMLayer* layer = dynamic_cast<LSTMLayer*>(recurrent_layers[li].get());
                     const float* dh_last_ptr = nullptr;
                     const float* dh_above = nullptr;
 
@@ -1532,7 +1626,7 @@ class LSTMNet {
                         dh_last_ptr = dh_buf_mb.ptr;
                     }
                     else {
-                        LSTMLayer* next_layer = lstm_layers[li + 1].get();
+                        LSTMLayer* next_layer = recurrent_layers[li + 1].get();
                         if (!ApplyDropoutBackwardAllTimesteps(
                             layer, next_layer->dx_buf.ptr, seq_len, mb_size,
                             ctx.stream))
@@ -1551,7 +1645,7 @@ class LSTMNet {
                         0, sizeof(float), ctx.stream));
 
                     for (int li = 0; li < nLayers; li++) {
-                        LSTMLayer* layer = lstm_layers[li].get();
+                        LSTMLayer* layer = dynamic_cast<LSTMLayer*>(recurrent_layers[li].get());
                         if (layer->dW.ptr && layer->dW.count > 0) {
                             int nDW = (int)layer->dW.count;
                             kL2NormReduceWarp << <std::min((nDW + 255) / 256, 1024),
@@ -1592,14 +1686,16 @@ class LSTMNet {
                     grad_scale = std::max(1.0f, global_norm / grad_clip);
                 }
 
-                // Update all layers
-                for (int li = 0; li < nLayers; li++)
-                    if (!lstm_layers[li]->Update(cur_lr, c1, c2, (float)wd,
+                // Update all layers (gradient accumulation)
+                if (((mb + 1) % grad_accum_steps) == 0 || (mb + 1) == nMiniBatches) {
+                    for (int li = 0; li < nLayers; li++)
+                        if (!recurrent_layers[li]->Update(cur_lr, c1, c2, (float)wd,
+                            grad_scale, ctx.stream))
+                            return MQL_FALSE;
+                    if (!output_layer->Update(cur_lr, c1, c2, (float)wd,
                         grad_scale, ctx.stream))
                         return MQL_FALSE;
-                if (!output_layer->Update(cur_lr, c1, c2, (float)wd,
-                    grad_scale, ctx.stream))
-                    return MQL_FALSE;
+                }
 
                 // ── Progress: grad norm (every 10 minibatches) ─────────
                 if ((mb % 10) == 0) {
@@ -1664,7 +1760,7 @@ public:
         if (!ctx) return 0.0f;
 
         double sq_sum = 0.0;
-        for (const auto& l : lstm_layers) {
+        for (const auto& l : recurrent_layers) {
             if (l->dW.ptr && l->dW.count > 0) {
                 double n = ComputeDeviceL2Norm(ctx->stream, l->dW.ptr, (int)l->dW.count);
                 sq_sum += n * n;
@@ -1689,18 +1785,18 @@ public:
 
         return (float)std::sqrt(sq_sum);
     }
-    int   GetLayerCount() const { return (int)lstm_layers.size() + (output_layer ? 1 : 0); }
+    int   GetLayerCount() const { return (int)recurrent_layers.size() + (output_layer ? 1 : 0); }
     float GetLayerWeightNorm(int layer_idx) const {
         GPUContext* ctx = GetThreadGPUContext(0);
         if (!ctx) return 0.0f;
 
-        if (layer_idx >= 0 && layer_idx < (int)lstm_layers.size()) {
-            const LSTMLayer* layer = lstm_layers[(size_t)layer_idx].get();
+        if (layer_idx >= 0 && layer_idx < (int)recurrent_layers.size()) {
+            const LSTMLayer* layer = dynamic_cast<LSTMLayer*>(recurrent_layers[(size_t)layer_idx].get());
             if (!layer->W.ptr || layer->W.count == 0) return 0.0f;
             return (float)ComputeDeviceL2Norm(ctx->stream, layer->W.ptr, (int)layer->W.count);
         }
 
-        if (output_layer && layer_idx == (int)lstm_layers.size()) {
+        if (output_layer && layer_idx == (int)recurrent_layers.size()) {
             if (!output_layer->W.ptr || output_layer->W.count == 0) return 0.0f;
             return (float)ComputeDeviceL2Norm(ctx->stream, output_layer->W.ptr,
                 (int)output_layer->W.count);
@@ -1754,7 +1850,7 @@ public:
             m_worker.join();
         }
 
-        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+        if (loaded_samples <= 0 || recurrent_layers.empty() || !output_layer)
             return MQL_FALSE;
 
         m_stop_flag.store(false);
@@ -1784,7 +1880,7 @@ public:
         double lr, double wd, double* out_mse, int* out_epochs)
     {
         if (m_state.load() == TS_TRAINING) return MQL_FALSE;
-        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+        if (loaded_samples <= 0 || recurrent_layers.empty() || !output_layer)
             return MQL_FALSE;
 
         GPUContext* ctx = GetThreadGPUContext(0);
@@ -1803,16 +1899,16 @@ public:
         return result;
     }
 
-    LSTMNet() : host_rng(std::random_device{}()) {
+    SequenceModel() : host_rng(std::random_device{}()) {
         init_ok = false;
         if (cudaSetDevice(0) != cudaSuccess) return;
         init_ok = true;
     }
 
-    ~LSTMNet() {
+    ~SequenceModel() {
         m_stop_flag.store(true);
         if (m_worker.joinable()) m_worker.join();
-        lstm_layers.clear();
+        recurrent_layers.clear();
         output_layer.reset();
     }
 
@@ -1820,34 +1916,46 @@ public:
     void SetSequenceLength(int sl) { seq_len = std::max(1, sl); }
     void SetMiniBatchSize(int mbs) { mini_batch_size = std::max(1, mbs); }
 
-    MQL_BOOL AddLSTMLayer(int in_dim, int hidden_size, float dropout = 0.0f) {
+    MQL_BOOL AddRecurrentLayer(RecurrentLayerType type, int in_dim, int hidden_size, float dropout = 0.0f) {
         if (!init_ok) return MQL_FALSE;
-        auto l = std::make_unique<LSTMLayer>();
+        std::unique_ptr<RecurrentLayer> l;
+        if (type == RecurrentLayerType::GRU) l = std::make_unique<GRULayer>();
+        else if (type == RecurrentLayerType::RNN) l = std::make_unique<RNNLayer>();
+        else l = std::make_unique<LSTMLayer>();
+
+        LSTMLayer* base = dynamic_cast<LSTMLayer*>(l.get());
+        if (!base) return MQL_FALSE;
         if (in_dim > 0) {
-            if (!l->Init(in_dim, hidden_size, dropout)) return MQL_FALSE;
+            if (!base->Init(in_dim, hidden_size, dropout)) return MQL_FALSE;
+        } else {
+            base->input_size = 0; base->hidden_size = hidden_size;
+            base->is_valid = false; base->use_dropout = (dropout > 0.0f);
+            base->dropout_rate = std::min(dropout, 0.999f);
         }
-        else {
-            l->input_size = 0; l->hidden_size = hidden_size;
-            l->is_valid = false; l->use_dropout = (dropout > 0.0f);
-            l->dropout_rate = std::min(dropout, 0.999f);
-        }
-        lstm_layers.push_back(std::move(l));
+        recurrent_layers.push_back(std::move(l));
         return MQL_TRUE;
     }
 
+    MQL_BOOL AddLSTMLayer(int in_dim, int hidden_size, float dropout = 0.0f) { return AddRecurrentLayer(RecurrentLayerType::LSTM, in_dim, hidden_size, dropout); }
+    MQL_BOOL AddGRULayer(int in_dim, int hidden_size, float dropout = 0.0f) { return AddRecurrentLayer(RecurrentLayerType::GRU, in_dim, hidden_size, dropout); }
+    MQL_BOOL AddRNNLayer(int in_dim, int hidden_size, float dropout = 0.0f) { return AddRecurrentLayer(RecurrentLayerType::RNN, in_dim, hidden_size, dropout); }
+
     MQL_BOOL SetOutputLayer(int out_dim) {
-        if (!init_ok || lstm_layers.empty()) return MQL_FALSE;
+        if (!init_ok || recurrent_layers.empty()) return MQL_FALSE;
         output_layer = std::make_unique<OutputLayer>();
-        return output_layer->Init(lstm_layers.back()->hidden_size, out_dim);
+        return output_layer->Init(recurrent_layers.back()->HiddenSize(), out_dim);
     }
 
     MQL_BOOL AddLayer(int in, int out, int act, int use_ln, float dropout) {
+        if (act == 1) return AddGRULayer(in, out, dropout);
+        if (act == 2) return AddRNNLayer(in, out, dropout);
         return AddLSTMLayer(in, out, dropout);
     }
 
     MQL_BOOL BindInputIfNeeded(int in_dim) {
-        if (lstm_layers.empty()) return MQL_FALSE;
-        LSTMLayer* L0 = lstm_layers[0].get();
+        if (recurrent_layers.empty()) return MQL_FALSE;
+        LSTMLayer* L0 = dynamic_cast<LSTMLayer*>(recurrent_layers[0].get());
+        if (!L0) return MQL_FALSE;
         if (!L0->is_valid || L0->input_size != in_dim) {
             L0->FreeAll();
             return L0->Init(in_dim, L0->hidden_size, L0->dropout_rate);
@@ -1856,9 +1964,10 @@ public:
     }
 
     MQL_BOOL BindIntermediateLayers() {
-        for (int i = 1; i < (int)lstm_layers.size(); i++) {
-            int prev_hidden = lstm_layers[i - 1]->hidden_size;
-            LSTMLayer* cur = lstm_layers[i].get();
+        for (int i = 1; i < (int)recurrent_layers.size(); i++) {
+            int prev_hidden = recurrent_layers[i - 1]->HiddenSize();
+            LSTMLayer* cur = dynamic_cast<LSTMLayer*>(recurrent_layers[i].get());
+            if (!cur) return MQL_FALSE;
             if (!cur->is_valid || cur->input_size != prev_hidden) {
                 float dr = cur->dropout_rate;
                 int hs = cur->hidden_size;
@@ -1870,13 +1979,13 @@ public:
     }
 
     MQL_BOOL SnapshotWeights() {
-        for (auto& l : lstm_layers) if (!l->SaveBest()) return MQL_FALSE;
+        for (auto& l : recurrent_layers) if (!l->SaveBest()) return MQL_FALSE;
         if (output_layer) return output_layer->SaveBest();
         return MQL_TRUE;
     }
 
     MQL_BOOL RestoreWeights() {
-        for (auto& l : lstm_layers) if (!l->RestoreBest()) return MQL_FALSE;
+        for (auto& l : recurrent_layers) if (!l->RestoreBest()) return MQL_FALSE;
         if (output_layer) return output_layer->RestoreBest();
         return MQL_TRUE;
     }
@@ -1897,9 +2006,9 @@ public:
 
         if (!output_layer || !output_layer->is_valid ||
             output_layer->out_dim != out_dim ||
-            output_layer->in_dim != lstm_layers.back()->hidden_size) {
+            output_layer->in_dim != recurrent_layers.back()->HiddenSize()) {
             output_layer = std::make_unique<OutputLayer>();
-            if (!output_layer->Init(lstm_layers.back()->hidden_size, out_dim))
+            if (!output_layer->Init(recurrent_layers.back()->HiddenSize(), out_dim))
                 return MQL_FALSE;
         }
 
@@ -2006,19 +2115,21 @@ public:
     std::string serialize_buf;
 
     MQL_BOOL Save(std::string& out_buf) {
-        if (lstm_layers.empty() || !output_layer) return MQL_FALSE;
+        if (recurrent_layers.empty() || !output_layer) return MQL_FALSE;
         std::stringstream ss;
         ss << std::fixed << std::setprecision(8)
-            << "LSTM_V1\nSEQ_LEN " << seq_len
-            << "\nLSTM_LAYERS " << lstm_layers.size() << "\n";
-        for (auto& l : lstm_layers) {
-            int dim = l->input_size + l->hidden_size;
-            int g = 4 * l->hidden_size;
-            ss << l->input_size << " " << l->hidden_size << " "
-                << l->dropout_rate << "\n";
+            << "SEQMODEL_V2\nSEQ_LEN " << seq_len
+            << "\nLAYERS " << recurrent_layers.size() << "\n";
+        for (auto& l : recurrent_layers) {
+            int dim = l->InputSize() + l->HiddenSize();
+            int g = 4 * l->HiddenSize();
+            ss << (int)l->Type() << " " << l->InputSize() << " " << l->HiddenSize() << " "
+                << l->DropoutRate() << "\n";
+            LSTMLayer* raw = dynamic_cast<LSTMLayer*>(l.get());
+            if (!raw) return MQL_FALSE;
             std::vector<float> Wv(dim * g), bv(g);
-            cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * 4, cudaMemcpyDeviceToHost);
-            cudaMemcpy(bv.data(), l->b.ptr, bv.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(Wv.data(), raw->W.ptr, Wv.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(bv.data(), raw->b.ptr, bv.size() * 4, cudaMemcpyDeviceToHost);
             for (float x : Wv) ss << x << " "; ss << "\n";
             for (float x : bv) ss << x << " "; ss << "\n";
         }
@@ -2038,23 +2149,33 @@ public:
         if (!data || !init_ok) return MQL_FALSE;
         std::istringstream ss(data);
         std::string t;
-        if (!(ss >> t) || t != "LSTM_V1") return MQL_FALSE;
+        if (!(ss >> t)) return MQL_FALSE;
+        const bool legacy_v1 = (t == "LSTM_V1");
+        const bool v2 = (t == "SEQMODEL_V2");
+        if (!legacy_v1 && !v2) return MQL_FALSE;
         if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
-        if (!(ss >> t) || t != "LSTM_LAYERS") return MQL_FALSE;
+        if (!(ss >> t) || (legacy_v1 ? (t != "LSTM_LAYERS") : (t != "LAYERS"))) return MQL_FALSE;
         int nl; if (!(ss >> nl)) return MQL_FALSE;
-        lstm_layers.clear();
+        recurrent_layers.clear();
         for (int i = 0; i < nl; i++) {
+            int type_i = (int)RecurrentLayerType::LSTM;
             int in_d, hid_d; float drop;
-            if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE;
-            auto l = std::make_unique<LSTMLayer>();
-            if (!l->InitFromData(in_d, hid_d, drop)) return MQL_FALSE;
+            if (legacy_v1) { if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE; }
+            else { if (!(ss >> type_i >> in_d >> hid_d >> drop)) return MQL_FALSE; }
+            std::unique_ptr<RecurrentLayer> l;
+            if (type_i == (int)RecurrentLayerType::GRU) l = std::make_unique<GRULayer>();
+            else if (type_i == (int)RecurrentLayerType::RNN) l = std::make_unique<RNNLayer>();
+            else l = std::make_unique<LSTMLayer>();
+            LSTMLayer* raw = dynamic_cast<LSTMLayer*>(l.get());
+            if (!raw) return MQL_FALSE;
+            if (!raw->InitFromData(in_d, hid_d, drop)) return MQL_FALSE;
             int dim = in_d + hid_d, g = 4 * hid_d;
             std::vector<float> Wv(dim * g), bv(g);
             for (size_t k = 0; k < Wv.size(); k++) ss >> Wv[k];
             for (size_t k = 0; k < bv.size(); k++) ss >> bv[k];
-            cudaMemcpy(l->W.ptr, Wv.data(), Wv.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(l->b.ptr, bv.data(), bv.size() * 4, cudaMemcpyHostToDevice);
-            lstm_layers.push_back(std::move(l));
+            cudaMemcpy(raw->W.ptr, Wv.data(), Wv.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(raw->b.ptr, bv.data(), bv.size() * 4, cudaMemcpyHostToDevice);
+            recurrent_layers.push_back(std::move(l));
         }
         if (!(ss >> t) || t != "OUTPUT") return MQL_FALSE;
         int oi, oo; if (!(ss >> oi >> oo)) return MQL_FALSE;
@@ -2068,6 +2189,8 @@ public:
         return MQL_TRUE;
     }
 };
+
+using LSTMNet = SequenceModel;
 
 // ============================================================================
 // DLL Exports
@@ -2169,6 +2292,21 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_AddLayerEx(int h, int in, int out, int act,
     std::unique_lock<std::shared_mutex> lk;
     std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
     return net ? net->AddLayer(in, out, act, ln, (float)drop) : MQL_FALSE;
+}
+
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_AddGRULayer(int h, int in, int out, double drop)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    return net ? net->AddGRULayer(in, out, (float)drop) : MQL_FALSE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_AddRNNLayer(int h, int in, int out, double drop)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    return net ? net->AddRNNLayer(in, out, (float)drop) : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
