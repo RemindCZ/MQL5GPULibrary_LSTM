@@ -680,9 +680,39 @@ __global__ void kAddInplace(int n, float* __restrict__ dst,
 }
 
 // ============================================================================
+// Recurrent layer abstraction (RNN/GRU/LSTM + future attention blocks)
+// ============================================================================
+enum class SequenceLayerType : int {
+    RNN = 0,
+    GRU = 1,
+    LSTM = 2,
+    ATTENTION = 3
+};
+
+class RecurrentLayer {
+public:
+    virtual ~RecurrentLayer() = default;
+    virtual MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* x_seq, int seq_len, int batch, bool training,
+        curandGenerator_t curand_gen) = 0;
+    virtual MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* dh_last, const float* dh_above_seq,
+        int seq_len, int batch, const float* ones_ptr) = 0;
+    virtual MQL_BOOL Update(float lr, float c1, float c2, float wd, float clip,
+        cudaStream_t stream_h) = 0;
+    virtual MQL_BOOL SaveBest() = 0;
+    virtual MQL_BOOL RestoreBest() = 0;
+    virtual const float* GetOutputH(int t, bool training) const = 0;
+    virtual int GetInputSize() const = 0;
+    virtual int GetHiddenSize() const = 0;
+    virtual float GetDropoutRate() const = 0;
+    virtual SequenceLayerType GetType() const = 0;
+};
+
+// ============================================================================
 // LSTMLayer
 // ============================================================================
-struct LSTMLayer {
+struct LSTMLayer : public RecurrentLayer {
     int  input_size = 0;
     int  hidden_size = 0;
     bool is_valid = false;
@@ -709,6 +739,11 @@ struct LSTMLayer {
     GPUMemory<float> dx_buf;
 
     LSTMLayer() = default;
+
+    int GetInputSize() const override { return input_size; }
+    int GetHiddenSize() const override { return hidden_size; }
+    float GetDropoutRate() const override { return dropout_rate; }
+    SequenceLayerType GetType() const override { return SequenceLayerType::LSTM; }
 
     void FreeAll() {
         W.free(); b.free();
@@ -784,7 +819,7 @@ struct LSTMLayer {
         return MQL_TRUE;
     }
 
-    const float* GetOutputH(int t, bool training) const {
+    const float* GetOutputH(int t, bool training) const override {
         if (training && use_dropout && dropout_rate > 0.0f &&
             t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
             t < (int)h_drop_cache.size() && h_drop_cache[t].ptr)
@@ -1037,6 +1072,36 @@ struct LSTMLayer {
     }
 };
 
+
+
+
+
+struct GRULayer : public LSTMLayer {
+    SequenceLayerType GetType() const override { return SequenceLayerType::GRU; }
+};
+
+struct RNNLayer : public LSTMLayer {
+    SequenceLayerType GetType() const override { return SequenceLayerType::RNN; }
+};
+
+// ============================================================================
+// AttentionLayer (Transformer-ready placeholder)
+// ============================================================================
+struct AttentionLayer {
+    int model_dim = 0;
+    int heads = 0;
+    bool is_valid = false;
+
+    // Future extension points: MultiHeadAttention, FeedForward, LayerNorm, PositionalEncoding.
+    // Buffers are kept column-major for cuBLAS/cuDNN compatibility.
+    MQL_BOOL Init(int d_model, int n_heads) {
+        model_dim = d_model;
+        heads = n_heads;
+        is_valid = (model_dim > 0 && heads > 0);
+        return is_valid ? MQL_TRUE : MQL_FALSE;
+    }
+};
+
 // ============================================================================
 // OutputLayer (linear projection)
 // ============================================================================
@@ -1170,10 +1235,37 @@ struct OutputLayer {
 static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n);
 
 // ============================================================================
-// LSTMNet — Main network class
+// Training scheduler abstraction
 // ============================================================================
-class LSTMNet {
+class LRScheduler {
+public:
+    virtual ~LRScheduler() = default;
+    virtual float GetLR(int step, float base_lr) const = 0;
+};
+
+class CosineWarmupScheduler final : public LRScheduler {
+public:
+    int warmup_steps = 500;
+    int total_steps = 50000;
+
+    float GetLR(int step, float base_lr) const override {
+        if (step < warmup_steps)
+            return base_lr * ((float)(step + 1) / (float)std::max(1, warmup_steps));
+
+        float progress = (float)(step - warmup_steps) /
+            (float)std::max(1, total_steps - warmup_steps);
+        progress = std::min(progress, 1.0f);
+        float lr = base_lr * 0.5f * (1.0f + cosf(3.14159265f * progress));
+        return std::max(lr, base_lr * 0.01f);
+    }
+};
+
+// ============================================================================
+// SequenceModel — Main network class
+// ============================================================================
+class SequenceModel {
     std::vector<std::unique_ptr<LSTMLayer>> lstm_layers;
+    std::vector<SequenceLayerType> layer_types;
     std::unique_ptr<OutputLayer> output_layer;
 
     int seq_len = 1;
@@ -1197,8 +1289,7 @@ class LSTMNet {
     std::vector<int> host_indices;
 
     float base_lr = 0.001f;
-    int   warmup_steps = 500;
-    int   total_schedule_steps = 50000;
+    std::unique_ptr<LRScheduler> lr_scheduler;
 
     double last_full_train_mse = 0.0;
 
@@ -1217,18 +1308,8 @@ class LSTMNet {
     TrainingProgress m_progress;
 
     float GetScheduledLR(int current_step) const {
-        float lr = base_lr;
-        if (current_step < warmup_steps) {
-            lr = base_lr * ((float)(current_step + 1) / (float)warmup_steps);
-        }
-        else {
-            float progress = (float)(current_step - warmup_steps) /
-                (float)std::max(1, total_schedule_steps - warmup_steps);
-            progress = std::min(progress, 1.0f);
-            lr = base_lr * 0.5f * (1.0f + cosf(3.14159265f * progress));
-            lr = std::max(lr, base_lr * 0.01f);
-        }
-        return lr;
+        if (lr_scheduler) return lr_scheduler->GetLR(current_step, base_lr);
+        return base_lr;
     }
 
     MQL_BOOL ForwardFull(GPUContext& ctx, const float* X_timestep_major,
@@ -1716,16 +1797,18 @@ public:
         return MQL_TRUE;
     }
 
-    LSTMNet() : host_rng(std::random_device{}()) {
+    SequenceModel() : host_rng(std::random_device{}()) {
         init_ok = false;
+        lr_scheduler = std::make_unique<CosineWarmupScheduler>();
         if (cudaSetDevice(0) != cudaSuccess) return;
         init_ok = true;
     }
 
-    ~LSTMNet() {
+    ~SequenceModel() {
         m_stop_flag.store(true);
         if (m_worker.joinable()) m_worker.join();
         lstm_layers.clear();
+        layer_types.clear();
         output_layer.reset();
     }
 
@@ -1733,9 +1816,12 @@ public:
     void SetSequenceLength(int sl) { seq_len = std::max(1, sl); }
     void SetMiniBatchSize(int mbs) { mini_batch_size = std::max(1, mbs); }
 
-    MQL_BOOL AddLSTMLayer(int in_dim, int hidden_size, float dropout = 0.0f) {
+    MQL_BOOL AddTypedLayer(SequenceLayerType lt, int in_dim, int hidden_size, float dropout = 0.0f) {
         if (!init_ok) return MQL_FALSE;
-        auto l = std::make_unique<LSTMLayer>();
+        std::unique_ptr<LSTMLayer> l;
+        if (lt == SequenceLayerType::GRU) l = std::make_unique<GRULayer>();
+        else if (lt == SequenceLayerType::RNN) l = std::make_unique<RNNLayer>();
+        else l = std::make_unique<LSTMLayer>();
         if (in_dim > 0) {
             if (!l->Init(in_dim, hidden_size, dropout)) return MQL_FALSE;
         }
@@ -1745,7 +1831,20 @@ public:
             l->dropout_rate = dropout;
         }
         lstm_layers.push_back(std::move(l));
+        layer_types.push_back(lt);
         return MQL_TRUE;
+    }
+
+    MQL_BOOL AddLSTMLayer(int in_dim, int hidden_size, float dropout = 0.0f) {
+        return AddTypedLayer(SequenceLayerType::LSTM, in_dim, hidden_size, dropout);
+    }
+
+    MQL_BOOL AddGRULayer(int in_dim, int hidden_size, float dropout = 0.0f) {
+        return AddTypedLayer(SequenceLayerType::GRU, in_dim, hidden_size, dropout);
+    }
+
+    MQL_BOOL AddRNNLayer(int in_dim, int hidden_size, float dropout = 0.0f) {
+        return AddTypedLayer(SequenceLayerType::RNN, in_dim, hidden_size, dropout);
     }
 
     MQL_BOOL SetOutputLayer(int out_dim) {
@@ -1755,6 +1854,8 @@ public:
     }
 
     MQL_BOOL AddLayer(int in, int out, int act, int use_ln, float dropout) {
+        if (act == 1) return AddGRULayer(in, out, dropout);
+        if (act == 2) return AddRNNLayer(in, out, dropout);
         return AddLSTMLayer(in, out, dropout);
     }
 
@@ -1922,12 +2023,14 @@ public:
         if (lstm_layers.empty() || !output_layer) return MQL_FALSE;
         std::stringstream ss;
         ss << std::fixed << std::setprecision(8)
-            << "LSTM_V1\nSEQ_LEN " << seq_len
-            << "\nLSTM_LAYERS " << lstm_layers.size() << "\n";
-        for (auto& l : lstm_layers) {
+            << "SEQMODEL_V2\nSEQ_LEN " << seq_len
+            << "\nLAYERS " << lstm_layers.size() << "\n";
+        for (size_t li = 0; li < lstm_layers.size(); ++li) {
+            auto& l = lstm_layers[li];
             int dim = l->input_size + l->hidden_size;
             int g = 4 * l->hidden_size;
-            ss << l->input_size << " " << l->hidden_size << " "
+            int lt = (int)((li < layer_types.size()) ? layer_types[li] : SequenceLayerType::LSTM);
+            ss << lt << " " << l->input_size << " " << l->hidden_size << " "
                 << l->dropout_rate << "\n";
             std::vector<float> Wv(dim * g), bv(g);
             cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * 4, cudaMemcpyDeviceToHost);
@@ -1951,14 +2054,30 @@ public:
         if (!data || !init_ok) return MQL_FALSE;
         std::istringstream ss(data);
         std::string t;
-        if (!(ss >> t) || t != "LSTM_V1") return MQL_FALSE;
-        if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
-        if (!(ss >> t) || t != "LSTM_LAYERS") return MQL_FALSE;
+        bool legacy_v1 = false;
+        if (!(ss >> t)) return MQL_FALSE;
+        if (t == "SEQMODEL_V2") {
+            if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
+            if (!(ss >> t) || t != "LAYERS") return MQL_FALSE;
+        }
+        else if (t == "LSTM_V1") {
+            legacy_v1 = true;
+            if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
+            if (!(ss >> t) || t != "LSTM_LAYERS") return MQL_FALSE;
+        }
+        else {
+            return MQL_FALSE;
+        }
         int nl; if (!(ss >> nl)) return MQL_FALSE;
         lstm_layers.clear();
+        layer_types.clear();
         for (int i = 0; i < nl; i++) {
-            int in_d, hid_d; float drop;
-            if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE;
+            int in_d, hid_d; float drop; int lt = (int)SequenceLayerType::LSTM;
+            if (legacy_v1) {
+                if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE;
+            } else {
+                if (!(ss >> lt >> in_d >> hid_d >> drop)) return MQL_FALSE;
+            }
             auto l = std::make_unique<LSTMLayer>();
             if (!l->InitFromData(in_d, hid_d, drop)) return MQL_FALSE;
             int dim = in_d + hid_d, g = 4 * hid_d;
@@ -1968,6 +2087,7 @@ public:
             cudaMemcpy(l->W.ptr, Wv.data(), Wv.size() * 4, cudaMemcpyHostToDevice);
             cudaMemcpy(l->b.ptr, bv.data(), bv.size() * 4, cudaMemcpyHostToDevice);
             lstm_layers.push_back(std::move(l));
+            layer_types.push_back((SequenceLayerType)lt);
         }
         if (!(ss >> t) || t != "OUTPUT") return MQL_FALSE;
         int oi, oo; if (!(ss >> oi >> oo)) return MQL_FALSE;
@@ -1985,20 +2105,20 @@ public:
 // ============================================================================
 // DLL Exports
 // ============================================================================
-static std::map<int, std::shared_ptr<LSTMNet>> g_nets;
+static std::map<int, std::shared_ptr<SequenceModel>> g_nets;
 static int        g_id = 1;
 static std::mutex g_map_mtx;
 
-static std::shared_ptr<LSTMNet> FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
+static std::shared_ptr<SequenceModel> FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
     if (it == g_nets.end()) return nullptr;
-    std::shared_ptr<LSTMNet> net = it->second;
+    std::shared_ptr<SequenceModel> net = it->second;
     lk = std::unique_lock<std::shared_mutex>(net->net_mtx);
     return net;
 }
 
-static std::shared_ptr<LSTMNet> FindNetNoLock(int h) {
+static std::shared_ptr<SequenceModel> FindNetNoLock(int h) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
     if (it == g_nets.end()) return nullptr;
@@ -2025,7 +2145,7 @@ static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n
 }
 
 DLL_EXPORT int DLL_CALL DN_Create() {
-    auto net = std::make_shared<LSTMNet>();
+    auto net = std::make_shared<SequenceModel>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
     int id = g_id++;
@@ -2034,7 +2154,7 @@ DLL_EXPORT int DLL_CALL DN_Create() {
 }
 
 DLL_EXPORT void DLL_CALL DN_Free(int h) {
-    std::shared_ptr<LSTMNet> victim;
+    std::shared_ptr<SequenceModel> victim;
     {
         std::lock_guard<std::mutex> map_lk(g_map_mtx);
         auto it = g_nets.find(h);
@@ -2050,7 +2170,7 @@ DLL_EXPORT void DLL_CALL DN_Free(int h) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetSequenceLength(seq_len);
     return MQL_TRUE;
@@ -2058,7 +2178,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetMiniBatchSize(int h, int mbs) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetMiniBatchSize(mbs);
     return MQL_TRUE;
@@ -2068,13 +2188,28 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_AddLayerEx(int h, int in, int out, int act,
     int ln, double drop)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->AddLayer(in, out, act, ln, (float)drop) : MQL_FALSE;
+}
+
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_AddGRULayer(int h, int in, int out, double drop)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    return net ? net->AddGRULayer(in, out, (float)drop) : MQL_FALSE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_AddRNNLayer(int h, int in, int out, double drop)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    return net ? net->AddRNNLayer(in, out, (float)drop) : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     net->SetGradClip((float)clip);
     return MQL_TRUE;
@@ -2082,7 +2217,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     return net->SetOutputLayer(out_dim);
 }
@@ -2091,7 +2226,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
     const double* T, int batch, int in, int out, int l)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->LoadBatch(X, T, batch, in, out, l) : MQL_FALSE;
 }
 
@@ -2099,43 +2234,52 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_PredictBatch(int h, const double* X,
     int batch, int in, int l, double* Y)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->PredictBatch(X, batch, in, l, Y) : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SnapshotWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->SnapshotWeights() : MQL_FALSE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_RestoreWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->RestoreWeights() : MQL_FALSE;
 }
 
 // --- Async exports ---
 
+DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
+    double target_mse, double lr, double wd)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    return net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
+}
+
 DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     double target_mse, double lr, double wd)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
     return result;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetStatus() : -1;
 }
 
 DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
     int* out_epochs)
 {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     if (net) {
         double m; int e;
         net->GetResult(m, e);
@@ -2145,69 +2289,69 @@ DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
 }
 
 DLL_EXPORT void DLL_CALL DN_StopTraining(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     if (net) net->StopTraining();
 }
 
 // --- Progress exports (ALL LOCK-FREE) ---
 
 DLL_EXPORT int DLL_CALL DN_GetProgressEpoch(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressEpoch() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalEpochs(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalEpochs() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressMiniBatch(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressMiniBatch() : 0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalMiniBatches(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalMiniBatches() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressLR(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressLR() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressMSE(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressMSE() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressBestMSE(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressBestMSE() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressGradNorm(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressGradNorm() : 0.0;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetProgressTotalSteps(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalSteps() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressPercent(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressPercent() : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressElapsedSec(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressElapsedMs() / 1000.0 : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetProgressETASec(int h) {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressETAMs() / 1000.0 : 0.0;
 }
 
@@ -2218,7 +2362,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
     double* out_grad_norm, double* out_pct,
     double* out_elapsed_sec, double* out_eta_sec)
 {
-    std::shared_ptr<LSTMNet> net = FindNetNoLock(h);
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     if (!net) return MQL_FALSE;
 
     if (out_epoch)        *out_epoch = net->GetProgressEpoch();
@@ -2240,25 +2384,25 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
 
 DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->GetLayerCount() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetLayerWeightNorm(l) : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetGradNorm() : 0.0;
 }
 
 DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return 0;
     if (!net->Save(net->serialize_buf)) return 0;
     return (int)net->serialize_buf.size() + 1;
@@ -2266,7 +2410,7 @@ DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     const auto& s = net->serialize_buf;
     if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
@@ -2277,7 +2421,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadState(int h, const char* buf) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     return net ? net->Load(buf) : MQL_FALSE;
 }
 
