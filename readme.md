@@ -1,54 +1,59 @@
-# MQL5GPULibrary_LSTM — Dokumentace kernelu 2.0.0
+# MQL5GPULibrary_LSTM — Dokumentace `kernel.cu` v2.1.0
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![CUDA](https://img.shields.io/badge/CUDA-Enabled-brightgreen.svg)
 ![MT5](https://img.shields.io/badge/MetaTrader%205-DLL%20API-blue.svg)
 
-Tento repozitář obsahuje CUDA DLL knihovnu pro MetaTrader 5 s vícevstvým LSTM modelem a asynchronním trénováním.
-Tato dokumentace je kompletně připravena pro **kernel v2.0.0** (`kernel.cu`).
+Tento dokument je zcela nová technická dokumentace pro **LSTM DLL v2.1.0** (`kernel.cu`) se zaměřením na:
+
+- **asynchronní trénování** (`DN_TrainAsync`),
+- **reporting průběhu tréninku** (`DN_GetProgress*`, `DN_GetProgressAll`),
+- bezpečné řízení životního cyklu modelu v prostředí **MetaTrader 5 + MQL5**.
 
 ---
 
-## 1. Co přináší verze 2.0.0
+## 1) Co je nové ve verzi 2.1.0
 
-Kernel 2.0.0 sjednocuje trénování, inferenci, diagnostiku a telemetrii do jedné stabilní C API vrstvy exportované z DLL.
+Verze 2.1.0 sjednocuje robustní GPU trénink, správu stavu modelu a telemetrii do jedné DLL API vrstvy.
 
-Hlavní body:
+Nejdůležitější body:
 
-- více modelů paralelně přes handle (`DN_Create` / `DN_Free`),
-- asynchronní trénování s průběžným pollingem (`DN_TrainAsync` + `DN_GetProgressAll`),
-- checkpointing vah (`DN_SnapshotWeights`, `DN_RestoreWeights`),
-- serializace stavu (`DN_SaveState`, `DN_GetState`, `DN_LoadState`),
-- centralizované chybové hlášky (`DN_GetError`),
-- standardizovaný stavový automat trénování.
+1. **Async trénování na pozadí** bez blokování hlavní MQL5 logiky (`DN_TrainAsync`).
+2. **Jemnozrnný progress reporting** (epocha, minibatch, ETA, elapsed, best MSE, grad norm).
+3. **Hromadné čtení telemetrie** jedním voláním (`DN_GetProgressAll`) pro nižší overhead.
+4. **Více současných modelů** přes handle architekturu (`DN_Create` / `DN_Free`).
+5. **Snapshot/restore vah** pro rollback experimentů (`DN_SnapshotWeights`, `DN_RestoreWeights`).
+6. **Serializace stavu** pro persistenci (`DN_SaveState`, `DN_GetState`, `DN_LoadState`).
+7. **Centralizované chybové hlášení** (`DN_GetError`) použitelné v každé fázi pipeline.
 
 ---
 
-## 2. Rychlý start (MT5 workflow)
+## 2) Architektura použití v MT5
 
-Doporučené pořadí volání API:
+Každý model je reprezentován integer handlem. Můžete provozovat více handle instancí paralelně (např. různé symboly/timeframy).
+
+**Doporučený lifecycle:**
 
 1. `DN_Create`
 2. `DN_SetSequenceLength`
 3. `DN_SetMiniBatchSize`
-4. `DN_AddLayerEx` (pro všechny LSTM vrstvy)
+4. `DN_AddLayerEx` (opakovaně pro stack LSTM vrstev)
 5. `DN_SetOutputDim`
 6. `DN_LoadBatch`
-7. volitelně `DN_SnapshotWeights`
-8. `DN_TrainAsync`
-9. polling: `DN_GetTrainingStatus` + `DN_GetProgressAll`
+7. (volitelně) `DN_SnapshotWeights`
+8. `DN_TrainAsync` nebo `DN_Train`
+9. polling přes `DN_GetTrainingStatus` + `DN_GetProgressAll`
 10. `DN_GetTrainingResult`
 11. `DN_PredictBatch`
 12. `DN_Free`
 
 ---
 
-## 3. API přehled (kernel 2.0.0)
+## 3) API reference (v2.1.0)
 
-Všechny exporty používají `__stdcall`. Funkce s návratem `MQL_BOOL` vrací:
-
-- `1` = úspěch
-- `0` = chyba
+> Všechny exporty používají `__stdcall`.
+>
+> Typ `MQL_BOOL`: `1 = success`, `0 = fail`.
 
 ### 3.1 Lifecycle
 
@@ -57,8 +62,8 @@ int DN_Create();
 void DN_Free(int h);
 ```
 
-- `DN_Create` vrací kladný handle modelu.
-- `DN_Free` uvolní CPU/GPU prostředky handle.
+- `DN_Create` vrací kladný handle, při chybě `<= 0`.
+- `DN_Free` vždy volejte při ukončení práce s modelem.
 
 ### 3.2 Konfigurace modelu
 
@@ -66,32 +71,39 @@ void DN_Free(int h);
 MQL_BOOL DN_SetSequenceLength(int h, int seq_len);
 MQL_BOOL DN_SetMiniBatchSize(int h, int mbs);
 MQL_BOOL DN_AddLayerEx(int h, int in, int out, int act, int ln, double drop);
+MQL_BOOL DN_AddGRULayer(int h, int in, int out, double drop);
+MQL_BOOL DN_AddRNNLayer(int h, int in, int out, double drop);
 MQL_BOOL DN_SetGradClip(int h, double clip);
 MQL_BOOL DN_SetOutputDim(int h, int out_dim);
 ```
 
-Důležité zásady:
+Konfigurační zásady:
 
 - `seq_len > 0`
-- dropout (`drop`) patří do intervalu `[0, 1)`
-- `DN_SetOutputDim` musí odpovídat cílovému rozměru `T`
+- `mbs > 0`
+- `drop` v intervalu `<0, 1)`
+- `out_dim` musí odpovídat cílovému rozměru v `T`
 
-### 3.3 Data a inference
+> Pro čisté LSTM workflow používejte primárně `DN_AddLayerEx`.
+
+### 3.3 Nahrání dat + inference
 
 ```cpp
-MQL_BOOL DN_LoadBatch(int h, const double* X, const double* T, int batch, int in, int out, int l);
-MQL_BOOL DN_PredictBatch(int h, const double* X, int batch, int in, int l, double* Y);
+MQL_BOOL DN_LoadBatch(int h, const double* X, const double* T,
+                      int batch, int in, int out, int l);
+MQL_BOOL DN_PredictBatch(int h, const double* X,
+                         int batch, int in, int l, double* Y);
 ```
 
-Kontrakt tvarů:
+Datový kontrakt:
 
 - `in = seq_len * feature_dim`
 - `len(X) = batch * in`
 - `len(T) = batch * out`
-- `len(Y) = batch * out_dim_modelu`
-- musí platit: `in % seq_len == 0`
+- `len(Y) = batch * out_dim`
+- musí platit `in % seq_len == 0`
 
-### 3.4 Trénování
+### 3.4 Trénování (sync + async)
 
 ```cpp
 MQL_BOOL DN_Train(int h, int epochs, double target_mse, double lr, double wd);
@@ -101,11 +113,13 @@ void DN_GetTrainingResult(int h, double* out_mse, int* out_epochs);
 void DN_StopTraining(int h);
 ```
 
-- `DN_Train` je synchronní varianta.
-- `DN_TrainAsync` vrací okamžitě a trénuje na pozadí.
-- `DN_StopTraining` vyžádá korektní ukončení asynchronního běhu.
+Použití:
 
-### 3.5 Progress telemetry
+- `DN_Train` = blokující (synchronní) varianta.
+- `DN_TrainAsync` = neblokující varianta na pozadí.
+- `DN_StopTraining` = bezpečný požadavek na ukončení async běhu.
+
+### 3.5 Progress Reporting API
 
 ```cpp
 int DN_GetProgressEpoch(int h);
@@ -120,23 +134,28 @@ int DN_GetProgressTotalSteps(int h);
 double DN_GetProgressPercent(int h);
 double DN_GetProgressElapsedSec(int h);
 double DN_GetProgressETASec(int h);
-MQL_BOOL DN_GetProgressAll(int h,
-                           int* epoch, int* total_epochs,
-                           int* minibatch, int* total_minibatches,
-                           double* mse, double* best_mse,
-                           double* lr, double* grad_norm,
-                           double* percent, double* elapsed_sec, double* eta_sec);
+MQL_BOOL DN_GetProgressAll(
+    int h,
+    int* epoch, int* total_epochs,
+    int* minibatch, int* total_minibatches,
+    double* mse, double* best_mse,
+    double* lr, double* grad_norm,
+    double* percent, double* elapsed_sec, double* eta_sec
+);
 ```
 
-Doporučení: v `OnTimer` preferujte jeden hromadný dotaz přes `DN_GetProgressAll` místo mnoha jednotlivých callů.
+Doporučení pro produkční MT5:
 
-### 3.6 Diagnostika a serializace
+- polling dělejte v `OnTimer` (např. 100–500 ms), ne v každém ticku,
+- preferujte **`DN_GetProgressAll`** před sérií jednotlivých getterů,
+- ETA je orientační, ale velmi užitečná pro UI/UX tréninku.
+
+### 3.6 Diagnostika, stav, snapshoty
 
 ```cpp
 int DN_GetLayerCount(int h);
 double DN_GetLayerWeightNorm(int h, int l);
 double DN_GetGradNorm(int h);
-void DN_GetError(short* buf, int len);
 
 int DN_SaveState(int h);
 MQL_BOOL DN_GetState(int h, char* buf, int max_len);
@@ -144,14 +163,17 @@ MQL_BOOL DN_LoadState(int h, const char* buf);
 
 MQL_BOOL DN_SnapshotWeights(int h);
 MQL_BOOL DN_RestoreWeights(int h);
+
+void DN_GetError(short* buf, int len);
 ```
 
-- serializační formát používá hlavičku `LSTM_V1`,
-- při chybě vždy čtěte `DN_GetError`.
+- `DN_SaveState` + `DN_GetState` + `DN_LoadState` = serializace modelu.
+- `DN_SnapshotWeights`/`DN_RestoreWeights` = rychlý rollback vah mezi experimenty.
+- Při libovolném `MQL_FALSE` vždy ihned čtěte `DN_GetError`.
 
 ---
 
-## 4. Stavový automat trénování
+## 4) Trénovací stavový automat
 
 `DN_GetTrainingStatus` vrací:
 
@@ -160,57 +182,101 @@ MQL_BOOL DN_RestoreWeights(int h);
 - `2` → `TS_COMPLETED`
 - `-1` → `TS_ERROR`
 
-Příklad bezpečného pollingu:
+Bezpečný polling pattern:
 
 ```cpp
-while(DN_GetTrainingStatus(h) == 1) {
-    // Sleep / čekání mezi tick-y
+int st = DN_GetTrainingStatus(h);
+while(st == 1) {
+    // čekání řízené timerem / Sleep
+    st = DN_GetTrainingStatus(h);
 }
 
-double mse = 0.0;
-int epochs_done = 0;
-DN_GetTrainingResult(h, &mse, &epochs_done);
+if(st == 2) {
+    double mse = 0.0;
+    int epochs_done = 0;
+    DN_GetTrainingResult(h, &mse, &epochs_done);
+}
 ```
 
 ---
 
-## 5. Praktická doporučení pro stabilní provoz
+## 5) Doporučené async workflow pro MQL5
 
-- Vždy nastavte `seq_len` před načtením dat.
-- Pokud experimentujete, dělejte checkpoint před dlouhým trénováním.
-- V UI používejte periodický polling (`OnTimer`), ne agresivní polling v každém ticku.
-- Po chybě ihned načtěte diagnostiku přes `DN_GetError`.
-- Při použití více modelů držte striktní mapování `handle -> dataset -> konfigurace`.
+### 5.1 Inicializace (OnInit)
+
+- vytvořte handle,
+- nakonfigurujte topologii,
+- načtěte batch,
+- spusťte `DN_TrainAsync`.
+
+### 5.2 Periodický monitoring (OnTimer)
+
+- čtěte `DN_GetTrainingStatus`,
+- čtěte `DN_GetProgressAll`,
+- aktualizujte panel / Comment / log,
+- při `TS_COMPLETED` načtěte `DN_GetTrainingResult`.
+
+### 5.3 Deinitializace (OnDeinit)
+
+- volejte `DN_StopTraining` (pokud ještě běží),
+- následně `DN_Free`.
 
 ---
 
-## 6. Build a nasazení
+## 6) Parametry tréninku a tuning
 
-### Build (Visual Studio + CUDA)
+Parametry `DN_Train*`:
+
+- `epochs` – max počet epoch,
+- `target_mse` – cílová chyba pro early stop,
+- `lr` – learning rate,
+- `wd` – weight decay.
+
+Praktická doporučení:
+
+- začněte konzervativně (`lr` nižší, rozumný `epochs`),
+- sledujte `best_mse` + `grad_norm` (detekce nestability),
+- při explozivních gradientech nastavte `DN_SetGradClip`.
+
+---
+
+## 7) Build a deployment
+
+### Build (Visual Studio + CUDA Toolkit)
 
 1. Otevřete `MQL5GPULibrary_LSTM.sln`.
-2. Zkontrolujte nainstalovaný CUDA Toolkit.
-3. Build konfigurace: `Release | x64`.
-4. Vzniklé DLL zkopírujte do `MQL5\Libraries` v datové složce MT5.
+2. Ověřte kompatibilní CUDA Toolkit.
+3. Build: `Release | x64`.
+4. DLL zkopírujte do `MQL5\Libraries` v datové složce MT5.
 
-### Nasazení v MetaTrader 5
+### Deployment v MetaTrader 5
 
-1. Uložte DLL do `MQL5\Libraries`.
-2. Zkopírujte indikátor (např. z `MQL5/Indicators/`) do `MQL5\Indicators`.
+1. Umístěte DLL do `MQL5\Libraries`.
+2. Umístěte indikátor z `MQL5/Indicators` do `MQL5\Indicators`.
 3. Zkompilujte v MetaEditoru.
 4. V MT5 povolte DLL imports.
 
 ---
 
-## 7. Obsah repozitáře
+## 8) Struktura repozitáře
 
-- `kernel.cu` — implementace kernelu 2.0.0 (CUDA/C++).
-- `MQL5/Indicators/` — integrační indikátory pro MT5.
-- `docs/index.html`, `docs/app.js`, `docs/lstm-flow.svg` — interaktivní dokumentace.
-- `MQL5GPULibrary_LSTM.sln`, `MQL5GPULibrary_LSTM.vcxproj` — build konfigurace pro Visual Studio.
+- `kernel.cu` — implementace LSTM DLL v2.1.0.
+- `MQL5/Indicators/` — integrační MQL5 indikátory a příklady.
+- `docs/` — statická dokumentační aplikace.
+- `MQL5GPULibrary_LSTM.sln`, `MQL5GPULibrary_LSTM.vcxproj` — build konfigurace.
 
 ---
 
-## 8. Licence
+## 9) Troubleshooting checklist
 
-MIT (`LICENSE.txt`).
+1. Po každé chybě (`MQL_FALSE`) čtěte `DN_GetError`.
+2. Ověřte správné dimenze `X/T/Y` a `seq_len`.
+3. Ujistěte se, že je dostupná CUDA kompatibilní GPU konfigurace.
+4. Při paralelních modelech striktně oddělte handle + data.
+5. Při dlouhých trénincích používejte snapshoty a průběžný progress polling.
+
+---
+
+## 10) Licence
+
+MIT — viz `LICENSE.txt`.
