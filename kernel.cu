@@ -259,6 +259,18 @@ struct GPUContext {
     }
 };
 
+static GPUContext* GetThreadGPUContext(int device = 0) {
+    thread_local std::unique_ptr<GPUContext> tls_ctx;
+    if (!tls_ctx) {
+        tls_ctx = std::make_unique<GPUContext>();
+        if (!tls_ctx->Init(device)) {
+            tls_ctx.reset();
+            return nullptr;
+        }
+    }
+    return tls_ctx.get();
+}
+
 // ============================================================================
 // Utilities
 // ============================================================================
@@ -861,6 +873,7 @@ struct LSTMLayer {
                 &beta_zero, gates_raw.ptr, gate_dim));
 
             dim3 threads(16, 16);
+            // x-dimension covers batch/cols, y-dimension covers gate_dim/rows.
             dim3 blocks_bias(toU32((batch + 15) / 16), toU32((gate_dim + 15) / 16));
             kAddBiasInplace << <blocks_bias, threads, 0, stream_h >> > (
                 gate_dim, batch, gates_raw.ptr, b.ptr);
@@ -1210,8 +1223,8 @@ class LSTMNet {
     std::atomic<int>  m_state{ TS_IDLE };
     std::atomic<bool> m_stop_flag{ false };
     std::thread       m_worker;
-    double            m_final_mse = 0.0;
-    int               m_final_epochs = 0;
+    std::atomic<double> m_final_mse{ 0.0 };
+    std::atomic<int>    m_final_epochs{ 0 };
 
     // Progress reporting
     TrainingProgress m_progress;
@@ -1589,8 +1602,8 @@ class LSTMNet {
 
         m_progress.last_mse.store((float)last_full_train_mse);
 
-        m_final_mse = last_full_train_mse;
-        m_final_epochs = final_epoch;
+        m_final_mse.store(last_full_train_mse);
+        m_final_epochs.store(final_epoch);
         return MQL_TRUE;
     }
 
@@ -1600,28 +1613,28 @@ public:
     float GetOutputMin()  const { return 0.0f; }
     float GetOutputMax()  const { return 0.0f; }
     float GetGradNorm()   const {
-        GPUContext ctx;
-        if (!ctx.Init(0)) return 0.0f;
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return 0.0f;
 
         double sq_sum = 0.0;
         for (const auto& l : lstm_layers) {
             if (l->dW.ptr && l->dW.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx.stream, l->dW.ptr, (int)l->dW.count);
+                double n = ComputeDeviceL2Norm(ctx->stream, l->dW.ptr, (int)l->dW.count);
                 sq_sum += n * n;
             }
             if (l->db.ptr && l->db.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx.stream, l->db.ptr, (int)l->db.count);
+                double n = ComputeDeviceL2Norm(ctx->stream, l->db.ptr, (int)l->db.count);
                 sq_sum += n * n;
             }
         }
         if (output_layer) {
             if (output_layer->dW.ptr && output_layer->dW.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx.stream, output_layer->dW.ptr,
+                double n = ComputeDeviceL2Norm(ctx->stream, output_layer->dW.ptr,
                     (int)output_layer->dW.count);
                 sq_sum += n * n;
             }
             if (output_layer->db.ptr && output_layer->db.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx.stream, output_layer->db.ptr,
+                double n = ComputeDeviceL2Norm(ctx->stream, output_layer->db.ptr,
                     (int)output_layer->db.count);
                 sq_sum += n * n;
             }
@@ -1631,18 +1644,18 @@ public:
     }
     int   GetLayerCount() const { return (int)lstm_layers.size() + (output_layer ? 1 : 0); }
     float GetLayerWeightNorm(int layer_idx) const {
-        GPUContext ctx;
-        if (!ctx.Init(0)) return 0.0f;
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return 0.0f;
 
         if (layer_idx >= 0 && layer_idx < (int)lstm_layers.size()) {
             const LSTMLayer* layer = lstm_layers[(size_t)layer_idx].get();
             if (!layer->W.ptr || layer->W.count == 0) return 0.0f;
-            return (float)ComputeDeviceL2Norm(ctx.stream, layer->W.ptr, (int)layer->W.count);
+            return (float)ComputeDeviceL2Norm(ctx->stream, layer->W.ptr, (int)layer->W.count);
         }
 
         if (output_layer && layer_idx == (int)lstm_layers.size()) {
             if (!output_layer->W.ptr || output_layer->W.count == 0) return 0.0f;
-            return (float)ComputeDeviceL2Norm(ctx.stream, output_layer->W.ptr,
+            return (float)ComputeDeviceL2Norm(ctx->stream, output_layer->W.ptr,
                 (int)output_layer->W.count);
         }
 
@@ -1658,12 +1671,16 @@ public:
     int GetStatus() const { return m_state.load(); }
 
     void GetResult(double& mse, int& ep) const {
-        mse = m_final_mse;
-        ep = m_final_epochs;
+        mse = m_final_mse.load();
+        ep = m_final_epochs.load();
     }
 
     void StopTraining() {
         m_stop_flag.store(true);
+    }
+
+    void JoinWorker() {
+        if (m_worker.joinable()) m_worker.join();
     }
 
     // ── Progress getters (all lock-free) ───────────────────────────────
@@ -1714,6 +1731,29 @@ public:
             });
 
         return MQL_TRUE;
+    }
+
+    MQL_BOOL TrainSync_Locked(int max_epochs, double target_mse,
+        double lr, double wd, double* out_mse, int* out_epochs)
+    {
+        if (m_state.load() == TS_TRAINING) return MQL_FALSE;
+        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+            return MQL_FALSE;
+
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return MQL_FALSE;
+
+        m_stop_flag.store(false);
+        m_state.store(TS_TRAINING);
+        MQL_BOOL result = TrainInternal(*ctx, max_epochs, target_mse, lr, wd);
+        if (ctx->stream) cudaStreamSynchronize(ctx->stream);
+        m_state.store(result ? TS_COMPLETED : TS_ERROR);
+
+        if (result) {
+            if (out_mse) *out_mse = m_final_mse.load();
+            if (out_epochs) *out_epochs = m_final_epochs.load();
+        }
+        return result;
     }
 
     LSTMNet() : host_rng(std::random_device{}()) {
@@ -1799,8 +1839,8 @@ public:
     {
         if (!init_ok || !X || !T) return MQL_FALSE;
 
-        GPUContext ctx;
-        if (!ctx.Init(0)) return MQL_FALSE;
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return MQL_FALSE;
 
         int feature_dim = in_dim / seq_len;
         if (feature_dim * seq_len != in_dim) return MQL_FALSE;
@@ -1824,13 +1864,13 @@ public:
         if (!tmpX.alloc(nX) || !tmpT.alloc(nT)) return MQL_FALSE;
 
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpX.ptr, X, nX * sizeof(double),
-            cudaMemcpyHostToDevice, ctx.stream));
+            cudaMemcpyHostToDevice, ctx->stream));
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpT.ptr, T, nT * sizeof(double),
-            cudaMemcpyHostToDevice, ctx.stream));
+            cudaMemcpyHostToDevice, ctx->stream));
 
-        kCopyD2F_vec4 << <std::min((int)((nX + 1023) / 1024), 4096), 256, 0, ctx.stream >> >
+        kCopyD2F_vec4 << <std::min((int)((nX + 1023) / 1024), 4096), 256, 0, ctx->stream >> >
             ((int)nX, tmpX.ptr, X_full.ptr);
-        kCopyD2F_vec4 << <std::min((int)((nT + 1023) / 1024), 4096), 256, 0, ctx.stream >> >
+        kCopyD2F_vec4 << <std::min((int)((nT + 1023) / 1024), 4096), 256, 0, ctx->stream >> >
             ((int)nT, tmpT.ptr, T_full.ptr);
 
         int max_b = std::max(batch, mini_batch_size);
@@ -1838,7 +1878,7 @@ public:
             if (!ones.alloc((size_t)max_b)) return MQL_FALSE;
             std::vector<float> h1((size_t)max_b, 1.0f);
             CUDA_CHECK_RET(cudaMemcpyAsync(ones.ptr, h1.data(),
-                max_b * sizeof(float), cudaMemcpyHostToDevice, ctx.stream));
+                max_b * sizeof(float), cudaMemcpyHostToDevice, ctx->stream));
         }
         if (!mse_reduce_buf.alloc(1)) return MQL_FALSE;
 
@@ -1848,7 +1888,7 @@ public:
         loaded_in_dim = feature_dim;
         loaded_out_dim = out_dim;
 
-        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
+        CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
         b1_pow = 1.0f; b2_pow = 1.0f; step = 0;
         last_full_train_mse = 0.0;
         return MQL_TRUE;
@@ -1859,8 +1899,8 @@ public:
     {
         if (!init_ok || !X || !out_Y) return MQL_FALSE;
 
-        GPUContext ctx;
-        if (!ctx.Init(0)) return MQL_FALSE;
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return MQL_FALSE;
 
         int feature_dim = in_dim / seq_len;
         if (feature_dim * seq_len != in_dim) return MQL_FALSE;
@@ -1878,38 +1918,38 @@ public:
 
         if (!X_float.alloc(nX) || !tmpDX.alloc(nX)) return MQL_FALSE;
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpDX.ptr, X, nX * sizeof(double),
-            cudaMemcpyHostToDevice, ctx.stream));
-        kCopyD2F_vec4 << <toU32((nX + 1023) / 1024), 256, 0, ctx.stream >> >
+            cudaMemcpyHostToDevice, ctx->stream));
+        kCopyD2F_vec4 << <toU32((nX + 1023) / 1024), 256, 0, ctx->stream >> >
             ((int)nX, tmpDX.ptr, X_float.ptr);
 
         if (!X_ts.alloc(nX)) return MQL_FALSE;
-        kTransposeToTimestep << <toU32((nX + 255) / 256), 256, 0, ctx.stream >> >
+        kTransposeToTimestep << <toU32((nX + 255) / 256), 256, 0, ctx->stream >> >
             (batch, seq_len, feature_dim, X_float.ptr, X_ts.ptr);
 
         if (ones.count < (size_t)batch) {
             if (!ones.alloc((size_t)batch)) return MQL_FALSE;
             std::vector<float> h1((size_t)batch, 1.0f);
             CUDA_CHECK_RET(cudaMemcpyAsync(ones.ptr, h1.data(),
-                batch * sizeof(float), cudaMemcpyHostToDevice, ctx.stream));
+                batch * sizeof(float), cudaMemcpyHostToDevice, ctx->stream));
         }
 
         if (!Y_float.alloc(nY)) return MQL_FALSE;
-        if (!ForwardFull(ctx, X_ts.ptr, seq_len, batch, false, Y_float.ptr))
+        if (!ForwardFull(*ctx, X_ts.ptr, seq_len, batch, false, Y_float.ptr))
             return MQL_FALSE;
 
         if (!outDY.alloc(nY)) return MQL_FALSE;
-        kCopyF2D_vec4 << <toU32((nY + 1023) / 1024), 256, 0, ctx.stream >> >
+        kCopyF2D_vec4 << <toU32((nY + 1023) / 1024), 256, 0, ctx->stream >> >
             ((int)nY, Y_float.ptr, outDY.ptr);
         CUDA_CHECK_RET(cudaMemcpyAsync(out_Y, outDY.ptr, nY * sizeof(double),
-            cudaMemcpyDeviceToHost, ctx.stream));
-        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
+            cudaMemcpyDeviceToHost, ctx->stream));
+        CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
         return MQL_TRUE;
     }
 
     MQL_BOOL EvalMSE(double* out_mse) {
-        GPUContext ctx;
-        if (!ctx.Init(0)) return MQL_FALSE;
-        double mse = ComputeFullTrainMSE(ctx);
+        GPUContext* ctx = GetThreadGPUContext(0);
+        if (!ctx) return MQL_FALSE;
+        double mse = ComputeFullTrainMSE(*ctx);
         if (mse < 0) return MQL_FALSE;
         if (out_mse) *out_mse = mse;
         return MQL_TRUE;
@@ -2043,9 +2083,20 @@ DLL_EXPORT void DLL_CALL DN_Free(int h) {
         g_nets.erase(it);
     }
     victim->StopTraining();
+    victim->JoinWorker();
     {
         std::unique_lock<std::shared_mutex> lk(victim->net_mtx);
     }
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
+    double target_mse, double lr, double wd,
+    double* out_mse, int* out_epochs)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    return net->TrainSync_Locked(epochs, target_mse, lr, wd, out_mse, out_epochs);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
