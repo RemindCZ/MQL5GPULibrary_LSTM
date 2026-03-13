@@ -52,6 +52,7 @@
 #include <thread>
 #include <limits>
 #include <chrono>
+#include <cstdint>
 
 #pragma comment(lib, "cudart.lib")
 #pragma comment(lib, "cublas.lib")
@@ -70,6 +71,19 @@ enum TrainingState : int {
     TS_COMPLETED = 2,
     TS_ERROR = -1
 };
+
+
+#pragma pack(push,1)
+struct ModelBinHeader {
+    uint32_t magic = 0x324D5153; // SQM2
+    uint32_t version = 1;
+    uint32_t seq_len = 1;
+    uint32_t layer_count = 0;
+    uint32_t out_in_dim = 0;
+    uint32_t out_dim = 0;
+};
+#pragma pack(pop)
+
 
 // ============================================================================
 // Error handling
@@ -679,8 +693,14 @@ __global__ void kAddInplace(int n, float* __restrict__ dst,
     if (i < n) dst[i] += src[i];
 }
 
+__global__ void kScaleInplace(int n, float* __restrict__ dst, float scale)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] *= scale;
+}
+
 // ============================================================================
-// Recurrent layer abstraction (RNN/GRU/LSTM + future attention blocks)
+// Recurrent layer abstraction (RNN/GRU/LSTM)
 // ============================================================================
 enum class SequenceLayerType : int {
     RNN = 0,
@@ -1271,6 +1291,7 @@ class SequenceModel {
     int seq_len = 1;
 
     GPUMemory<float> X_full, T_full;
+    GPUMemory<float> X_val, T_val;
     GPUMemory<float> ones;
     GPUMemory<float> mse_reduce_buf;
     GPUMemory<float> debug_sum;
@@ -1280,6 +1301,14 @@ class SequenceModel {
     int loaded_samples = 0;
     int loaded_in_dim = 0;
     int loaded_out_dim = 0;
+    int val_samples = 0;
+
+    bool eval_mode = false;
+    bool has_validation = false;
+    int early_stopping_patience = 0;
+    int early_stopping_wait = 0;
+    double best_val_loss = std::numeric_limits<double>::infinity();
+    float global_grad_clip_norm = 0.0f;
 
     unsigned long long step = 0;
     float b1_pow = 1.0f, b2_pow = 1.0f;
@@ -1296,6 +1325,7 @@ class SequenceModel {
     bool init_ok = false;
 
     std::mt19937 host_rng;
+    unsigned int user_seed = 0;
 
     // Async training state
     std::atomic<int>  m_state{ TS_IDLE };
@@ -1361,14 +1391,11 @@ class SequenceModel {
         return MQL_TRUE;
     }
 
-    double ComputeFullTrainMSE(GPUContext& ctx) {
-        if (loaded_samples <= 0 || !X_full.ptr || !T_full.ptr ||
-            lstm_layers.empty() || !output_layer)
+    double ComputeDatasetMSE(GPUContext& ctx, const GPUMemory<float>& X_data, const GPUMemory<float>& T_data, int samples, int in_dim, int out_dim) {
+        if (samples <= 0 || !X_data.ptr || !T_data.ptr || lstm_layers.empty() || !output_layer)
             return -1.0;
 
-        int batch = loaded_samples;
-        int out_dim = loaded_out_dim;
-        int in_dim = loaded_in_dim;
+        int batch = samples;
 
         int eval_batch = std::min(batch, 256);
 
@@ -1393,12 +1420,12 @@ class SequenceModel {
 
             int total_x = cur_batch * seq_len * in_dim;
             kGatherTransposeSeq << <toU32((total_x + 255) / 256), 256, 0, ctx.stream >> > (
-                cur_batch, seq_len, in_dim, idx.ptr, X_full.ptr, X_mb_ts.ptr);
+                cur_batch, seq_len, in_dim, idx.ptr, X_data.ptr, X_mb_ts.ptr);
             CUDA_CHECK_VOID(cudaGetLastError());
 
             int total_t = cur_batch * out_dim;
             kGatherRows << <toU32((total_t + 255) / 256), 256, 0, ctx.stream >> > (
-                out_dim, cur_batch, T_full.ptr, idx.ptr, T_mb.ptr);
+                out_dim, cur_batch, T_data.ptr, idx.ptr, T_mb.ptr);
             CUDA_CHECK_VOID(cudaGetLastError());
 
             if (!ForwardFull(ctx, X_mb_ts.ptr, seq_len, cur_batch, false, Y_eval.ptr))
@@ -1422,6 +1449,46 @@ class SequenceModel {
 
         if (total_out <= 0) return -1.0;
         return total_mse_sum / (double)total_out;
+    }
+
+    double ComputeFullTrainMSE(GPUContext& ctx) {
+        return ComputeDatasetMSE(ctx, X_full, T_full, loaded_samples, loaded_in_dim, loaded_out_dim);
+    }
+
+    double ComputeValidationMSE(GPUContext& ctx) {
+        if (!has_validation) return -1.0;
+        return ComputeDatasetMSE(ctx, X_val, T_val, val_samples, loaded_in_dim, loaded_out_dim);
+    }
+
+    MQL_BOOL ApplyGlobalGradNormClipping(GPUContext& ctx) {
+        if (global_grad_clip_norm <= 0.0f) return MQL_TRUE;
+        float n = GetGradNorm();
+        if (n <= 0.0f) return MQL_TRUE;
+        m_progress.grad_norm.store(n);
+        if (n <= global_grad_clip_norm) return MQL_TRUE;
+        float scale = global_grad_clip_norm / n;
+        for (const auto& l : lstm_layers) {
+            if (l->dW.ptr && l->dW.count) {
+                int c = (int)l->dW.count;
+                kScaleInplace<<<toU32((c + 255) / 256),256,0,ctx.stream>>>(c,l->dW.ptr,scale);
+            }
+            if (l->db.ptr && l->db.count) {
+                int c = (int)l->db.count;
+                kScaleInplace<<<toU32((c + 255) / 256),256,0,ctx.stream>>>(c,l->db.ptr,scale);
+            }
+        }
+        if (output_layer) {
+            if (output_layer->dW.ptr && output_layer->dW.count) {
+                int c = (int)output_layer->dW.count;
+                kScaleInplace<<<toU32((c + 255) / 256),256,0,ctx.stream>>>(c,output_layer->dW.ptr,scale);
+            }
+            if (output_layer->db.ptr && output_layer->db.count) {
+                int c = (int)output_layer->db.count;
+                kScaleInplace<<<toU32((c + 255) / 256),256,0,ctx.stream>>>(c,output_layer->db.ptr,scale);
+            }
+        }
+        CUDA_CHECK_KERNEL_RET();
+        return MQL_TRUE;
     }
 
     MQL_BOOL ApplyDropoutBackwardAllTimesteps(
@@ -1619,6 +1686,9 @@ class SequenceModel {
                         return MQL_FALSE;
                 }
 
+                if (!ApplyGlobalGradNormClipping(ctx))
+                    return MQL_FALSE;
+
                 // Update all layers
                 for (int li = 0; li < nLayers; li++)
                     if (!lstm_layers[li]->Update(cur_lr, c1, c2, (float)wd,
@@ -1649,16 +1719,33 @@ class SequenceModel {
 
             final_epoch = epoch;
 
-            bool collect = (epoch == 1 || epoch == max_epochs || (epoch % 50) == 0);
+            bool collect = (epoch == 1 || epoch == max_epochs || (epoch % 10) == 0);
             if (collect) {
                 last_full_train_mse = ComputeFullTrainMSE(ctx);
 
-                // ── Progress: MSE update ───────────────────────────────
                 m_progress.last_mse.store((float)last_full_train_mse);
+                float tracked_metric = (float)last_full_train_mse;
+                if (has_validation) {
+                    double val_mse = ComputeValidationMSE(ctx);
+                    if (val_mse > 0.0) tracked_metric = (float)val_mse;
+                }
                 float cur_best = m_progress.best_mse.load();
-                if ((float)last_full_train_mse < cur_best)
-                    m_progress.best_mse.store((float)last_full_train_mse);
-                // ───────────────────────────────────────────────────────
+                if (tracked_metric < cur_best) m_progress.best_mse.store(tracked_metric);
+
+                if (has_validation) {
+                    double val_mse = ComputeValidationMSE(ctx);
+                    if (val_mse > 0.0 && val_mse < best_val_loss) {
+                        best_val_loss = val_mse;
+                        early_stopping_wait = 0;
+                        SnapshotWeights();
+                    } else if (early_stopping_patience > 0) {
+                        early_stopping_wait++;
+                        if (early_stopping_wait >= early_stopping_patience) {
+                            RestoreWeights();
+                            break;
+                        }
+                    }
+                }
 
                 if (target_mse > 0.0 && last_full_train_mse > 0.0 &&
                     last_full_train_mse <= target_mse)
@@ -1735,10 +1822,10 @@ public:
 
         return 0.0f;
     }
-    float GetLayerGradNorm(int)   const { return 0.0f; }
-    float GetLayerActMin(int)     const { return 0.0f; }
-    float GetLayerActMax(int)     const { return 0.0f; }
-    float GetLayerAliveRatio(int) const { return 1.0f; }
+    float GetLayerGradNorm(int)   const { return std::numeric_limits<float>::quiet_NaN(); }
+    float GetLayerActMin(int)     const { return std::numeric_limits<float>::quiet_NaN(); }
+    float GetLayerActMax(int)     const { return std::numeric_limits<float>::quiet_NaN(); }
+    float GetLayerAliveRatio(int) const { return std::numeric_limits<float>::quiet_NaN(); }
     bool  IsInitOK()              const { return init_ok; }
 
     // Lock-free async interface (atomics only)
@@ -1767,6 +1854,26 @@ public:
     long long GetProgressElapsedMs()        const { return m_progress.elapsed_ms.load(); }
     long long GetProgressETAMs()            const { return m_progress.eta_ms.load(); }
     // ───────────────────────────────────────────────────────────────────
+
+    MQL_BOOL TrainSync_Locked(int max_epochs, double target_mse,
+        double lr, double wd)
+    {
+        if (m_state.load() == TS_TRAINING) return MQL_FALSE;
+        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+            return MQL_FALSE;
+
+        m_stop_flag.store(false);
+        m_state.store(TS_TRAINING);
+        GPUContext ctx;
+        if (!ctx.Init(0)) {
+            m_state.store(TS_ERROR);
+            return MQL_FALSE;
+        }
+        MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse, lr, wd);
+        if (ctx.stream) cudaStreamSynchronize(ctx.stream);
+        m_state.store(result ? TS_COMPLETED : TS_ERROR);
+        return result;
+    }
 
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
         double lr, double wd)
@@ -1821,6 +1928,13 @@ public:
     void SetGradClip(float v) { grad_clip = v; }
     void SetSequenceLength(int sl) { seq_len = std::max(1, sl); }
     void SetMiniBatchSize(int mbs) { mini_batch_size = std::max(1, mbs); }
+    void SetGlobalGradClipNorm(float v) { global_grad_clip_norm = std::max(0.0f, v); }
+    float GetGlobalGradClipNorm() const { return global_grad_clip_norm; }
+    void SetTrainMode(bool train_mode) { eval_mode = !train_mode; }
+    bool IsTrainMode() const { return !eval_mode; }
+    void SetSeed(unsigned int seed) { user_seed = seed; host_rng.seed(seed); }
+    void SetEarlyStoppingPatience(int p) { early_stopping_patience = std::max(0, p); }
+    double GetBestValidationLoss() const { return best_val_loss; }
 
     MQL_BOOL AddTypedLayer(SequenceLayerType lt, int in_dim, int hidden_size, float dropout = 0.0f) {
         if (!init_ok) return MQL_FALSE;
@@ -1954,10 +2068,47 @@ public:
         loaded_samples = batch;
         loaded_in_dim = feature_dim;
         loaded_out_dim = out_dim;
+        early_stopping_wait = 0;
+        best_val_loss = std::numeric_limits<double>::infinity();
 
         CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
         b1_pow = 1.0f; b2_pow = 1.0f; step = 0;
         last_full_train_mse = 0.0;
+        return MQL_TRUE;
+    }
+
+
+    MQL_BOOL LoadValidationBatch(const double* X, const double* T, int batch,
+        int in_dim, int out_dim, int layout)
+    {
+        if (!init_ok || !X || !T || batch <= 0) return MQL_FALSE;
+        int feature_dim = in_dim / seq_len;
+        if (feature_dim * seq_len != in_dim) return MQL_FALSE;
+        if (loaded_in_dim > 0 && feature_dim != loaded_in_dim) return MQL_FALSE;
+        if (loaded_out_dim > 0 && out_dim != loaded_out_dim) return MQL_FALSE;
+
+        GPUContext ctx;
+        if (!ctx.Init(0)) return MQL_FALSE;
+
+        size_t nX = (size_t)batch * seq_len * feature_dim;
+        size_t nT = (size_t)batch * out_dim;
+        if (!X_val.alloc(nX) || !T_val.alloc(nT)) return MQL_FALSE;
+
+        GPUMemory<double> tmpX, tmpT;
+        if (!tmpX.alloc(nX) || !tmpT.alloc(nT)) return MQL_FALSE;
+
+        CUDA_CHECK_RET(cudaMemcpyAsync(tmpX.ptr, X, nX * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
+        CUDA_CHECK_RET(cudaMemcpyAsync(tmpT.ptr, T, nT * sizeof(double), cudaMemcpyHostToDevice, ctx.stream));
+
+        kCopyD2F_vec4<<<std::min((int)((nX + 1023) / 1024), 4096), 256, 0, ctx.stream>>>((int)nX, tmpX.ptr, X_val.ptr);
+        kCopyD2F_vec4<<<std::min((int)((nT + 1023) / 1024), 4096), 256, 0, ctx.stream>>>((int)nT, tmpT.ptr, T_val.ptr);
+        CUDA_CHECK_KERNEL_RET();
+        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
+
+        val_samples = batch;
+        has_validation = true;
+        best_val_loss = std::numeric_limits<double>::infinity();
+        early_stopping_wait = 0;
         return MQL_TRUE;
     }
 
@@ -2001,7 +2152,7 @@ public:
         }
 
         if (!Y_float.alloc(nY)) return MQL_FALSE;
-        if (!ForwardFull(ctx, X_ts.ptr, seq_len, batch, false, Y_float.ptr))
+        if (!ForwardFull(ctx, X_ts.ptr, seq_len, batch, !eval_mode, Y_float.ptr))
             return MQL_FALSE;
 
         if (!outDY.alloc(nY)) return MQL_FALSE;
@@ -2019,6 +2170,75 @@ public:
         double mse = ComputeFullTrainMSE(ctx);
         if (mse < 0) return MQL_FALSE;
         if (out_mse) *out_mse = mse;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL SaveBinaryFile(const char* path) {
+        if (!path || !*path || lstm_layers.empty() || !output_layer) return MQL_FALSE;
+        FILE* f = nullptr;
+        fopen_s(&f, path, "wb");
+        if (!f) return MQL_FALSE;
+        ModelBinHeader h;
+        h.seq_len = (uint32_t)seq_len;
+        h.layer_count = (uint32_t)lstm_layers.size();
+        h.out_in_dim = (uint32_t)output_layer->in_dim;
+        h.out_dim = (uint32_t)output_layer->out_dim;
+        fwrite(&h, sizeof(h), 1, f);
+        for (size_t li = 0; li < lstm_layers.size(); ++li) {
+            auto& l = lstm_layers[li];
+            uint32_t lt = (uint32_t)((li < layer_types.size()) ? layer_types[li] : SequenceLayerType::LSTM);
+            fwrite(&lt, sizeof(uint32_t), 1, f);
+            fwrite(&l->input_size, sizeof(int), 1, f);
+            fwrite(&l->hidden_size, sizeof(int), 1, f);
+            fwrite(&l->dropout_rate, sizeof(float), 1, f);
+            int dim = l->input_size + l->hidden_size;
+            int g = 4 * l->hidden_size;
+            std::vector<float> Wv((size_t)dim * g), bv(g);
+            cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(bv.data(), l->b.ptr, bv.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            fwrite(Wv.data(), sizeof(float), Wv.size(), f);
+            fwrite(bv.data(), sizeof(float), bv.size(), f);
+        }
+        std::vector<float> Wo((size_t)output_layer->in_dim * output_layer->out_dim), bo(output_layer->out_dim);
+        cudaMemcpy(Wo.data(), output_layer->W.ptr, Wo.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(bo.data(), output_layer->b.ptr, bo.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        fwrite(Wo.data(), sizeof(float), Wo.size(), f);
+        fwrite(bo.data(), sizeof(float), bo.size(), f);
+        fclose(f);
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL LoadBinaryFile(const char* path) {
+        if (!path || !*path || !init_ok) return MQL_FALSE;
+        FILE* f = nullptr;
+        fopen_s(&f, path, "rb");
+        if (!f) return MQL_FALSE;
+        ModelBinHeader h{};
+        if (fread(&h, sizeof(h), 1, f) != 1) { fclose(f); return MQL_FALSE; }
+        if (h.magic != 0x324D5153 || h.version != 1) { fclose(f); return MQL_FALSE; }
+        seq_len = (int)h.seq_len;
+        lstm_layers.clear();
+        layer_types.clear();
+        for (uint32_t i = 0; i < h.layer_count; ++i) {
+            uint32_t lt=0; int in_d=0,hid_d=0; float drop=0;
+            if (fread(&lt,sizeof(uint32_t),1,f)!=1 || fread(&in_d,sizeof(int),1,f)!=1 || fread(&hid_d,sizeof(int),1,f)!=1 || fread(&drop,sizeof(float),1,f)!=1) { fclose(f); return MQL_FALSE; }
+            auto l = std::make_unique<LSTMLayer>();
+            if (!l->InitFromData(in_d,hid_d,drop)) { fclose(f); return MQL_FALSE; }
+            int dim = in_d + hid_d, g = 4 * hid_d;
+            std::vector<float> Wv((size_t)dim * g), bv(g);
+            if (fread(Wv.data(),sizeof(float),Wv.size(),f)!=Wv.size() || fread(bv.data(),sizeof(float),bv.size(),f)!=bv.size()) { fclose(f); return MQL_FALSE; }
+            cudaMemcpy(l->W.ptr, Wv.data(), Wv.size()*sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(l->b.ptr, bv.data(), bv.size()*sizeof(float), cudaMemcpyHostToDevice);
+            lstm_layers.push_back(std::move(l));
+            layer_types.push_back((SequenceLayerType)lt);
+        }
+        output_layer = std::make_unique<OutputLayer>();
+        if (!output_layer->InitFromData((int)h.out_in_dim, (int)h.out_dim)) { fclose(f); return MQL_FALSE; }
+        std::vector<float> Wo((size_t)h.out_in_dim * h.out_dim), bo(h.out_dim);
+        if (fread(Wo.data(),sizeof(float),Wo.size(),f)!=Wo.size() || fread(bo.data(),sizeof(float),bo.size(),f)!=bo.size()) { fclose(f); return MQL_FALSE; }
+        cudaMemcpy(output_layer->W.ptr, Wo.data(), Wo.size()*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(output_layer->b.ptr, bo.data(), bo.size()*sizeof(float), cudaMemcpyHostToDevice);
+        fclose(f);
         return MQL_TRUE;
     }
 
@@ -2236,6 +2456,76 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
     return net ? net->LoadBatch(X, T, batch, in, out, l) : MQL_FALSE;
 }
 
+DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadValidationBatch(int h, const double* X,
+    const double* T, int batch, int in, int out, int l)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    return net ? net->LoadValidationBatch(X, T, batch, in, out, l) : MQL_FALSE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetEarlyStoppingPatience(int h, int patience)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    net->SetEarlyStoppingPatience(patience);
+    return MQL_TRUE;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetBestValidationLoss(int h)
+{
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
+    return net ? net->GetBestValidationLoss() : 0.0;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetTrainMode(int h, MQL_BOOL train_mode)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    net->SetTrainMode(train_mode != 0);
+    return MQL_TRUE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSeed(int h, int seed)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    net->SetSeed((unsigned int)seed);
+    return MQL_TRUE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGlobalGradNormClip(int h, double clip)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    if (!net) return MQL_FALSE;
+    net->SetGlobalGradClipNorm((float)clip);
+    return MQL_TRUE;
+}
+
+DLL_EXPORT double DLL_CALL DN_GetGlobalGradNormClip(int h)
+{
+    std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
+    return net ? (double)net->GetGlobalGradClipNorm() : 0.0;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SaveBinaryState(int h, const char* path)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    return net ? net->SaveBinaryFile(path) : MQL_FALSE;
+}
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBinaryState(int h, const char* path)
+{
+    std::unique_lock<std::shared_mutex> lk;
+    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    return net ? net->LoadBinaryFile(path) : MQL_FALSE;
+}
+
 DLL_EXPORT MQL_BOOL DLL_CALL DN_PredictBatch(int h, const double* X,
     int batch, int in, int l, double* Y)
 {
@@ -2264,7 +2554,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
     std::unique_lock<std::shared_mutex> lk;
     std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
-    return net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
+    return net->TrainSync_Locked(epochs, target_mse, lr, wd);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
