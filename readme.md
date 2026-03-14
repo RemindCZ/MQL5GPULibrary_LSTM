@@ -320,5 +320,6 @@ This project is distributed under the **MIT License**. See `LICENSE.txt` for the
 ---
 
 ### A small personal note
+![Poděkování Aničce](ann.svg)
 
 Děkuji Aničce za pomoc při nočním přemýšlení nad zbytečně složitým kódem. 💙
