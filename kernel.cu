@@ -450,6 +450,97 @@ __global__ void kLSTMGatesBackward(
     dgates_raw[h + 3 * hidden_size + b * stride] = do_val * o * (1.0f - o);
 }
 
+__global__ void kGRUGatesForward(
+    int hidden_size, int batch,
+    const float* __restrict__ gates_raw,
+    const float* __restrict__ h_prev,
+    float* __restrict__ h_new,
+    float* __restrict__ z_cache,
+    float* __restrict__ r_cache,
+    float* __restrict__ n_cache)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_size * batch;
+    if (idx >= total) return;
+
+    int h = idx % hidden_size;
+    int b = idx / hidden_size;
+    int stride = 3 * hidden_size;
+
+    float z = d_sigmoid(gates_raw[h + 0 * hidden_size + b * stride]);
+    float r = d_sigmoid(gates_raw[h + 1 * hidden_size + b * stride]);
+    float n_pre = gates_raw[h + 2 * hidden_size + b * stride] + r * h_prev[idx];
+    float n = tanhf(n_pre);
+    float hp = h_prev[idx];
+    float hn = (1.0f - z) * hp + z * n;
+
+    h_new[idx] = hn;
+    z_cache[idx] = z;
+    r_cache[idx] = r;
+    n_cache[idx] = n;
+}
+
+__global__ void kGRUGatesBackward(
+    int hidden_size, int batch,
+    const float* __restrict__ dh,
+    const float* __restrict__ h_prev,
+    const float* __restrict__ z_cache,
+    const float* __restrict__ r_cache,
+    const float* __restrict__ n_cache,
+    float* __restrict__ dh_prev_out,
+    float* __restrict__ dgates_raw)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_size * batch;
+    if (idx >= total) return;
+
+    int h = idx % hidden_size;
+    int b = idx / hidden_size;
+    int stride = 3 * hidden_size;
+
+    float hp = h_prev[idx];
+    float z = z_cache[idx];
+    float r = r_cache[idx];
+    float n = n_cache[idx];
+    float dht = dh[idx];
+
+    float dz = dht * (n - hp);
+    float dn = dht * z;
+    float da_n = dn * (1.0f - n * n);
+    float dr = da_n * hp;
+    float da_r = dr * r * (1.0f - r);
+    float da_z = dz * z * (1.0f - z);
+
+    dh_prev_out[idx] = dht * (1.0f - z) + da_n * r;
+
+    dgates_raw[h + 0 * hidden_size + b * stride] = da_z;
+    dgates_raw[h + 1 * hidden_size + b * stride] = da_r;
+    dgates_raw[h + 2 * hidden_size + b * stride] = da_n;
+}
+
+__global__ void kRNNForward(
+    int hidden_size, int batch,
+    const float* __restrict__ preact,
+    float* __restrict__ h_new)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_size * batch;
+    if (idx < total) h_new[idx] = tanhf(preact[idx]);
+}
+
+__global__ void kRNNBackward(
+    int hidden_size, int batch,
+    const float* __restrict__ dh,
+    const float* __restrict__ h_cur,
+    float* __restrict__ dpreact)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = hidden_size * batch;
+    if (idx >= total) return;
+    float h = h_cur[idx];
+    dpreact[idx] = dh[idx] * (1.0f - h * h);
+}
+
 __global__ void kAddBiasInplace(int rows, int cols,
     float* __restrict__ A, const float* __restrict__ bias)
 {
@@ -745,7 +836,7 @@ struct LSTMLayer : public RecurrentLayer {
     float GetDropoutRate() const override { return dropout_rate; }
     SequenceLayerType GetType() const override { return SequenceLayerType::LSTM; }
 
-    void FreeAll() {
+    virtual void FreeAll() {
         W.free(); b.free();
         mW.free(); vW.free(); mb.free(); vb.free();
         dW.free(); db.free();
@@ -760,7 +851,7 @@ struct LSTMLayer : public RecurrentLayer {
         is_valid = false;
     }
 
-    MQL_BOOL Init(int in_sz, int hid_sz, float drop_rate = 0.0f) {
+    virtual MQL_BOOL Init(int in_sz, int hid_sz, float drop_rate = 0.0f) {
         FreeAll();
         input_size = in_sz;
         hidden_size = hid_sz;
@@ -795,7 +886,7 @@ struct LSTMLayer : public RecurrentLayer {
         return MQL_TRUE;
     }
 
-    MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) {
+    virtual MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) {
         FreeAll();
         input_size = in_sz;
         hidden_size = hid_sz;
@@ -1078,10 +1169,326 @@ struct LSTMLayer : public RecurrentLayer {
 
 struct GRULayer : public LSTMLayer {
     SequenceLayerType GetType() const override { return SequenceLayerType::GRU; }
+
+    MQL_BOOL Init(int in_sz, int hid_sz, float drop_rate = 0.0f) override {
+        if (!LSTMLayer::Init(in_sz, hid_sz, drop_rate)) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = 3 * hidden_size;
+        size_t w_size = (size_t)concat_dim * gate_dim;
+        W.free(); b.free(); mW.free(); vW.free(); mb.free(); vb.free();
+        if (!W.alloc(w_size) || !b.alloc(gate_dim)) return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero()) return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero()) return MQL_FALSE;
+        if (!mb.alloc(gate_dim) || !mb.zero()) return MQL_FALSE;
+        if (!vb.alloc(gate_dim) || !vb.zero()) return MQL_FALSE;
+
+        std::vector<float> hW(w_size);
+        std::mt19937 gen(std::random_device{}());
+        float stddev = sqrtf(2.0f / (float)(concat_dim + gate_dim));
+        std::normal_distribution<float> dist(0.0f, stddev);
+        for (float& w : hW) w = dist(gen);
+        CUDA_CHECK_RET(cudaMemcpy(W.ptr, hW.data(), w_size * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK_RET(cudaMemset(b.ptr, 0, gate_dim * sizeof(float)));
+        is_valid = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) override {
+        FreeAll();
+        input_size = in_sz;
+        hidden_size = hid_sz;
+        use_dropout = (drop_rate > 0.0f);
+        dropout_rate = drop_rate;
+        if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = 3 * hidden_size;
+        size_t w_size = (size_t)concat_dim * gate_dim;
+        if (!W.alloc(w_size) || !b.alloc(gate_dim)) return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero()) return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero()) return MQL_FALSE;
+        if (!mb.alloc(gate_dim) || !mb.zero()) return MQL_FALSE;
+        if (!vb.alloc(gate_dim) || !vb.zero()) return MQL_FALSE;
+        is_valid = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* x_seq, int seq_len, int batch, bool training,
+        curandGenerator_t curand_gen) override
+    {
+        if (!is_valid || !blas_h || !stream_h || !x_seq) return MQL_FALSE;
+        int H = hidden_size, I = input_size;
+        int concat_dim = I + H, gate_dim = 3 * H;
+        size_t hb_size = (size_t)H * batch;
+
+        h_cache.resize(seq_len); hx_cache.resize(seq_len);
+        f_cache.resize(seq_len); i_cache.resize(seq_len); g_cache.resize(seq_len);
+        h_drop_cache.resize(seq_len); dropout_mask.resize(seq_len); dropout_mask_valid.assign(seq_len, false);
+        if (!h_init.alloc(hb_size) || !h_init.zero()) return MQL_FALSE;
+
+        for (int t = 0; t < seq_len; t++) {
+            if (!h_cache[t].alloc(hb_size)) return MQL_FALSE;
+            if (!hx_cache[t].alloc((size_t)concat_dim * batch)) return MQL_FALSE;
+            if (!f_cache[t].alloc(hb_size) || !i_cache[t].alloc(hb_size) || !g_cache[t].alloc(hb_size)) return MQL_FALSE;
+
+            const float* h_prev = (t == 0) ? h_init.ptr : h_cache[t - 1].ptr;
+            const float* x_t = x_seq + (size_t)t * batch * I;
+            kConcatHX<<<toU32(((size_t)concat_dim * batch + 255) / 256), 256, 0, stream_h>>>(H, I, batch, h_prev, x_t, hx_cache[t].ptr);
+            CUDA_CHECK_KERNEL_RET();
+
+            GPUMemory<float> gates_raw;
+            if (!gates_raw.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
+            float alpha = 1.0f, beta_zero = 0.0f;
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                gate_dim, batch, concat_dim, &alpha, W.ptr, concat_dim, hx_cache[t].ptr, concat_dim,
+                &beta_zero, gates_raw.ptr, gate_dim));
+
+            dim3 th(16,16), bl(toU32((batch + 15) / 16), toU32((gate_dim + 15) / 16));
+            kAddBiasInplace<<<bl, th, 0, stream_h>>>(gate_dim, batch, gates_raw.ptr, b.ptr);
+            CUDA_CHECK_KERNEL_RET();
+
+            kGRUGatesForward<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(
+                H, batch, gates_raw.ptr, h_prev, h_cache[t].ptr, f_cache[t].ptr, i_cache[t].ptr, g_cache[t].ptr);
+            CUDA_CHECK_KERNEL_RET();
+        }
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* dh_last, const float* dh_above_seq,
+        int seq_len, int batch, const float* ones_ptr) override
+    {
+        if (!is_valid || !blas_h || !stream_h) return MQL_FALSE;
+        int H = hidden_size, I = input_size;
+        int concat_dim = I + H, gate_dim = 3 * H;
+        size_t hb_size = (size_t)H * batch;
+
+        if (!dW.alloc((size_t)concat_dim * gate_dim) || !dW.zero()) return MQL_FALSE;
+        if (!db.alloc(gate_dim) || !db.zero()) return MQL_FALSE;
+        if (!dx_buf.alloc((size_t)seq_len * batch * I)) return MQL_FALSE;
+
+        GPUMemory<float> dh_cur, dh_prev_tmp, dhx, dgates_raw;
+        if (!dh_cur.alloc(hb_size) || !dh_prev_tmp.alloc(hb_size)) return MQL_FALSE;
+        if (!dhx.alloc((size_t)concat_dim * batch) || !dgates_raw.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
+        if (dh_last) CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_last, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
+        else if (!dh_cur.zero()) return MQL_FALSE;
+
+        float alpha = 1.0f, beta_zero = 0.0f, beta_one = 1.0f;
+        for (int t = seq_len - 1; t >= 0; --t) {
+            if (dh_above_seq) {
+                const float* dh_top_t = dh_above_seq + (size_t)t * batch * H;
+                kAddInplace<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(hb_size, dh_cur.ptr, dh_top_t);
+                CUDA_CHECK_KERNEL_RET();
+            }
+            const float* h_prev = (t == 0) ? h_init.ptr : h_cache[t - 1].ptr;
+            kGRUGatesBackward<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(
+                H, batch, dh_cur.ptr, h_prev, f_cache[t].ptr, i_cache[t].ptr, g_cache[t].ptr,
+                dh_prev_tmp.ptr, dgates_raw.ptr);
+            CUDA_CHECK_KERNEL_RET();
+
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
+                concat_dim, gate_dim, batch, &alpha, hx_cache[t].ptr, concat_dim, dgates_raw.ptr, gate_dim,
+                &beta_one, dW.ptr, concat_dim));
+            CUBLAS_CHECK_RET(cublasSgemv(blas_h, CUBLAS_OP_N, gate_dim, batch,
+                &alpha, dgates_raw.ptr, gate_dim, ones_ptr, 1, &beta_one, db.ptr, 1));
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
+                concat_dim, batch, gate_dim, &alpha, W.ptr, concat_dim, dgates_raw.ptr, gate_dim,
+                &beta_zero, dhx.ptr, concat_dim));
+
+            float* dx_t = dx_buf.ptr + (size_t)t * batch * I;
+            kSplitDHX<<<toU32(((size_t)concat_dim * batch + 255) / 256), 256, 0, stream_h>>>(
+                H, I, batch, dhx.ptr, dh_cur.ptr, dx_t);
+            CUDA_CHECK_KERNEL_RET();
+            kAddInplace<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(hb_size, dh_cur.ptr, dh_prev_tmp.ptr);
+            CUDA_CHECK_KERNEL_RET();
+        }
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Update(float lr, float c1, float c2, float wd, float clip,
+        cudaStream_t stream_h) override
+    {
+        if (!is_valid || !stream_h) return MQL_FALSE;
+        const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = 3 * hidden_size;
+        int nW = concat_dim * gate_dim;
+        kAdamW<<<toU32((nW + 255) / 256), 256, 0, stream_h>>>(nW, W.ptr, mW.ptr, vW.ptr, dW.ptr, lr, b1, b2, eps, wd, c1, c2, clip);
+        CUDA_CHECK_KERNEL_RET();
+        kAdamW<<<toU32((gate_dim + 255) / 256), 256, 0, stream_h>>>(gate_dim, b.ptr, mb.ptr, vb.ptr, db.ptr, lr, b1, b2, eps, 0.0f, c1, c2, clip);
+        CUDA_CHECK_KERNEL_RET();
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL SaveBest() override {
+        if (!is_valid) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = 3 * hidden_size;
+        size_t wSize = (size_t)concat_dim * gate_dim;
+        if (!W_best.alloc(wSize) || !b_best.alloc(gate_dim)) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaMemcpy(W_best.ptr, W.ptr, wSize * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RET(cudaMemcpy(b_best.ptr, b.ptr, gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        has_snapshot = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL RestoreBest() override {
+        if (!is_valid || !has_snapshot) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = 3 * hidden_size;
+        CUDA_CHECK_RET(cudaMemcpy(W.ptr, W_best.ptr, (size_t)concat_dim * gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RET(cudaMemcpy(b.ptr, b_best.ptr, gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        return MQL_TRUE;
+    }
 };
 
 struct RNNLayer : public LSTMLayer {
     SequenceLayerType GetType() const override { return SequenceLayerType::RNN; }
+
+    MQL_BOOL Init(int in_sz, int hid_sz, float drop_rate = 0.0f) override {
+        if (!LSTMLayer::Init(in_sz, hid_sz, drop_rate)) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = hidden_size;
+        size_t w_size = (size_t)concat_dim * gate_dim;
+        W.free(); b.free(); mW.free(); vW.free(); mb.free(); vb.free();
+        if (!W.alloc(w_size) || !b.alloc(gate_dim)) return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero()) return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero()) return MQL_FALSE;
+        if (!mb.alloc(gate_dim) || !mb.zero()) return MQL_FALSE;
+        if (!vb.alloc(gate_dim) || !vb.zero()) return MQL_FALSE;
+        std::vector<float> hW(w_size);
+        std::mt19937 gen(std::random_device{}());
+        float stddev = sqrtf(2.0f / (float)(concat_dim + gate_dim));
+        std::normal_distribution<float> dist(0.0f, stddev);
+        for (float& w : hW) w = dist(gen);
+        CUDA_CHECK_RET(cudaMemcpy(W.ptr, hW.data(), w_size * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK_RET(cudaMemset(b.ptr, 0, gate_dim * sizeof(float)));
+        is_valid = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) override {
+        FreeAll();
+        input_size = in_sz;
+        hidden_size = hid_sz;
+        use_dropout = (drop_rate > 0.0f);
+        dropout_rate = drop_rate;
+        if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = hidden_size;
+        size_t w_size = (size_t)concat_dim * gate_dim;
+        if (!W.alloc(w_size) || !b.alloc(gate_dim)) return MQL_FALSE;
+        if (!mW.alloc(w_size) || !mW.zero()) return MQL_FALSE;
+        if (!vW.alloc(w_size) || !vW.zero()) return MQL_FALSE;
+        if (!mb.alloc(gate_dim) || !mb.zero()) return MQL_FALSE;
+        if (!vb.alloc(gate_dim) || !vb.zero()) return MQL_FALSE;
+        is_valid = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* x_seq, int seq_len, int batch, bool training,
+        curandGenerator_t curand_gen) override
+    {
+        if (!is_valid || !blas_h || !stream_h || !x_seq) return MQL_FALSE;
+        int H = hidden_size, I = input_size;
+        int concat_dim = I + H, gate_dim = H;
+        size_t hb_size = (size_t)H * batch;
+        h_cache.resize(seq_len); hx_cache.resize(seq_len);
+        if (!h_init.alloc(hb_size) || !h_init.zero()) return MQL_FALSE;
+        for (int t = 0; t < seq_len; t++) {
+            if (!h_cache[t].alloc(hb_size)) return MQL_FALSE;
+            if (!hx_cache[t].alloc((size_t)concat_dim * batch)) return MQL_FALSE;
+            const float* h_prev = (t == 0) ? h_init.ptr : h_cache[t - 1].ptr;
+            const float* x_t = x_seq + (size_t)t * batch * I;
+            kConcatHX<<<toU32(((size_t)concat_dim * batch + 255) / 256), 256, 0, stream_h>>>(H, I, batch, h_prev, x_t, hx_cache[t].ptr);
+            CUDA_CHECK_KERNEL_RET();
+            GPUMemory<float> preact;
+            if (!preact.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
+            float alpha = 1.0f, beta_zero = 0.0f;
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_T, CUBLAS_OP_N, gate_dim, batch, concat_dim,
+                &alpha, W.ptr, concat_dim, hx_cache[t].ptr, concat_dim, &beta_zero, preact.ptr, gate_dim));
+            dim3 th(16,16), bl(toU32((batch + 15) / 16), toU32((gate_dim + 15) / 16));
+            kAddBiasInplace<<<bl, th, 0, stream_h>>>(gate_dim, batch, preact.ptr, b.ptr);
+            CUDA_CHECK_KERNEL_RET();
+            kRNNForward<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(H, batch, preact.ptr, h_cache[t].ptr);
+            CUDA_CHECK_KERNEL_RET();
+        }
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
+        const float* dh_last, const float* dh_above_seq,
+        int seq_len, int batch, const float* ones_ptr) override
+    {
+        if (!is_valid || !blas_h || !stream_h) return MQL_FALSE;
+        int H = hidden_size, I = input_size;
+        int concat_dim = I + H, gate_dim = H;
+        size_t hb_size = (size_t)H * batch;
+        if (!dW.alloc((size_t)concat_dim * gate_dim) || !dW.zero()) return MQL_FALSE;
+        if (!db.alloc(gate_dim) || !db.zero()) return MQL_FALSE;
+        if (!dx_buf.alloc((size_t)seq_len * batch * I)) return MQL_FALSE;
+        GPUMemory<float> dh_cur, dhx, dpreact;
+        if (!dh_cur.alloc(hb_size) || !dhx.alloc((size_t)concat_dim * batch) || !dpreact.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
+        if (dh_last) CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_last, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
+        else if (!dh_cur.zero()) return MQL_FALSE;
+        float alpha = 1.0f, beta_zero = 0.0f, beta_one = 1.0f;
+        for (int t = seq_len - 1; t >= 0; --t) {
+            if (dh_above_seq) {
+                const float* dh_top_t = dh_above_seq + (size_t)t * batch * H;
+                kAddInplace<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(hb_size, dh_cur.ptr, dh_top_t);
+                CUDA_CHECK_KERNEL_RET();
+            }
+            kRNNBackward<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(H, batch, dh_cur.ptr, h_cache[t].ptr, dpreact.ptr);
+            CUDA_CHECK_KERNEL_RET();
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_T, concat_dim, gate_dim, batch,
+                &alpha, hx_cache[t].ptr, concat_dim, dpreact.ptr, gate_dim, &beta_one, dW.ptr, concat_dim));
+            CUBLAS_CHECK_RET(cublasSgemv(blas_h, CUBLAS_OP_N, gate_dim, batch,
+                &alpha, dpreact.ptr, gate_dim, ones_ptr, 1, &beta_one, db.ptr, 1));
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N, concat_dim, batch, gate_dim,
+                &alpha, W.ptr, concat_dim, dpreact.ptr, gate_dim, &beta_zero, dhx.ptr, concat_dim));
+            float* dx_t = dx_buf.ptr + (size_t)t * batch * I;
+            kSplitDHX<<<toU32(((size_t)concat_dim * batch + 255) / 256), 256, 0, stream_h>>>(H, I, batch, dhx.ptr, dh_cur.ptr, dx_t);
+            CUDA_CHECK_KERNEL_RET();
+        }
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL Update(float lr, float c1, float c2, float wd, float clip,
+        cudaStream_t stream_h) override
+    {
+        if (!is_valid || !stream_h) return MQL_FALSE;
+        const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = hidden_size;
+        int nW = concat_dim * gate_dim;
+        kAdamW<<<toU32((nW + 255) / 256), 256, 0, stream_h>>>(nW, W.ptr, mW.ptr, vW.ptr, dW.ptr, lr, b1, b2, eps, wd, c1, c2, clip);
+        CUDA_CHECK_KERNEL_RET();
+        kAdamW<<<toU32((gate_dim + 255) / 256), 256, 0, stream_h>>>(gate_dim, b.ptr, mb.ptr, vb.ptr, db.ptr, lr, b1, b2, eps, 0.0f, c1, c2, clip);
+        CUDA_CHECK_KERNEL_RET();
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL SaveBest() override {
+        if (!is_valid) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = hidden_size;
+        size_t wSize = (size_t)concat_dim * gate_dim;
+        if (!W_best.alloc(wSize) || !b_best.alloc(gate_dim)) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaMemcpy(W_best.ptr, W.ptr, wSize * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RET(cudaMemcpy(b_best.ptr, b.ptr, gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        has_snapshot = true;
+        return MQL_TRUE;
+    }
+
+    MQL_BOOL RestoreBest() override {
+        if (!is_valid || !has_snapshot) return MQL_FALSE;
+        int concat_dim = input_size + hidden_size;
+        int gate_dim = hidden_size;
+        CUDA_CHECK_RET(cudaMemcpy(W.ptr, W_best.ptr, (size_t)concat_dim * gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK_RET(cudaMemcpy(b.ptr, b_best.ptr, gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
+        return MQL_TRUE;
+    }
 };
 
 // ============================================================================
