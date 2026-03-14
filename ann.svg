@@ -17,7 +17,7 @@
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
         font-size="28"
         font-weight="700"
-        fill="#79c0ff">
+        fill="#ff69b4">
     Aničce,
   </text>
 
@@ -25,7 +25,7 @@
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
         font-size="24"
         fill="#c9d1d9">
-    děkuji za tichou noční podporu,
+    děkuji za noční podporu,
   </text>
 
   <text x="52" y="120"
@@ -39,6 +39,6 @@
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
         font-size="24"
         fill="#c9d1d9">
-    ve chvílích, kdy byl kód zbytečně složitý. 💙
+    ve chvílích, kdy byl kód zbytečně složitý (chtělo to méně myslet). 💙
   </text>
 </svg>
