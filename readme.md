@@ -6,6 +6,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![CUDA](https://img.shields.io/badge/CUDA-Enabled-brightgreen.svg)
 ![MT5](https://img.shields.io/badge/MetaTrader%205-DLL%20API-blue.svg)
+![LSTM](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/blob/master/LSTM.gif)
 
 ---
 
