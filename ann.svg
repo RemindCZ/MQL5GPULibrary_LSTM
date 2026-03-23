@@ -13,31 +13,31 @@
   <rect x="0" y="0" width="920" height="170" rx="18" fill="url(#bg)"/>
   <rect x="24" y="24" width="6" height="122" rx="3" fill="url(#line)"/>
 
-  <text x="52" y="52"
+  <text x="52" y="44"
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
-        font-size="28"
+        font-size="18"
         font-weight="700"
         fill="#ff69b4">
     Aničce,
   </text>
 
-  <text x="52" y="88"
+  <text x="52" y="68"
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
-        font-size="24"
+        font-size="15"
         fill="#c9d1d9">
     děkuji za noční podporu,
   </text>
 
-  <text x="52" y="120"
+  <text x="52" y="88"
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
-        font-size="24"
+        font-size="15"
         fill="#c9d1d9">
     trpělivost a blízkost
   </text>
 
-  <text x="52" y="152"
+  <text x="52" y="108"
         font-family="Segoe UI, Arial, Helvetica, sans-serif"
-        font-size="24"
+        font-size="15"
         fill="#c9d1d9">
     ve chvílích, kdy byl kód zbytečně složitý (chtělo to méně myslet). 💙
   </text>
