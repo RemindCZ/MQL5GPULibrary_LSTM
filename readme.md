@@ -12,7 +12,7 @@
 
 ## 1. Executive Summary
 
-`MQL5GPULibrary_LSTM` is a hybrid quantitative-engineering project that exposes a CUDA-backed recurrent neural network runtime (LSTM-centric, with additional RNN/GRU layer support) to **MetaTrader 5** through a DLL API designed for low-latency practical use.
+`MQL5GPULibrary_LSTM` is a hybrid quantitative-engineering project that exposes a CUDA-backed recurrent neural network runtime focused on **pure multi-layer LSTM** to **MetaTrader 5** through a DLL API designed for low-latency practical use.
 
 The project solves a common integration bottleneck in algorithmic trading systems:
 
@@ -22,7 +22,7 @@ The project solves a common integration bottleneck in algorithmic trading system
 This repository bridges those worlds with:
 
 1. **Handle-based model lifecycle management** (`DN_Create`, `DN_Free`),
-2. **Flexible network construction** (`DN_AddLayerEx`, `DN_AddGRULayer`, `DN_AddRNNLayer`),
+2. **Flexible LSTM stack construction** (`DN_AddLayerEx` with activation, layer norm switch, and dropout),
 3. **Synchronous and asynchronous training** (`DN_Train`, `DN_TrainAsync`),
 4. **Detailed progress telemetry** (`DN_GetProgress*`, `DN_GetProgressAll`),
 5. **State persistence and rollback tools** (`DN_SaveState`, `DN_GetState`, `DN_LoadState`, snapshots),
@@ -71,8 +71,6 @@ void DN_Free(int h);
 MQL_BOOL DN_SetSequenceLength(int h, int seq_len);
 MQL_BOOL DN_SetMiniBatchSize(int h, int mbs);
 MQL_BOOL DN_AddLayerEx(int h, int in, int out, int act, int ln, double drop);
-MQL_BOOL DN_AddGRULayer(int h, int in, int out, double drop);
-MQL_BOOL DN_AddRNNLayer(int h, int in, int out, double drop);
 MQL_BOOL DN_SetGradClip(int h, double clip);
 MQL_BOOL DN_SetOutputDim(int h, int out_dim);
 ```
@@ -335,7 +333,7 @@ This project is distributed under the **MIT License**. See `LICENSE.txt` for the
 
 ## 1. Shrnutí projektu
 
-`MQL5GPULibrary_LSTM` je hybridní kvantitativně-inženýrský projekt, který zpřístupňuje CUDA-akcelerovaný běhový modul rekurentních neuronových sítí (s důrazem na LSTM, s dodatečnou podporou vrstev RNN/GRU) platformě **MetaTrader 5** skrze DLL API navržené pro praktické využití s nízkou latencí.
+`MQL5GPULibrary_LSTM` je hybridní kvantitativně-inženýrský projekt, který zpřístupňuje CUDA-akcelerovaný běhový modul rekurentních neuronových sítí zaměřený na **čisté vícevrstvé LSTM** platformě **MetaTrader 5** skrze DLL API navržené pro praktické využití s nízkou latencí.
 
 Projekt řeší běžné integrační úzké místo v systémech algoritmického obchodování:
 
@@ -345,7 +343,7 @@ Projekt řeší běžné integrační úzké místo v systémech algoritmického
 Toto úložiště propojuje oba světy prostřednictvím:
 
 1. **Správy životního cyklu modelu založené na handle** (`DN_Create`, `DN_Free`),
-2. **Flexibilní konstrukce sítě** (`DN_AddLayerEx`, `DN_AddGRULayer`, `DN_AddRNNLayer`),
+2. **Flexibilní konstrukce LSTM zásobníku** (`DN_AddLayerEx` s aktivací, přepínačem layer norm a dropoutem),
 3. **Synchronního i asynchronního tréninku** (`DN_Train`, `DN_TrainAsync`),
 4. **Podrobné telemetrie průběhu** (`DN_GetProgress*`, `DN_GetProgressAll`),
 5. **Nástrojů pro persistenci stavu a návrat k předchozímu stavu** (`DN_SaveState`, `DN_GetState`, `DN_LoadState`, snímky),
@@ -394,8 +392,6 @@ void DN_Free(int h);
 MQL_BOOL DN_SetSequenceLength(int h, int seq_len);
 MQL_BOOL DN_SetMiniBatchSize(int h, int mbs);
 MQL_BOOL DN_AddLayerEx(int h, int in, int out, int act, int ln, double drop);
-MQL_BOOL DN_AddGRULayer(int h, int in, int out, double drop);
-MQL_BOOL DN_AddRNNLayer(int h, int in, int out, double drop);
 MQL_BOOL DN_SetGradClip(int h, double clip);
 MQL_BOOL DN_SetOutputDim(int h, int out_dim);
 ```
