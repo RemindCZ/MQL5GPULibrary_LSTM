@@ -50,6 +50,7 @@
 #include <random>
 #include <numeric>
 #include <thread>
+#include <future>
 #include <limits>
 #include <chrono>
 
@@ -114,6 +115,15 @@ static void SetError(const wchar_t* fmt, ...) {
     if(e!=cudaSuccess){                                               \
         g_last_cuda.store((int)e);                                    \
         SetError(L"[CUDA VOID] %S", cudaGetErrorString(e));          \
+    }                                                                 \
+}while(0)
+
+#define CUDA_CHECK_NEG(x) do{                                         \
+    cudaError_t e=(x);                                                \
+    if(e!=cudaSuccess){                                               \
+        g_last_cuda.store((int)e);                                    \
+        SetError(L"[CUDA] %S", cudaGetErrorString(e));               \
+        return -1.0;                                                  \
     }                                                                 \
 }while(0)
 
@@ -587,8 +597,11 @@ __global__ void kAdamW(int n, float* __restrict__ p,
         float mi = b1 * m[i] + (1.0f - b1) * gi;
         float vi = b2 * v[i] + (1.0f - b2) * (gi * gi);
         m[i] = mi; v[i] = vi;
-        float denom = sqrtf(vi * c2) + eps;
-        float upd = (mi * c1) / denom;
+        float m_hat = mi * c1;              // FIX #8 – numericky stabilnější Adam bias correction
+        float v_hat = vi * c2;
+        v_hat = fminf(v_hat, 1e30f);
+        float denom = sqrtf(v_hat) + eps;
+        float upd = m_hat / denom;
         p[i] -= lr * (upd + wd * p[i]);
     }
 }
@@ -913,7 +926,8 @@ struct LSTMLayer {
         const float* dh_last,
         const float* dh_above_seq,
         int seq_len, int batch,
-        const float* ones_ptr)
+        const float* ones_ptr,
+        bool apply_dropout_on_dh_last)
     {
         if (!is_valid || !blas_h || !stream_h) return MQL_FALSE;
 
@@ -928,9 +942,10 @@ struct LSTMLayer {
         if (!db.alloc(gate_dim) || !db.zeroAsync(stream_h))
             return MQL_FALSE;
 
-        GPUMemory<float> dh_cur, dc_cur, dgates_raw, dhx, dh_prev_tmp;
+        GPUMemory<float> dh_cur, dc_cur, dc_prev, dgates_raw, dhx, dh_prev_tmp;
         if (!dh_cur.alloc(hb_size) || !dh_cur.zeroAsync(stream_h)) return MQL_FALSE;
         if (!dc_cur.alloc(hb_size) || !dc_cur.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!dc_prev.alloc(hb_size) || !dc_prev.zeroAsync(stream_h)) return MQL_FALSE; // FIX #1 – oddělený buffer pro dc_prev_out
         if (!dgates_raw.alloc((size_t)gate_dim * batch))                return MQL_FALSE;
         if (!dhx.alloc((size_t)concat_dim * batch))                     return MQL_FALSE;
         if (!dh_prev_tmp.alloc(hb_size))                                return MQL_FALSE;
@@ -963,6 +978,18 @@ struct LSTMLayer {
                 CUDA_CHECK_KERNEL_RET();
             }
 
+            // FIX #3 – dropout backward na dh_last pouze jednou uvnitř BPTT (t == seq_len-1).
+            if (apply_dropout_on_dh_last && t == seq_len - 1 &&
+                use_dropout && dropout_rate > 0.0f &&
+                t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
+                t < (int)dropout_mask.size() && dropout_mask[t].ptr)
+            {
+                int total_hb = (int)hb_size;
+                kDropoutBackward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+                    total_hb, dh_cur.ptr, dropout_mask[t].ptr, dropout_rate);
+                CUDA_CHECK_KERNEL_RET();
+            }
+
             const float* c_prev = (t == 0) ? c_init.ptr : c_cache[t - 1].ptr;
 
             int total_hb = (int)hb_size;
@@ -972,7 +999,7 @@ struct LSTMLayer {
                 c_prev, c_cache[t].ptr,
                 f_cache[t].ptr, i_cache[t].ptr,
                 g_cache[t].ptr, o_cache[t].ptr,
-                dc_cur.ptr,
+                dc_prev.ptr, // FIX #1 – výstup dc_prev_out nesmí aliasovat dc_next
                 dgates_raw.ptr);
             CUDA_CHECK_KERNEL_RET();
 
@@ -1000,6 +1027,9 @@ struct LSTMLayer {
                 CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_prev_tmp.ptr,
                     hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
             }
+
+            // FIX #1 – swap místo aliasování/kopírování dc.
+            std::swap(dc_cur, dc_prev);
         }
 
         return MQL_TRUE;
@@ -1030,6 +1060,7 @@ struct LSTMLayer {
 
     MQL_BOOL SaveBest() {
         if (!is_valid) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaDeviceSynchronize()); // FIX #6 – dokončit všechny asynchronní operace před snapshotem
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
         size_t wSize = (size_t)concat_dim * gate_dim;
@@ -1042,6 +1073,7 @@ struct LSTMLayer {
 
     MQL_BOOL RestoreBest() {
         if (!is_valid || !has_snapshot) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaDeviceSynchronize()); // FIX #6 – dokončit všechny asynchronní operace před restore
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
         CUDA_CHECK_RET(cudaMemcpy(W.ptr, W_best.ptr, (size_t)concat_dim * gate_dim * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -1164,6 +1196,7 @@ struct OutputLayer {
 
     MQL_BOOL SaveBest() {
         if (!is_valid) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaDeviceSynchronize()); // FIX #6 – dokončit všechny asynchronní operace před snapshotem
         size_t wSize = (size_t)in_dim * out_dim;
         if (!W_best.alloc(wSize) || !b_best.alloc(out_dim)) return MQL_FALSE;
         CUDA_CHECK_RET(cudaMemcpy(W_best.ptr, W.ptr, wSize * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -1174,6 +1207,7 @@ struct OutputLayer {
 
     MQL_BOOL RestoreBest() {
         if (!is_valid || !has_snapshot) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaDeviceSynchronize()); // FIX #6 – dokončit všechny asynchronní operace před restore
         CUDA_CHECK_RET(cudaMemcpy(W.ptr, W_best.ptr, (size_t)in_dim * out_dim * sizeof(float), cudaMemcpyDeviceToDevice));
         CUDA_CHECK_RET(cudaMemcpy(b.ptr, b_best.ptr, out_dim * sizeof(float), cudaMemcpyDeviceToDevice));
         return MQL_TRUE;
@@ -1320,33 +1354,33 @@ class LSTMNet {
             int cur_batch = std::min(eval_batch, batch - start);
             for (int i = 0; i < cur_batch; i++) hidx[i] = start + i;
 
-            CUDA_CHECK_VOID(cudaMemcpyAsync(idx.ptr, hidx.data(),
+            CUDA_CHECK_NEG(cudaMemcpyAsync(idx.ptr, hidx.data(),
                 (size_t)cur_batch * sizeof(int), cudaMemcpyHostToDevice, ctx.stream));
 
             int total_x = cur_batch * seq_len * in_dim;
             kGatherTransposeSeq << <toU32((total_x + 255) / 256), 256, 0, ctx.stream >> > (
                 cur_batch, seq_len, in_dim, idx.ptr, X_full.ptr, X_mb_ts.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #7 – okamžitý návrat při chybě kernel launch
 
             int total_t = cur_batch * out_dim;
             kGatherRows << <toU32((total_t + 255) / 256), 256, 0, ctx.stream >> > (
                 out_dim, cur_batch, T_full.ptr, idx.ptr, T_mb.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #7 – okamžitý návrat při chybě kernel launch
 
             if (!ForwardFull(ctx, X_mb_ts.ptr, seq_len, cur_batch, false, Y_eval.ptr))
                 return -1.0;
 
             int nOut = cur_batch * out_dim;
-            CUDA_CHECK_VOID(cudaMemsetAsync(mse_reduce_buf.ptr, 0, sizeof(float), ctx.stream));
+            CUDA_CHECK_NEG(cudaMemsetAsync(mse_reduce_buf.ptr, 0, sizeof(float), ctx.stream));
 
-            kMSEReduceWarp << <std::min((nOut + 255) / 256, 1024), 256, 0, ctx.stream >> > (
+            kMSEReduceWarp << <toU32(std::min(((size_t)nOut + 255) / 256, (size_t)1024)), 256, 0, ctx.stream >> > (
                 nOut, Y_eval.ptr, T_mb.ptr, mse_reduce_buf.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #4/#7 – bezpečný grid výpočet + okamžitý návrat při chybě
 
             float sum = 0.0f;
-            CUDA_CHECK_VOID(cudaMemcpyAsync(&sum, mse_reduce_buf.ptr,
+            CUDA_CHECK_NEG(cudaMemcpyAsync(&sum, mse_reduce_buf.ptr,
                 sizeof(float), cudaMemcpyDeviceToHost, ctx.stream));
-            CUDA_CHECK_VOID(cudaStreamSynchronize(ctx.stream));
+            CUDA_CHECK_NEG(cudaStreamSynchronize(ctx.stream));
 
             total_mse_sum += (double)sum;
             total_out += nOut;
@@ -1505,23 +1539,7 @@ class LSTMNet {
                 if (!output_layer->Backward(ctx.blas, ctx.stream, dLoss_mb.ptr,
                     h_for_output, dh_buf_mb.ptr, ones.ptr, mb_size))
                     return MQL_FALSE;
-
-                if (used_dropout_on_h) {
-                    size_t hb_size = (size_t)H_last * mb_size;
-                    int total_hb = (int)hb_size;
-                    if (seq_len > 0 &&
-                        (int)last_lstm->dropout_mask_valid.size() >= seq_len &&
-                        last_lstm->dropout_mask_valid[seq_len - 1] &&
-                        (int)last_lstm->dropout_mask.size() >= seq_len &&
-                        last_lstm->dropout_mask[seq_len - 1].ptr)
-                    {
-                        kDropoutBackward << <toU32((total_hb + 255) / 256), 256, 0, ctx.stream >> > (
-                            total_hb, dh_buf_mb.ptr,
-                            last_lstm->dropout_mask[seq_len - 1].ptr,
-                            last_lstm->dropout_rate);
-                        CUDA_CHECK_KERNEL_RET();
-                    }
-                }
+                // FIX #3 – explicitní dropout backward na posledním timestepu je přesunut do LSTMLayer::Backward.
 
                 for (int li = nLayers - 1; li >= 0; li--) {
                     LSTMLayer* layer = lstm_layers[li].get();
@@ -1540,8 +1558,9 @@ class LSTMNet {
                         dh_above = next_layer->dx_buf.ptr;
                     }
 
+                    bool apply_dropout_on_dh_last = (li == nLayers - 1) ? used_dropout_on_h : false; // FIX #3 – jen top layer aplikuje dh_last dropout uvnitř BPTT
                     if (!layer->Backward(ctx.blas, ctx.stream, dh_last_ptr,
-                        dh_above, seq_len, mb_size, ones.ptr))
+                        dh_above, seq_len, mb_size, ones.ptr, apply_dropout_on_dh_last))
                         return MQL_FALSE;
                 }
 
@@ -1554,14 +1573,14 @@ class LSTMNet {
                         LSTMLayer* layer = lstm_layers[li].get();
                         if (layer->dW.ptr && layer->dW.count > 0) {
                             int nDW = (int)layer->dW.count;
-                            kL2NormReduceWarp << <std::min((nDW + 255) / 256, 1024),
+                            kL2NormReduceWarp << <toU32(std::min(((size_t)nDW + 255) / 256, (size_t)1024)),
                                 256, 0, ctx.stream >> > (
                                     nDW, layer->dW.ptr, grad_norm_reduce.ptr);
                             CUDA_CHECK_KERNEL_RET();
                         }
                         if (layer->db.ptr && layer->db.count > 0) {
                             int nDb = (int)layer->db.count;
-                            kL2NormReduceWarp << <std::min((nDb + 255) / 256, 1024),
+                            kL2NormReduceWarp << <toU32(std::min(((size_t)nDb + 255) / 256, (size_t)1024)),
                                 256, 0, ctx.stream >> > (
                                     nDb, layer->db.ptr, grad_norm_reduce.ptr);
                             CUDA_CHECK_KERNEL_RET();
@@ -1570,14 +1589,14 @@ class LSTMNet {
 
                     if (output_layer->dW.ptr && output_layer->dW.count > 0) {
                         int nDW = (int)output_layer->dW.count;
-                        kL2NormReduceWarp << <std::min((nDW + 255) / 256, 1024),
+                        kL2NormReduceWarp << <toU32(std::min(((size_t)nDW + 255) / 256, (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nDW, output_layer->dW.ptr, grad_norm_reduce.ptr);
                         CUDA_CHECK_KERNEL_RET();
                     }
                     if (output_layer->db.ptr && output_layer->db.count > 0) {
                         int nDb = (int)output_layer->db.count;
-                        kL2NormReduceWarp << <std::min((nDb + 255) / 256, 1024),
+                        kL2NormReduceWarp << <toU32(std::min(((size_t)nDb + 255) / 256, (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nDb, output_layer->db.ptr, grad_norm_reduce.ptr);
                         CUDA_CHECK_KERNEL_RET();
@@ -1607,7 +1626,7 @@ class LSTMNet {
                         CUDA_CHECK_RET(cudaMemsetAsync(grad_norm_reduce.ptr,
                             0, sizeof(float), ctx.stream));
                         int nW = (int)output_layer->dW.count;
-                        kL2NormReduceWarp << <std::min((nW + 255) / 256, 1024),
+                        kL2NormReduceWarp << <toU32(std::min(((size_t)nW + 255) / 256, (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nW, output_layer->dW.ptr, grad_norm_reduce.ptr);
                         float gn = 0.0f;
@@ -1746,7 +1765,7 @@ public:
     // ───────────────────────────────────────────────────────────────────
 
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
-        double lr, double wd)
+        double lr, double wd, std::unique_lock<std::shared_mutex>& lk)
     {
         if (m_state.load() == TS_TRAINING) return MQL_FALSE;
 
@@ -1759,9 +1778,13 @@ public:
 
         m_stop_flag.store(false);
         m_state.store(TS_TRAINING);
+        // FIX #2 – handshake mezi volajícím a worker threadem pro garantované převzetí zámku.
+        auto lock_promise = std::make_shared<std::promise<void>>();
+        std::future<void> lock_future = lock_promise->get_future();
 
-        m_worker = std::thread([this, max_epochs, target_mse, lr, wd]() {
+        m_worker = std::thread([this, max_epochs, target_mse, lr, wd, lock_promise]() {
             std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
+            lock_promise->set_value();
 
             GPUContext ctx;
             if (!ctx.Init(0)) {
@@ -1776,6 +1799,9 @@ public:
             excl_lock.unlock();
             m_state.store(result ? TS_COMPLETED : TS_ERROR);
             });
+
+        lk.unlock();     // FIX #2 – uvolnit vnější lock před čekáním, jinak deadlock.
+        lock_future.get();
 
         return MQL_TRUE;
     }
@@ -1915,9 +1941,9 @@ public:
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpT.ptr, T, nT * sizeof(double),
             cudaMemcpyHostToDevice, ctx->stream));
 
-        kCopyD2F_vec4 << <std::min((int)((nX + 1023) / 1024), 4096), 256, 0, ctx->stream >> >
+        kCopyD2F_vec4 << <toU32(std::min((nX + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
             ((int)nX, tmpX.ptr, X_full.ptr);
-        kCopyD2F_vec4 << <std::min((int)((nT + 1023) / 1024), 4096), 256, 0, ctx->stream >> >
+        kCopyD2F_vec4 << <toU32(std::min((nT + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
             ((int)nT, tmpT.ptr, T_full.ptr);
 
         int max_b = std::max(batch, mini_batch_size);
@@ -1934,6 +1960,17 @@ public:
         loaded_samples = batch;
         loaded_in_dim = feature_dim;
         loaded_out_dim = out_dim;
+
+        // FIX #5 – reset Adam momentů při načtení nového batch datasetu.
+        for (auto& l : lstm_layers) {
+            if (!l->mW.zero() || !l->vW.zero() || !l->mb.zero() || !l->vb.zero())
+                return MQL_FALSE;
+        }
+        if (output_layer) {
+            if (!output_layer->mW.zero() || !output_layer->vW.zero() ||
+                !output_layer->mb.zero() || !output_layer->vb.zero())
+                return MQL_FALSE;
+        }
 
         CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
         b1_pow = 1.0f; b2_pow = 1.0f; step = 0;
@@ -1966,7 +2003,7 @@ public:
         if (!X_float.alloc(nX) || !tmpDX.alloc(nX)) return MQL_FALSE;
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpDX.ptr, X, nX * sizeof(double),
             cudaMemcpyHostToDevice, ctx->stream));
-        kCopyD2F_vec4 << <toU32((nX + 1023) / 1024), 256, 0, ctx->stream >> >
+        kCopyD2F_vec4 << <toU32(std::min((nX + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
             ((int)nX, tmpDX.ptr, X_float.ptr);
 
         if (!X_ts.alloc(nX)) return MQL_FALSE;
@@ -1985,7 +2022,7 @@ public:
             return MQL_FALSE;
 
         if (!outDY.alloc(nY)) return MQL_FALSE;
-        kCopyF2D_vec4 << <toU32((nY + 1023) / 1024), 256, 0, ctx->stream >> >
+        kCopyF2D_vec4 << <toU32(std::min((nY + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
             ((int)nY, Y_float.ptr, outDY.ptr);
         CUDA_CHECK_RET(cudaMemcpyAsync(out_Y, outDY.ptr, nY * sizeof(double),
             cudaMemcpyDeviceToHost, ctx->stream));
@@ -2073,17 +2110,21 @@ public:
 // DLL Exports
 // ============================================================================
 static std::map<int, std::shared_ptr<LSTMNet>> g_nets;
-static int        g_id = 1;
+static std::atomic<int> g_id{ 1 }; // FIX #9 – atomický identifikátor pro DN_Create
 static std::mutex g_map_mtx;
 
-static std::shared_ptr<LSTMNet> FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
+enum LockResult { LR_OK, LR_NOT_FOUND, LR_BUSY }; // FIX #10 – explicitní stav lock výsledku
+
+static LockResult FindAndLockExclusive(int h, std::shared_ptr<LSTMNet>& out_net,
+    std::unique_lock<std::shared_mutex>& lk) {
     std::lock_guard<std::mutex> map_lk(g_map_mtx);
     auto it = g_nets.find(h);
-    if (it == g_nets.end()) return nullptr;
+    if (it == g_nets.end()) return LR_NOT_FOUND;
     std::shared_ptr<LSTMNet> net = it->second;
     lk = std::unique_lock<std::shared_mutex>(net->net_mtx, std::try_to_lock);
-    if (!lk.owns_lock()) return nullptr;
-    return net;
+    if (!lk.owns_lock()) return LR_BUSY;
+    out_net = net;
+    return LR_OK;
 }
 
 static std::shared_ptr<LSTMNet> FindNetNoLock(int h) {
@@ -2093,6 +2134,20 @@ static std::shared_ptr<LSTMNet> FindNetNoLock(int h) {
     return it->second;
 }
 
+static MQL_BOOL AcquireNetExclusiveOrSetError(int h, std::shared_ptr<LSTMNet>& net,
+    std::unique_lock<std::shared_mutex>& lk) {
+    LockResult lr = FindAndLockExclusive(h, net, lk);
+    if (lr == LR_NOT_FOUND) {
+        SetError(L"Network %d not found", h); // FIX #10 – rozlišení not found
+        return MQL_FALSE;
+    }
+    if (lr == LR_BUSY) {
+        SetError(L"Network %d is busy (training in progress)", h); // FIX #10 – rozlišení busy
+        return MQL_FALSE;
+    }
+    return MQL_TRUE;
+}
+
 static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n) {
     if (!buf || n <= 0) return 0.0;
 
@@ -2100,7 +2155,7 @@ static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n
     if (!reduce.alloc(1)) return 0.0;
 
     CUDA_CHECK_VOID(cudaMemsetAsync(reduce.ptr, 0, sizeof(float), stream_h));
-    kL2NormReduceWarp << <std::min((n + 255) / 256, 1024), 256, 0, stream_h >> > (
+    kL2NormReduceWarp << <toU32(std::min(((size_t)n + 255) / 256, (size_t)1024)), 256, 0, stream_h >> > ( // FIX #4 – size_t výpočet grid dim bez overflow
         n, buf, reduce.ptr);
     CUDA_CHECK_VOID(cudaGetLastError());
 
@@ -2116,7 +2171,8 @@ DLL_EXPORT int DLL_CALL DN_Create() {
     auto net = std::make_shared<LSTMNet>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
-    int id = g_id++;
+    int id = g_id.fetch_add(1); // FIX #9 – atomické inkrementování
+    if (id <= 0) return 0;      // FIX #9 – ochrana proti overflow do záporných hodnot
     g_nets[id] = net;
     return id;
 }
@@ -2142,23 +2198,23 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
     double* out_mse, int* out_epochs)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     return net->TrainSync_Locked(epochs, target_mse, lr, wd, out_mse, out_epochs);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     net->SetSequenceLength(seq_len);
     return MQL_TRUE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetMiniBatchSize(int h, int mbs) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     net->SetMiniBatchSize(mbs);
     return MQL_TRUE;
 }
@@ -2167,22 +2223,23 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_AddLayerEx(int h, int in, int out, int act,
     int ln, double drop)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->AddLayer(in, out, act, ln, (float)drop) : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->AddLayer(in, out, act, ln, (float)drop);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     net->SetGradClip((float)clip);
     return MQL_TRUE;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     return net->SetOutputLayer(out_dim);
 }
 
@@ -2190,28 +2247,32 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
     const double* T, int batch, int in, int out, int l)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->LoadBatch(X, T, batch, in, out, l) : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->LoadBatch(X, T, batch, in, out, l);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_PredictBatch(int h, const double* X,
     int batch, int in, int l, double* Y)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->PredictBatch(X, batch, in, l, Y) : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->PredictBatch(X, batch, in, l, Y);
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_SnapshotWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->SnapshotWeights() : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->SnapshotWeights();
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_RestoreWeights(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->RestoreWeights() : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->RestoreWeights();
 }
 
 // --- Async exports ---
@@ -2220,9 +2281,9 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     double target_mse, double lr, double wd)
 {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
-    MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd, lk);
     return result;
 }
 
@@ -2339,34 +2400,37 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
 
 DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return 0;
     return net ? net->GetLayerCount() : 0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return 0.0;
     return net ? (double)net->GetLayerWeightNorm(l) : 0.0;
 }
 
 DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return 0.0;
     return net ? (double)net->GetGradNorm() : 0.0;
 }
 
 DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return 0;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return 0;
     if (!net->Save(net->serialize_buf)) return 0;
     return (int)net->serialize_buf.size() + 1;
 }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    if (!net) return MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
     const auto& s = net->serialize_buf;
     if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
     int copy_len = std::min((int)s.size(), max_len - 1);
@@ -2377,8 +2441,9 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadState(int h, const char* buf) {
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<LSTMNet> net = FindAndLockExclusive(h, lk);
-    return net ? net->Load(buf) : MQL_FALSE;
+    std::shared_ptr<LSTMNet> net;
+    if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    return net->Load(buf);
 }
 
 DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
@@ -2389,5 +2454,17 @@ DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
         buf[i] = (short)g_last_err_w[(size_t)i];
     buf[copy_len] = 0;
 }
+
+// FIX SUMMARY:
+// FIX #1  – Opraveno aliasování dc_cur/dc_prev_out v LSTMLayer::Backward přes dc_prev buffer + std::swap.
+// FIX #2  – Přidán promise/future handshake v StartTrainingAsync_Locked pro bezpečné předání exkluzivního locku workeru.
+// FIX #3  – Odstraněn dvojitý dropout backward na posledním timestepu; aplikace přesunuta do LSTMLayer::Backward.
+// FIX #4  – Výpočty grid dim sjednoceny na size_t + toU32 na všech relevantních launch místech.
+// FIX #5  – V LoadBatch resetovány Adam momenty (mW/vW/mb/vb) všech LSTM vrstev i output vrstvy.
+// FIX #6  – V SaveBest/RestoreBest přidán cudaDeviceSynchronize pro konzistentní snapshot/restore vah.
+// FIX #7  – ComputeFullTrainMSE používá CUDA_CHECK_NEG a okamžitě vrací -1.0 při CUDA chybě/launch error.
+// FIX #8  – Stabilizován Adam update (m_hat/v_hat, clamp v_hat, bezpečnější sqrtf).
+// FIX #9  – g_id změněno na std::atomic<int> s fetch_add + kontrolou overflow v DN_Create.
+// FIX #10 – FindAndLockExclusive vrací LR_OK/LR_NOT_FOUND/LR_BUSY + přesnější chybové hlášky v exportech.
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
