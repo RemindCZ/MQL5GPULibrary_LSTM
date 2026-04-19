@@ -981,8 +981,10 @@ struct LSTMLayer {
             // FIX #3 – dropout backward na dh_last pouze jednou uvnitř BPTT (t == seq_len-1).
             if (apply_dropout_on_dh_last && t == seq_len - 1 &&
                 use_dropout && dropout_rate > 0.0f &&
-                t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
-                t < (int)dropout_mask.size() && dropout_mask[t].ptr)
+                t < (int)dropout_mask_valid.size() && // HOTFIX #A
+                t < (int)dropout_mask.size() &&       // HOTFIX #A
+                dropout_mask_valid[t] &&
+                dropout_mask[t].ptr)
             {
                 int total_hb = (int)hb_size;
                 kDropoutBackward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
@@ -1765,7 +1767,7 @@ public:
     // ───────────────────────────────────────────────────────────────────
 
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
-        double lr, double wd, std::unique_lock<std::shared_mutex>& lk)
+        double lr, double wd, std::future<void>& out_lock_future)
     {
         if (m_state.load() == TS_TRAINING) return MQL_FALSE;
 
@@ -1780,7 +1782,7 @@ public:
         m_state.store(TS_TRAINING);
         // FIX #2 – handshake mezi volajícím a worker threadem pro garantované převzetí zámku.
         auto lock_promise = std::make_shared<std::promise<void>>();
-        std::future<void> lock_future = lock_promise->get_future();
+        out_lock_future = lock_promise->get_future(); // HOTFIX #D
 
         m_worker = std::thread([this, max_epochs, target_mse, lr, wd, lock_promise]() {
             std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
@@ -1799,9 +1801,6 @@ public:
             excl_lock.unlock();
             m_state.store(result ? TS_COMPLETED : TS_ERROR);
             });
-
-        lk.unlock();     // FIX #2 – uvolnit vnější lock před čekáním, jinak deadlock.
-        lock_future.get();
 
         return MQL_TRUE;
     }
@@ -1963,13 +1962,16 @@ public:
 
         // FIX #5 – reset Adam momentů při načtení nového batch datasetu.
         for (auto& l : lstm_layers) {
-            if (!l->mW.zero() || !l->vW.zero() || !l->mb.zero() || !l->vb.zero())
-                return MQL_FALSE;
+            if (!l->mW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!l->vW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!l->mb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!l->vb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
         }
         if (output_layer) {
-            if (!output_layer->mW.zero() || !output_layer->vW.zero() ||
-                !output_layer->mb.zero() || !output_layer->vb.zero())
-                return MQL_FALSE;
+            if (!output_layer->mW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!output_layer->vW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!output_layer->mb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
+            if (!output_layer->vb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
         }
 
         CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
@@ -2110,7 +2112,7 @@ public:
 // DLL Exports
 // ============================================================================
 static std::map<int, std::shared_ptr<LSTMNet>> g_nets;
-static std::atomic<int> g_id{ 1 }; // FIX #9 – atomický identifikátor pro DN_Create
+static std::atomic<unsigned> g_id{ 1u }; // FIX #9 – atomický identifikátor pro DN_Create
 static std::mutex g_map_mtx;
 
 enum LockResult { LR_OK, LR_NOT_FOUND, LR_BUSY }; // FIX #10 – explicitní stav lock výsledku
@@ -2171,8 +2173,13 @@ DLL_EXPORT int DLL_CALL DN_Create() {
     auto net = std::make_shared<LSTMNet>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
-    int id = g_id.fetch_add(1); // FIX #9 – atomické inkrementování
-    if (id <= 0) return 0;      // FIX #9 – ochrana proti overflow do záporných hodnot
+    unsigned uid = g_id.fetch_add(1u); // HOTFIX #C
+    if (uid == 0u ||
+        uid > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+        SetError(L"DN_Create: network handle overflow");
+        return 0;
+    }
+    int id = static_cast<int>(uid);
     g_nets[id] = net;
     return id;
 }
@@ -2283,8 +2290,13 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     std::unique_lock<std::shared_mutex> lk;
     std::shared_ptr<LSTMNet> net;
     if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
-    MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd, lk);
-    return result;
+    std::future<void> lock_future; // HOTFIX #D
+    MQL_BOOL result = net->StartTrainingAsync_Locked(
+        epochs, target_mse, lr, wd, lock_future);
+    if (!result) return MQL_FALSE;
+    lk.unlock(); // HOTFIX #D
+    lock_future.get(); // HOTFIX #D
+    return MQL_TRUE;
 }
 
 DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
@@ -2464,7 +2476,11 @@ DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
 // FIX #6  – V SaveBest/RestoreBest přidán cudaDeviceSynchronize pro konzistentní snapshot/restore vah.
 // FIX #7  – ComputeFullTrainMSE používá CUDA_CHECK_NEG a okamžitě vrací -1.0 při CUDA chybě/launch error.
 // FIX #8  – Stabilizován Adam update (m_hat/v_hat, clamp v_hat, bezpečnější sqrtf).
-// FIX #9  – g_id změněno na std::atomic<int> s fetch_add + kontrolou overflow v DN_Create.
+// FIX #9  – g_id změněno na std::atomic<unsigned> s fetch_add + kontrolou overflow v DN_Create.
 // FIX #10 – FindAndLockExclusive vrací LR_OK/LR_NOT_FOUND/LR_BUSY + přesnější chybové hlášky v exportech.
+// HOTFIX #A – Doplněny bounds checky t < dropout_mask_valid.size() a t < dropout_mask.size() před indexací v LSTMLayer::Backward.
+// HOTFIX #B – V LoadBatch změněn reset Adam momentů z zero() na zeroAsync(ctx->stream) pro správné stream pořadí.
+// HOTFIX #C – g_id převedeno na std::atomic<unsigned> + bezpečná kontrola overflow v DN_Create před castem na int.
+// HOTFIX #D – StartTrainingAsync_Locked už nemanipuluje s externím lockem; handshake future čekání přesunuto do DN_TrainAsync.
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
