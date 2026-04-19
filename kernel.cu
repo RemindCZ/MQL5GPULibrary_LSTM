@@ -1784,23 +1784,44 @@ public:
         auto lock_promise = std::make_shared<std::promise<void>>();
         out_lock_future = lock_promise->get_future(); // HOTFIX #D
 
-        m_worker = std::thread([this, max_epochs, target_mse, lr, wd, lock_promise]() {
-            std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
-            lock_promise->set_value();
+        // HOTFIX #E – ochrana před výjimkou konstruktoru std::thread.
+        // Pokud thread nelze vytvořit (system_error), lock_promise->set_value()
+        // by nikdy neproběhlo a lock_future.get() v DN_TrainAsync by čekal
+        // věčně → DEADLOCK. Catch blok odblokuje čekatele a nastaví chybu.
+        try {
+            m_worker = std::thread([this, max_epochs, target_mse,
+                                    lr, wd, lock_promise]() {
+                std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
+                lock_promise->set_value();
 
-            GPUContext ctx;
-            if (!ctx.Init(0)) {
-                m_state.store(TS_ERROR);
-                return;
-            }
+                GPUContext ctx;
+                if (!ctx.Init(0)) {
+                    m_state.store(TS_ERROR);
+                    return;
+                }
 
-            MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse, lr, wd);
+                MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse,
+                                                lr, wd);
 
-            if (ctx.stream) cudaStreamSynchronize(ctx.stream);
+                if (ctx.stream) cudaStreamSynchronize(ctx.stream);
 
-            excl_lock.unlock();
-            m_state.store(result ? TS_COMPLETED : TS_ERROR);
+                excl_lock.unlock();
+                m_state.store(result ? TS_COMPLETED : TS_ERROR);
             });
+        }
+        catch (const std::system_error& ex) {
+            // HOTFIX #E – thread se nepodařilo vytvořit.
+            // Odblokuj čekatele na lock_future.get() a nastav chybový stav.
+            m_state.store(TS_ERROR);
+            try {
+                lock_promise->set_value();
+            }
+            catch (const std::future_error&) {
+                // promise již má hodnotu – ignoruj
+            }
+            SetError(L"[Async] Failed to create worker thread: %S", ex.what());
+            return MQL_FALSE;
+        }
 
         return MQL_TRUE;
     }
@@ -2482,5 +2503,9 @@ DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
 // HOTFIX #B – V LoadBatch změněn reset Adam momentů z zero() na zeroAsync(ctx->stream) pro správné stream pořadí.
 // HOTFIX #C – g_id převedeno na std::atomic<unsigned> + bezpečná kontrola overflow v DN_Create před castem na int.
 // HOTFIX #D – StartTrainingAsync_Locked už nemanipuluje s externím lockem; handshake future čekání přesunuto do DN_TrainAsync.
+// HOTFIX #E – StartTrainingAsync_Locked: try/catch kolem std::thread
+//             konstruktoru zabraňuje deadlocku při selhání vytvoření
+//             vlákna (std::system_error); catch odblokuje lock_future
+//             a nastaví TS_ERROR.
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
