@@ -856,6 +856,22 @@ public:
     virtual MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) = 0;
     virtual MQL_BOOL Init(int in_sz, int hid_sz, float drop_rate = 0.0f) = 0;
     virtual void FreeAll() = 0;
+protected:
+    void FreeBaseBuffers() {
+        W.free(); b.free();
+        mW.free(); vW.free(); mb.free(); vb.free();
+        dW.free(); db.free();
+        W_best.free(); b_best.free();
+        has_snapshot = false;
+        dropout_rand.free();
+        dx_buf.free();
+        h_init.free(); c_init.free();
+        hx_cache.clear(); f_cache.clear(); i_cache.clear();
+        g_cache.clear(); o_cache.clear(); c_cache.clear(); h_cache.clear();
+        dropout_mask.clear(); dropout_mask_valid.clear(); h_drop_cache.clear();
+        use_dropout = false;
+        dropout_rate = 0.0f;
+    }
 };
 
 // ============================================================================
@@ -871,17 +887,7 @@ struct LSTMLayer : public RecurrentLayer {
     int GetGateDim() const override { return 4 * hidden_size; }
 
     virtual void FreeAll() {
-        W.free(); b.free();
-        mW.free(); vW.free(); mb.free(); vb.free();
-        dW.free(); db.free();
-        W_best.free(); b_best.free();
-        has_snapshot = false;
-        dropout_rand.free();
-        dx_buf.free();
-        h_init.free(); c_init.free();
-        hx_cache.clear(); f_cache.clear(); i_cache.clear();
-        g_cache.clear(); o_cache.clear(); c_cache.clear(); h_cache.clear();
-        dropout_mask.clear(); dropout_mask_valid.clear(); h_drop_cache.clear();
+        FreeBaseBuffers();
         is_valid = false;
     }
 
@@ -1216,15 +1222,13 @@ struct GRULayer : public RecurrentLayer {
     int GetGateDim() const override { return 4 * hidden_size; } // zr(2H)+nx(H)+nh(H)
 
     void FreeAll() {
-        W.free(); b.free(); mW.free(); vW.free(); mb.free(); vb.free(); dW.free(); db.free();
-        W_best.free(); b_best.free();
+        FreeBaseBuffers();
         Wn_x.free(); Wn_h.free(); bn_x.free(); bn_h.free();
         mWn_x.free(); vWn_x.free(); mWn_h.free(); vWn_h.free();
         mbn_x.free(); vbn_x.free(); mbn_h.free(); vbn_h.free();
         dWn_x.free(); dWn_h.free(); dbn_x.free(); dbn_h.free();
         Wn_x_best.free(); Wn_h_best.free(); bn_x_best.free(); bn_h_best.free();
-        h_init.free(); c_init.free(); dx_buf.free();
-        hx_cache.clear(); h_cache.clear(); f_cache.clear(); i_cache.clear(); g_cache.clear(); nh_cache.clear();
+        nh_cache.clear();
         is_valid = false;
     }
 
@@ -1262,6 +1266,14 @@ struct GRULayer : public RecurrentLayer {
     }
 
     MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) override { return Init(in_sz, hid_sz, drop_rate); }
+    const float* GetOutputH(int t, bool training) const override {
+        if (training && use_dropout && dropout_rate > 0.0f &&
+            t >= 0 && t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
+            t < (int)h_drop_cache.size() && h_drop_cache[t].ptr) {
+            return h_drop_cache[t].ptr;
+        }
+        return (t >= 0 && t < (int)h_cache.size()) ? h_cache[t].ptr : nullptr;
+    }
 
     MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
         const float* x_seq, int seq_len, int batch, bool training,
@@ -1444,10 +1456,7 @@ struct RNNLayer : public RecurrentLayer {
     int GetGateDim() const override { return hidden_size; }
 
     void FreeAll() {
-        W.free(); b.free(); mW.free(); vW.free(); mb.free(); vb.free(); dW.free(); db.free();
-        W_best.free(); b_best.free();
-        h_init.free(); dx_buf.free();
-        hx_cache.clear(); h_cache.clear();
+        FreeBaseBuffers();
         is_valid = false;
     }
 
@@ -1476,6 +1485,15 @@ struct RNNLayer : public RecurrentLayer {
     }
 
     MQL_BOOL InitFromData(int in_sz, int hid_sz, float drop_rate = 0.0f) override { return Init(in_sz, hid_sz, drop_rate); }
+    const float* GetOutputH(int t, bool training) const override {
+        if (training && use_dropout && dropout_rate > 0.0f &&
+            t >= 0 && t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
+            t < (int)h_drop_cache.size() && h_drop_cache[t].ptr) {
+            return h_drop_cache[t].ptr;
+        }
+        (void)training;
+        return (t >= 0 && t < (int)h_cache.size()) ? h_cache[t].ptr : nullptr;
+    }
 
     MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
         const float* x_seq, int seq_len, int batch, bool training,
@@ -2389,6 +2407,10 @@ public:
 
     MQL_BOOL AddTypedLayer(SequenceLayerType lt, int in_dim, int hidden_size, float dropout = 0.0f) {
         if (!init_ok) return MQL_FALSE;
+        if (!(dropout >= 0.0f && dropout < 1.0f)) {
+            SetError(L"Invalid drop_rate=%g (expected [0,1))", (double)dropout);
+            return MQL_FALSE;
+        }
         std::unique_ptr<RecurrentLayer> l;
         if (lt == SequenceLayerType::GRU) l = std::make_unique<GRULayer>();
         else if (lt == SequenceLayerType::RNN) l = std::make_unique<RNNLayer>();
@@ -2425,6 +2447,10 @@ public:
     }
 
     MQL_BOOL AddLayer(int in, int out, int act, int use_ln, float dropout) {
+        if (use_ln != 0) {
+            SetError(L"LayerNorm flag ln=%d is not supported in this build; use ln=0", use_ln);
+            return MQL_FALSE;
+        }
         if (act == 1) return AddGRULayer(in, out, dropout);
         if (act == 2) return AddRNNLayer(in, out, dropout);
         return AddLSTMLayer(in, out, dropout);
@@ -2531,6 +2557,11 @@ public:
         int layout, double* out_Y)
     {
         if (!init_ok || !X || !out_Y) return MQL_FALSE;
+        // Explicit layout handling: keep column-major/timestep transform path.
+        if (layout != 0 && layout != 1) {
+            SetError(L"Unsupported layout=%d in PredictBatch (expected 0 or 1)", layout);
+            return MQL_FALSE;
+        }
 
         GPUContext ctx;
         if (!ctx.Init(0)) return MQL_FALSE;
