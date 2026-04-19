@@ -585,7 +585,91 @@ void DN_GetError(short* buf, int len);
 
 ---
 
-## 9. Doporučení pro výkon a stabilitu
+## 9. Rozšíření: ukázky z `LSTM_MTF_Predictor_20percent_Shanon_FIX.mq5`
+
+Níže jsou praktické výřezy přímo z indikátoru `MQL5/Indicators/LSTM_MTF_Predictor_20percent_Shanon_FIX.mq5`, aby bylo v README lépe vidět, jak je knihovna zapojená v reálném MTF + entropy workflow.
+
+### 9.1 DLL bridge + progress API
+
+```mq5
+#import "MQL5GPULibrary_LSTM.dll"
+int DN_Create();
+int DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
+int DN_LoadBatch(int h, const double &X[], const double &T[], int batch, int in_dim, int out_dim, int layout);
+int DN_TrainAsync(int h, int epochs, double target_mse, double lr, double wd);
+int DN_PredictBatch(int h, const double &X[], int batch, int in_dim, int layout, double &Y[]);
+int DN_GetProgressAll(int h, int &epoch, int &total_epochs, int &mb, int &total_mb,
+                      double &lr, double &mse, double &best_mse, double &grad_norm,
+                      double &pct, double &elapsed_sec, double &eta_sec);
+#import
+```
+
+Tahle část ukazuje, že indikátor používá jak asynchronní trénink, tak dávkovou predikci i kompletní telemetrii tréninku.
+
+### 9.2 Train/Test split přes `InpTestPct`
+
+```mq5
+int ComputeTestBoundary(int rates_total)
+  {
+   int minBar = InpPredictAhead + 1;
+   int maxBar = rates_total - 1 - InpLookback;
+   int totalRange = maxBar - minBar + 1;
+   int testCount = (int)MathRound(totalRange * InpTestPct / 100.0);
+   testCount = MathMax(testCount, 1);
+   testCount = MathMin(testCount, totalRange - 1);
+   return minBar + testCount;
+  }
+```
+
+V praxi to znamená, že OOS (test) oblast je přímo řízená procentem (`InpTestPct`, default 20 %), nikoliv pevným počtem barů.
+
+### 9.3 Inicializace indikátoru + načtení uloženého modelu
+
+```mq5
+if(!InitNetwork())
+  {
+   Print("FATAL: Network init failed. GPU asi stávkuje.");
+   return INIT_FAILED;
+  }
+
+g_ModelFilePath = BuildModelFileName();
+if(InpSaveModel && FileIsExist(g_ModelFilePath, FILE_COMMON))
+  {
+   if(LoadModel())
+     {
+      g_ModelReady = true;
+      g_LoadedFromFile = true;
+      g_NeedImmediatePredict = true;
+     }
+  }
+```
+
+Tenhle pattern je důležitý pro produkční provoz: při úspěšném loadu se přeskočí cold-start trénink a indikátor jde rovnou do predikce.
+
+### 9.4 Shannon entropy filtr (anti-chaos gating)
+
+```mq5
+input bool InpUseEntropyFilter = true;
+input double InpEntropyChaosLevel = 0.65;
+input double InpEntropyFilterPower = 0.60;
+
+double CalculateShannonEntropyTF(ENUM_TIMEFRAMES tf, int sh, int period, int priceStepPoints)
+  {
+   // ... výpočet pFlat, pUp, pDown
+   double H = 0.0;
+   if(pFlat > 0.0) H -= pFlat * MathLog(pFlat) / LN2_CONST;
+   if(pUp > 0.0)   H -= pUp   * MathLog(pUp)   / LN2_CONST;
+   if(pDown > 0.0) H -= pDown * MathLog(pDown) / LN2_CONST;
+   double Hmax = MathLog(3.0) / LN2_CONST;
+   return (Hmax > 0.0) ? (H / Hmax) : 0.0;
+  }
+```
+
+Entropy vrstva normalizuje míru „chaosu“ trhu do intervalu 0..1 a následně ji používá jako filtr síly/validity signálů.
+
+---
+
+## 10. Doporučení pro výkon a stabilitu
 
 ### Hyperparametry
 
@@ -607,7 +691,7 @@ void DN_GetError(short* buf, int len);
 
 ---
 
-## 10. Mapa úložiště
+## 11. Mapa úložiště
 
 - `kernel.cu` — implementace CUDA DLL, jádro běhového modulu pro trénink a inferenci.
 - `MQL5/Indicators/LSTM_RealTimePredictor.mq5` — primární praktický příklad integrace v MT5.
@@ -618,7 +702,7 @@ void DN_GetError(short* buf, int len);
 
 ---
 
-## 11. Matice řešení problémů
+## 12. Matice řešení problémů
 
 1. **Jakékoli API vrátí selhání (`MQL_FALSE`)**
 → zavolejte `DN_GetError`, okamžitě zalogujte, uveďte kontext (handle, operace, dimenze).
@@ -637,7 +721,7 @@ void DN_GetError(short* buf, int len);
 
 ---
 
-## 12. Licence
+## 13. Licence
 
 Tento projekt je distribuován pod licencí **MIT**. Úplné znění licence naleznete v souboru `LICENSE.txt`.
 
