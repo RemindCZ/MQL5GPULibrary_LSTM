@@ -14,7 +14,7 @@
 #include <Trade/Trade.mqh>
 
 //+------------------------------------------------------------------+
-//| DLL Import – přesné signatury dle dokumentace kernel.cu          |
+//| DLL Import – signatury dle aktuálního exportu MQL5GPULibrary_LSTM |
 //+------------------------------------------------------------------+
 #import "MQL5GPULibrary_LSTM.dll"
    int    DN_Create();
@@ -25,8 +25,8 @@
    int    DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
    int    DN_SetOutputDim(int h, int out_dim);
    int    DN_SetGradClip(int h, double clip);
-   // batch=počet vzorků, in_dim=celkový vstupní rozměr, out_dim=výstupní rozměr, l=seq_len
-   int    DN_PredictBatch(int h, const double &X[], double &Y[], int batch, int in_dim, int out_dim, int l);
+   // DN_PredictBatch: layout=0 => [batch, out_dim] (flat), Y musí mít batch*out_dim prvků
+   int    DN_PredictBatch(int h, const double &X[], int batch, int in_dim, int layout, double &Y[]);
    int    DN_SaveState(int h);
    int    DN_GetState(int h, char &buf[], int max_len);
    int    DN_LoadState(int h, const char &buf[]);
@@ -235,6 +235,12 @@ string GetDLLError()
 double Clamp(double value, double low, double high)
 {
    return MathMax(low, MathMin(high, value));
+}
+
+//--- Kontrola finity čísla (NaN/Inf guard)
+bool IsFinite(const double v)
+{
+   return MathIsValidNumber(v);
 }
 
 //+------------------------------------------------------------------+
@@ -826,29 +832,45 @@ bool ComputePrediction(datetime barTime, PredictionSnapshot &out)
       return false;
    }
 
+   int inDim = InpLookback * FEAT_PER_BAR;
+   if(ArraySize(X) != inDim)
+   {
+      LogMessage(LOG_FAIL, StringFormat("ComputePrediction: neočekávaná velikost X (%d != %d)", ArraySize(X), inDim));
+      return false;
+   }
+
    double Y[];
-   ArrayResize(Y, OUTPUT_DIM);
+   if(ArrayResize(Y, OUTPUT_DIM) != OUTPUT_DIM)
+      return false;
    ArrayInitialize(Y, 0.0);
 
-   // batch=1, in_dim=celkový vstup, out_dim=OUTPUT_DIM, l=InpLookback
-   if(!DN_PredictBatch(g_NetHandle, X, Y, 1, InpLookback * FEAT_PER_BAR, OUTPUT_DIM, InpLookback))
+   // batch=1, layout=0 => Y je flat [batch, OUTPUT_DIM]
+   if(!DN_PredictBatch(g_NetHandle, X, 1, inDim, 0, Y))
    {
       LogMessage(LOG_FAIL, "DN_PredictBatch selhal: " + GetDLLError());
       return false;
    }
 
-   // Normalizace výstupu na pravděpodobnosti (softmax-like)
-   double pBull = Clamp(Y[0], 0.0, 1.0);
-   double pBear = Clamp(Y[1], 0.0, 1.0);
-   double total = pBull + pBear;
-   if(total > 1e-9)
+   if(ArraySize(Y) < OUTPUT_DIM || !IsFinite(Y[0]) || !IsFinite(Y[1]))
    {
-      pBull /= total;
-      pBear /= total;
+      LogMessage(LOG_FAIL, "ComputePrediction: nevalidní výstup Y");
+      return false;
    }
-   else
+
+   // Stabilní softmax z logitů -> pravděpodobnosti
+   double z0 = Y[0];
+   double z1 = Y[1];
+   double zMax = MathMax(z0, z1);
+   double e0 = MathExp(z0 - zMax);
+   double e1 = MathExp(z1 - zMax);
+   double den = e0 + e1;
+
+   double pBull = 0.5;
+   double pBear = 0.5;
+   if(IsFinite(den) && den > 1e-12)
    {
-      pBull = pBear = 0.5;
+      pBull = e0 / den;
+      pBear = e1 / den;
    }
 
    // Entropie na primárním TF
@@ -887,7 +909,8 @@ double GetATRValue()
    double buf[];
    ArraySetAsSeries(buf, true);
    int copied = CopyBuffer(g_ATRHandle, 0, 1, 1, buf);
-   if(copied != 1) return 0.0;
+   if(copied != 1 || ArraySize(buf) < 1 || !IsFinite(buf[0]))
+      return 0.0;
 
    return MathMax(buf[0], _Point * 5.0);
 }
@@ -1015,6 +1038,11 @@ bool BuildOrderPrices(bool isBuy, double &price, double &sl, double &tp, double 
 
    price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(!IsFinite(price) || price <= 0.0)
+   {
+      LogMessage(LOG_FAIL, "Nevalidní cena pro otevření obchodu");
+      return false;
+   }
 
    double slDist = atr * MathMax(0.1, InpATRSLMultiplier);
    double tpDist = (InpRiskRewardRatio > 0.01)
@@ -1035,9 +1063,15 @@ bool BuildOrderPrices(bool isBuy, double &price, double &sl, double &tp, double 
    price    = NormalizeDouble(price, _Digits);
    sl       = NormalizeDouble(sl,    _Digits);
    tp       = NormalizeDouble(tp,    _Digits);
-   slPoints = MathAbs(price - sl) / _Point;
 
-   return (slPoints > 0.0);
+   if(!IsFinite(sl) || !IsFinite(tp) || sl <= 0.0 || tp <= 0.0)
+      return false;
+
+   slPoints = MathAbs(price - sl) / _Point;
+   if(!IsFinite(slPoints) || slPoints <= 0.0)
+      return false;
+
+   return true;
 }
 
 //--- Otevření pokynu dle signálu
@@ -1056,7 +1090,11 @@ bool OpenSignalTrade(int signal, const PredictionSnapshot &p)
       return false;
 
    double lots = ComputeLotByRisk(slPoints);
-   if(lots <= 0.0) return false;
+   if(!IsFinite(lots) || lots <= 0.0)
+   {
+      LogMessage(LOG_FAIL, "Nevalidní lotsize");
+      return false;
+   }
 
    string comment = StringFormat("LSTM_EA pBull=%.1f%% eS=%.2f", p.pBull * 100.0, p.entropySlow);
 
@@ -1068,6 +1106,12 @@ bool OpenSignalTrade(int signal, const PredictionSnapshot &p)
    {
       LogMessage(LOG_FAIL, StringFormat("Pokyn selhal, retcode=%d lastErr=%d",
                                         g_Trade.ResultRetcode(), GetLastError()));
+      return false;
+   }
+
+   if(g_Trade.ResultDeal() == 0 && g_Trade.ResultOrder() == 0)
+   {
+      LogMessage(LOG_FAIL, StringFormat("Pokyn bez deal/order, retcode=%d", g_Trade.ResultRetcode()));
       return false;
    }
 
