@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| LSTM_Pure_MTF_Predictor.mq5 v5.23 |
+//| LSTM_Pure_MTF_Predictor.mq5 v5.90 |
 //| Pure LSTM architecture with Multi-Timeframe (MTF) inputs |
 //| GPU-optimized via MQL5GPULibrary_LSTM.dll |
 //| |
@@ -108,10 +108,18 @@ int DN_GetProgressAll(int h, int &epoch, int &total_epochs, int &mb, int &total_
 #define FEAT_PER_BAR (FEAT_PER_TF * NUM_TFS)
 #define OUTPUT_DIM 2
 #define MODEL_MAGIC 0x4C53544D // Hex pro "LSTM"
-#define MODEL_META_VER 4
+#define MODEL_META_VER 5
 #define LN2_CONST 0.6931471805599453
 #define ARROW_UP 233
 #define ARROW_DOWN 234
+#define MIN_MODEL_STATE_BYTES 64
+
+enum ENUM_LOG_LEVEL
+  {
+   LOG_DBG = 0,
+   LOG_OK,
+   LOG_FAIL
+  };
 
 //+------------------------------------------------------------------+
 //| Vstupní parametry (Inputs) |
@@ -167,6 +175,11 @@ input int InpPredictBatch = 512; // Kolik toho nasypeme GPU najednou (bágl)
 input int InpMaxPredictBars = 2000;
 input int InpPredictAhead = 5; // Na kolik svíček dopředu hádáme
 input bool InpUsePlotShift = true;
+input double InpMinEvalConfidence = 0.10;   // 0..0.49
+input double InpSignalDeadZonePct = 0.0;    // 0..20 kolem 50 %
+input double InpArrowMinConfidence = 0.0;   // 0..0.49
+input double InpProbClampMinPct = 0.0;      // 0..49, 0=vypnuto
+input double InpProbClampMaxPct = 100.0;    // 51..100, 100=vypnuto
 
 input group "=== Display ==="
 input color InpBullColor = clrLime;
@@ -182,6 +195,8 @@ input bool InpAutoRetrain = true;
 input bool InpSaveModel = true;
 input string InpModelPrefix = "REMIND";
 input bool InpVerboseLog = false; // Kdo to má pak číst v terminálu...
+input int InpMinSamplesForAccuracy = 10;
+input bool InpDisableGraduationWhenLowOOS = true;
 
 //+------------------------------------------------------------------+
 //| Stavy tréninku - abychom věděli, co ten model zrovna dělá. |
@@ -208,6 +223,28 @@ struct GradHistoryEntry
    double            mseBefore;
    double            mseAfter;
    datetime          timestamp;
+  };
+
+struct ModelMetaV5
+  {
+   int               magic;
+   int               metaVersion;
+   int               featPerBar;
+   int               outputDim;
+   int               lookback;
+   int               hidden1;
+   int               hidden2;
+   int               hidden3;
+   int               predictAhead;
+   int               tf1;
+   int               tf2;
+   int               tf3;
+   int               entropyFast;
+   int               entropySlow;
+   int               entropyStep;
+   int               gradCount;
+   int               frozenBoundary;
+   int               stateSize;
   };
 
 //+------------------------------------------------------------------+
@@ -343,13 +380,67 @@ int ComputeTestBoundary(int rates_total)
    return minBar + testCount;
   }
 
+void LogMessage(ENUM_LOG_LEVEL lvl, string msg)
+  {
+   if(lvl == LOG_DBG && !InpVerboseLog)
+      return;
+   string pfx = "[DBG] ";
+   if(lvl == LOG_OK)
+      pfx = "[OK] ";
+   else
+      if(lvl == LOG_FAIL)
+         pfx = "[FAIL] ";
+   Print(pfx + msg);
+  }
+
+double ClampProbabilityPct(double pct)
+  {
+   double lo = MathMax(0.0, MathMin(49.0, InpProbClampMinPct));
+   double hi = MathMin(100.0, MathMax(51.0, InpProbClampMaxPct));
+   if(lo >= hi)
+     {
+      lo = 0.0;
+      hi = 100.0;
+     }
+   return MathMax(lo, MathMin(hi, pct));
+  }
+
+bool ValidateBoundary(const int rates_total, const int boundary, const string ctx)
+  {
+   int oosFirst = InpPredictAhead + 1;
+   int trainLast = rates_total - 1 - InpLookback;
+   bool ok = true;
+   if(boundary <= oosFirst || boundary > trainLast)
+      ok = false;
+   if(!ok)
+     {
+      LogMessage(LOG_FAIL, StringFormat("%s: invalid boundary=%d (oosFirst=%d trainLast=%d rates=%d)",
+                                        ctx, boundary, oosFirst, trainLast, rates_total));
+     }
+   return ok;
+  }
+
+bool EnsureRuntimeStateSafe(const string ctx)
+  {
+   if(g_NetHandle <= 0)
+     {
+      LogMessage(LOG_FAIL, ctx + ": neplatný handle sítě.");
+      g_ModelReady = false;
+      g_IsTraining = false;
+      g_PendingGraduation = false;
+      g_TrainPhase = PHASE_IDLE;
+      return false;
+     }
+   return true;
+  }
+
 //+------------------------------------------------------------------+
 //| Inicializace - jdeme na to. Snad se nám ten pískový hrad |
 //| nesesype hned na startu. |
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   Print("=== Pure MTF LSTM v5.23 (reviewed & hardened) ===");
+   LogMessage(LOG_OK, "=== Pure MTF LSTM v5.90 (reviewed & hardened) ===");
 // Náhoda je blbec, tak to zkusíme aspoň trošku zrandomizovat
    MathSrand((int)((long)TimeCurrent() ^ (long)GetTickCount()));
    SetIndexBuffer(0, g_ProbPct, INDICATOR_DATA);
@@ -385,24 +476,24 @@ int OnInit()
 // Křísíme GPU
    if(!InitNetwork())
      {
-      Print("FATAL: Network init failed. GPU asi stávkuje.");
+      LogMessage(LOG_FAIL, "FATAL: Network init failed. GPU asi stávkuje.");
       return INIT_FAILED;
      }
    g_ModelFilePath = BuildModelFileName();
-   Print("Model file: ", g_ModelFilePath);
+   LogMessage(LOG_DBG, "Model file: " + g_ModelFilePath);
    g_LoadedFromFile = false;
    if(InpSaveModel && FileIsExist(g_ModelFilePath, FILE_COMMON))
      {
       if(LoadModel())
         {
-         Print("Model loaded — skippuju učení, jdeme rovnou na věc.");
+         LogMessage(LOG_OK, "Model loaded — skippuju učení, jdeme rovnou na věc.");
          g_ModelReady = true;
          g_LoadedFromFile = true;
          g_NeedImmediatePredict = true;
          g_LastTrainBar = 0;
         }
       else
-         Print("Model load failed — no nic, trénujeme od nuly.");
+         LogMessage(LOG_FAIL, "Model load failed — trénujeme od nuly.");
      }
 // Vynulujeme stavy
    g_LastClosedBarTime = 0;
@@ -733,25 +824,25 @@ bool InitNetwork()
    g_NetHandle = DN_Create();
    if(g_NetHandle == 0)
      {
-      Print("DN_Create fail: ", GetDLLError());
+      LogMessage(LOG_FAIL, "DN_Create fail: " + GetDLLError());
       return false;
      }
    DN_SetSequenceLength(g_NetHandle, InpLookback);
    DN_SetMiniBatchSize(g_NetHandle, InpMiniBatch);
    DN_SetGradClip(g_NetHandle, InpGradClip);
    if(!DN_AddLayerEx(g_NetHandle, FEAT_PER_BAR, InpHiddenSize1, 0, 0, InpDropout))
-     { Print("L1 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+     { LogMessage(LOG_FAIL, "L1 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
    if(!DN_AddLayerEx(g_NetHandle, 0, InpHiddenSize2, 0, 0, InpDropout * 0.5))
-     { Print("L2 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+     { LogMessage(LOG_FAIL, "L2 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
    if(InpHiddenSize3 > 0)
       if(!DN_AddLayerEx(g_NetHandle, 0, InpHiddenSize3, 0, 0, 0.0))
-        { Print("L3 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+        { LogMessage(LOG_FAIL, "L3 fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
    if(!DN_SetOutputDim(g_NetHandle, OUTPUT_DIM))
-     { Print("OutDim fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
+     { LogMessage(LOG_FAIL, "OutDim fail"); DN_Free(g_NetHandle); g_NetHandle = 0; return false; }
    EstimateVRAM();
-   Print(StringFormat("Network: %d->LSTM(%d)->LSTM(%d)%s->%d",
-                      FEAT_PER_BAR, InpHiddenSize1, InpHiddenSize2,
-                      InpHiddenSize3 > 0 ? StringFormat("->LSTM(%d)", InpHiddenSize3) : "", OUTPUT_DIM));
+   LogMessage(LOG_OK, StringFormat("Network: %d->LSTM(%d)->LSTM(%d)%s->%d",
+                                   FEAT_PER_BAR, InpHiddenSize1, InpHiddenSize2,
+                                   InpHiddenSize3 > 0 ? StringFormat("->LSTM(%d)", InpHiddenSize3) : "", OUTPUT_DIM));
    return true;
   }
 
@@ -852,7 +943,7 @@ void UpdateSplitLine(const datetime &time[], int rates_total)
 
    int oosFirst = InpPredictAhead + 1;
    int oosLast  = activeBoundary - 1;
-   int oosCount = oosLast - oosFirst + 1;
+   int oosCount = MathMax(0, oosLast - oosFirst + 1);
    ObjectSetString(chart_id, labelName, OBJPROP_TEXT,
                    StringFormat("OOS [bar %d..%d] (%d bars) | boundary %d | Grad #%d",
                                 oosFirst, oosLast, oosCount,
@@ -883,8 +974,14 @@ int OnCalculate(const int rates_total,
    int minBars = InpLookback + InpPredictAhead + MathMax(100, InpEntropySlowPeriod + 20);
    if(rates_total < minBars)
       return 0; // Málo dat, jdeme na párek.
+   if(!EnsureRuntimeStateSafe("OnCalculate"))
+      return prev_calculated;
    g_TotalBars = rates_total;
    g_TestBoundary = ComputeTestBoundary(rates_total);
+   if(!ValidateBoundary(rates_total, g_TestBoundary, "OnCalculate.ComputeTestBoundary"))
+      g_TestBoundary = MathMax(InpPredictAhead + 2, MathMin(rates_total - 1 - InpLookback, g_TestBoundary));
+   if(g_FrozenTestBoundary > 0 && !ValidateBoundary(rates_total, g_FrozenTestBoundary, "OnCalculate.FrozenBoundary"))
+      g_FrozenTestBoundary = g_TestBoundary;
    CacheRateData(time, high, low, close, rates_total);
    bool newClosedBar = false;
    if(rates_total >= 2)
@@ -1095,6 +1192,11 @@ void CheckAndTriggerGraduation(int rates_total, const datetime &time[], const do
      }
    int activeBoundary = GetActiveBoundary();
    int oosBarCount = activeBoundary - (InpPredictAhead + 1);
+   if(InpDisableGraduationWhenLowOOS && oosBarCount < InpMinOOSSamples * 2)
+     {
+      LogMessage(LOG_DBG, StringFormat("Graduation disabled: OOS coverage příliš nízké (%d bars).", oosBarCount));
+      return;
+     }
    if(oosBarCount < InpMinOOSSamples)
      {
       if(InpVerboseLog)
@@ -1105,8 +1207,8 @@ void CheckAndTriggerGraduation(int rates_total, const datetime &time[], const do
    g_LastOOSAccuracy = oosAcc;
    if(oosAcc >= InpOOSPassThreshold)
      {
-      Print(StringFormat("=== OOS GRADUATION TRIGGERED #%d === accuracy: %.1f%% >= %.1f%% (%d/%d) | boundary: %d",
-                         g_GraduationCount + 1, oosAcc, InpOOSPassThreshold, g_TestCorrect, g_TestTotal, activeBoundary));
+      LogMessage(LOG_OK, StringFormat("=== OOS GRADUATION TRIGGERED #%d === accuracy: %.1f%% >= %.1f%% (%d/%d) | boundary: %d",
+                                      g_GraduationCount + 1, oosAcc, InpOOSPassThreshold, g_TestCorrect, g_TestTotal, activeBoundary));
       g_OOSPassed = true;
       g_PendingGraduation = true;
       g_PreGradBoundary = activeBoundary;
@@ -1117,7 +1219,7 @@ void CheckAndTriggerGraduation(int rates_total, const datetime &time[], const do
         }
       else
         {
-         Print("OOS retrain failed to start — jen posunu hranici a jedeme dál.");
+         LogMessage(LOG_FAIL, "OOS retrain failed to start — jen posunu hranici a jedeme dál.");
          PerformBoundaryGraduation(rates_total);
          g_PendingGraduation = false;
         }
@@ -1134,9 +1236,11 @@ void CheckAndTriggerGraduation(int rates_total, const datetime &time[], const do
 //+------------------------------------------------------------------+
 bool StartOOSRetrain(int rates_total, const datetime &time[], const double &high[], const double &low[], const double &close[])
   {
-   if(g_NetHandle == 0)
+   if(g_NetHandle == 0 || g_IsTraining || !g_ModelReady)
       return false;
    int activeBoundary = GetActiveBoundary();
+   if(!ValidateBoundary(rates_total, activeBoundary, "StartOOSRetrain.ActiveBoundary"))
+      return false;
    int oosMinBar = InpPredictAhead + 1;
    int oosMaxBar = activeBoundary - 1;
    if(oosMaxBar < oosMinBar)
@@ -1145,7 +1249,7 @@ bool StartOOSRetrain(int rates_total, const datetime &time[], const double &high
       return false;
      }
    int candidateCnt = oosMaxBar - oosMinBar + 1;
-   Print(StringFormat("OOS retrain region: bars [%d..%d] = %d bars", oosMinBar, oosMaxBar, candidateCnt));
+   LogMessage(LOG_DBG, StringFormat("OOS retrain region: bars [%d..%d] = %d bars", oosMinBar, oosMaxBar, candidateCnt));
    int candidates[];
    ArrayResize(candidates, candidateCnt);
    for(int i = 0; i < candidateCnt; i++)
@@ -1153,7 +1257,11 @@ bool StartOOSRetrain(int rates_total, const datetime &time[], const double &high
    ShuffleIntArray(candidates, candidateCnt);
    int maxSamples = MathMin(candidateCnt, InpTrainBars);
 // Uložíme zálohu váh, kdyby to dopadlo bledě
-   DN_SnapshotWeights(g_NetHandle);
+   if(!DN_SnapshotWeights(g_NetHandle))
+     {
+      LogMessage(LOG_FAIL, "StartOOSRetrain: snapshot weights selhal.");
+      return false;
+     }
    g_TargetEpochs = InpOOSRetrainEpochs;
    g_CurrentEpochs = 0;
    g_TrainStartTime = TimeCurrent();
@@ -1216,24 +1324,27 @@ bool StartOOSRetrain(int rates_total, const datetime &time[], const double &high
      }
    if(validSamples < 10)
      {
-      Print("StartOOSRetrain: too few valid samples: ", validSamples);
-      DN_RestoreWeights(g_NetHandle);
+      LogMessage(LOG_FAIL, StringFormat("StartOOSRetrain: too few valid samples: %d", validSamples));
+      if(g_ModelReady)
+         DN_RestoreWeights(g_NetHandle);
       return false;
      }
    if(!DN_LoadBatch(g_NetHandle, X, T, maxSamples, inDim, OUTPUT_DIM, 0))
      {
-      Print("OOS LoadBatch fail: ", GetDLLError());
-      DN_RestoreWeights(g_NetHandle);
+      LogMessage(LOG_FAIL, "OOS LoadBatch fail: " + GetDLLError());
+      if(g_ModelReady)
+         DN_RestoreWeights(g_NetHandle);
       return false;
      }
    if(!DN_TrainAsync(g_NetHandle, g_TargetEpochs, InpTargetMSE, InpOOSRetrainLR, InpWeightDecay))
      {
-      Print("OOS TrainAsync fail: ", GetDLLError());
-      DN_RestoreWeights(g_NetHandle);
+      LogMessage(LOG_FAIL, "OOS TrainAsync fail: " + GetDLLError());
+      if(g_ModelReady)
+         DN_RestoreWeights(g_NetHandle);
       return false;
      }
-   Print(StringFormat("OOS Retrain started: %d samples (%d valid) x %d epochs (LR=%.6f) | OOS bars [%d..%d]",
-                      maxSamples, validSamples, g_TargetEpochs, InpOOSRetrainLR, oosMinBar, oosMaxBar));
+   LogMessage(LOG_OK, StringFormat("OOS Retrain started: %d samples (%d valid) x %d epochs (LR=%.6f) | OOS bars [%d..%d]",
+                                   maxSamples, validSamples, g_TargetEpochs, InpOOSRetrainLR, oosMinBar, oosMaxBar));
    return true;
   }
 
@@ -1243,6 +1354,8 @@ bool StartOOSRetrain(int rates_total, const datetime &time[], const double &high
 void PerformBoundaryGraduation(int rates_total)
   {
    int oldBoundary = GetActiveBoundary();
+   if(!ValidateBoundary(rates_total, oldBoundary, "PerformBoundaryGraduation.OldBoundary"))
+      return;
    int oosFirst = InpPredictAhead + 1;
    int oldOOSCount = oldBoundary - oosFirst;
    if(oldOOSCount <= 0)
@@ -1260,6 +1373,11 @@ void PerformBoundaryGraduation(int rates_total)
       newBoundary = oldBoundary - 1;
    if(newBoundary < oosFirst + 1)
       newBoundary = oosFirst + 1;
+   if((newBoundary - oosFirst) < InpMinOOSSamples)
+     {
+      LogMessage(LOG_FAIL, StringFormat("Graduation blocked: nové OOS=%d < min=%d", newBoundary - oosFirst, InpMinOOSSamples));
+      return;
+     }
    int graduatedBars = oldBoundary - newBoundary;
    int newOOSBars = newBoundary - oosFirst;
    GradHistoryEntry entry;
@@ -1287,10 +1405,10 @@ void PerformBoundaryGraduation(int rates_total)
    g_AccuracyTotalEligible = 0;
    g_CoveragePct = 0.0;
    g_OOSPassed = false;
-   Print(StringFormat("=== GRADUATION #%d COMPLETE ===", g_GraduationCount));
-   Print(StringFormat(" boundary: %d -> %d (shifted by %d bars)", oldBoundary, newBoundary, graduatedBars));
-   Print(StringFormat(" graduated %d bars into training | new OOS: %d bars [%d..%d]", graduatedBars, newOOSBars, oosFirst, newBoundary - 1));
-   Print(StringFormat(" OOS accuracy was: %.1f%% (%d/%d)", g_LastOOSAccuracy, g_TestCorrect, g_TestTotal));
+   LogMessage(LOG_OK, StringFormat("=== GRADUATION #%d COMPLETE ===", g_GraduationCount));
+   LogMessage(LOG_OK, StringFormat("boundary: %d -> %d (shifted by %d bars)", oldBoundary, newBoundary, graduatedBars));
+   LogMessage(LOG_OK, StringFormat("graduated %d bars into training | new OOS: %d bars [%d..%d]", graduatedBars, newOOSBars, oosFirst, newBoundary - 1));
+   LogMessage(LOG_OK, StringFormat("OOS accuracy was: %.1f%% (%d/%d)", g_LastOOSAccuracy, g_TestCorrect, g_TestTotal));
   }
 
 //+------------------------------------------------------------------+
@@ -1325,8 +1443,8 @@ void OnTimer()
    // Status 2 = hotovo
    if(st == 2)
    {
-      Print(StringFormat("Training done [%s]: MSE=%.6f ep=%d elapsed=%.1fs",
-                         PhaseToString(g_TrainPhase), mse, ep, g_ProgElapsedSec));
+      LogMessage(LOG_OK, StringFormat("Training done [%s]: MSE=%.6f ep=%d elapsed=%.1fs",
+                                      PhaseToString(g_TrainPhase), mse, ep, g_ProgElapsedSec));
 
       if(mse < g_BestMSE)
       {
@@ -1389,19 +1507,22 @@ void OnTimer()
    }
    else
    {
-      Print("Training error [", PhaseToString(g_TrainPhase), "]: ", GetDLLError());
+      LogMessage(LOG_FAIL, "Training error [" + PhaseToString(g_TrainPhase) + "]: " + GetDLLError());
 
       if(g_TrainPhase == PHASE_OOS_RETRAIN)
       {
-         DN_RestoreWeights(g_NetHandle);
-         Print("OOS retrain failed — weights restored, graduation cancelled");
+         if(g_ModelReady)
+            DN_RestoreWeights(g_NetHandle);
+         LogMessage(LOG_FAIL, "OOS retrain failed — weights restored, graduation cancelled");
          g_PendingGraduation = false;
       }
       else
       {
-         DN_RestoreWeights(g_NetHandle);
+         if(g_ModelReady)
+            DN_RestoreWeights(g_NetHandle);
       }
       g_TrainPhase = PHASE_IDLE;
+      g_ModelReady = (g_NetHandle > 0 && (g_TotalEpochs > 0 || g_LoadedFromFile));
    }
 
    UpdateInfoPanel();
@@ -1456,7 +1577,7 @@ bool StartTraining(int rates_total, const datetime &time[],
                    const double &high[], const double &low[],
                    const double &close[], bool initial)
 {
-   if(g_NetHandle == 0)
+   if(g_NetHandle == 0 || g_IsTraining)
       return false;
 
    g_TargetEpochs  = initial ? InpInitialEpochs : InpRetrainEpochs;
@@ -1479,11 +1600,15 @@ bool StartTraining(int rates_total, const datetime &time[],
    ComputeATRMean(rates_total, close, high, low);
 
    g_TestBoundary = ComputeTestBoundary(rates_total);
+   if(!ValidateBoundary(rates_total, g_TestBoundary, "StartTraining.TestBoundary"))
+      return false;
 
    // OPRAVA: FrozenTestBoundary měníme POUZE při initial train
    // nebo pokud ještě nebyl nastaven — graduace by se jinak smazaly
    if(initial || g_FrozenTestBoundary == 0)
       g_FrozenTestBoundary = g_TestBoundary;
+   if(!ValidateBoundary(rates_total, g_FrozenTestBoundary, "StartTraining.FrozenBoundary"))
+      return false;
 
    if(initial)
    {
@@ -1537,6 +1662,7 @@ bool StartTraining(int rates_total, const datetime &time[],
    double T[];
    ArrayResize(T, maxSamples * OUTPUT_DIM);
    ArrayInitialize(T, 0.0);
+   int validSamples = 0;
 
    for(int s = 0; s < maxSamples; s++)
    {
@@ -1557,22 +1683,29 @@ bool StartTraining(int rates_total, const datetime &time[],
 
       T[s * OUTPUT_DIM + 0] = pBull;
       T[s * OUTPUT_DIM + 1] = 1.0 - pBull;
+      validSamples++;
+   }
+
+   if(validSamples < MathMax(10, InpMiniBatch / 2))
+   {
+      LogMessage(LOG_FAIL, StringFormat("StartTraining: málo validních vzorků %d/%d", validSamples, maxSamples));
+      return false;
    }
 
    if(!DN_LoadBatch(g_NetHandle, X, T, maxSamples, inDim, OUTPUT_DIM, 0))
    {
-      Print("LoadBatch fail: ", GetDLLError());
+      LogMessage(LOG_FAIL, "LoadBatch fail: " + GetDLLError());
       return false;
    }
    if(!DN_TrainAsync(g_NetHandle, g_TargetEpochs, InpTargetMSE,
                      InpLearningRate, InpWeightDecay))
    {
-      Print("TrainAsync fail: ", GetDLLError());
+      LogMessage(LOG_FAIL, "TrainAsync fail: " + GetDLLError());
       return false;
    }
 
    int testBars = g_FrozenTestBoundary - (InpPredictAhead + 1);
-   Print(StringFormat(
+   LogMessage(LOG_OK, StringFormat(
       "Training [%s]: %d samples x %d epochs | TRAIN bars [%d..%d] | TEST bars [%d..%d] (%d bars)",
       initial ? "INITIAL" : "PERIODIC",
       maxSamples, g_TargetEpochs, trainMinBar, trainMaxBar,
@@ -1680,6 +1813,9 @@ void BulkPredictAndEvaluate(int rates_total, const datetime &time[], const doubl
 
          pBull = ApplyEntropyConfidenceFilter(pBull, eSlow);
          pBear = 1.0 - pBull;
+         double pbPct = ClampProbabilityPct(100.0 * pBull);
+         pBull = pbPct / 100.0;
+         pBear = 1.0 - pBull;
 
          if(barIdx == 1)
          {
@@ -1689,12 +1825,13 @@ void BulkPredictAndEvaluate(int rates_total, const datetime &time[], const doubl
          }
 
          if(barIdx <= drawLastPred)
-            g_ProbPct[barIdx] = 100.0 * pBull;
+            g_ProbPct[barIdx] = pbPct;
 
          g_AccuracyTotalEligible++;
 
          double predDir = pBull - pBear;
-         if(MathAbs(predDir) <= 0.1)
+         double minConf = MathMax(0.0, MathMin(0.49, InpMinEvalConfidence));
+         if(MathAbs(predDir) <= minConf)
             continue; // neutrální zóna
 
          int evalBar = barIdx - InpPredictAhead;
@@ -1795,6 +1932,19 @@ void UpdateCrossSignals(int rates_total, const datetime &time[])
       if(MathAbs(diff) < 1e-10)
          continue;
 
+      double dz = MathMax(0.0, MathMin(20.0, InpSignalDeadZonePct));
+      if(dz > 0.0)
+        {
+         double lo = 50.0 - dz;
+         double hi = 50.0 + dz;
+         if((curr >= lo && curr <= hi) || (prev >= lo && prev <= hi))
+            continue;
+        }
+
+      double minArrowConf = MathMax(0.0, MathMin(0.49, InpArrowMinConfidence));
+      if(MathAbs((curr / 100.0) - 0.5) < minArrowConf)
+         continue;
+
       // Entropie filtruje šipky pokud je to žádáno
       if(InpUseEntropyFilter && InpEntropyFilterCrossSignals)
       {
@@ -1850,7 +2000,6 @@ void UpdateCrossSignals(int rates_total, const datetime &time[])
       g_CrossDown70[0] = EMPTY_VALUE;
    }
 
-   ChartRedraw();
 }
 
 //+------------------------------------------------------------------+
@@ -1994,7 +2143,7 @@ string BuildModelFileName()
    string layers = StringFormat("LSTM%dx%d", InpHiddenSize1, InpHiddenSize2);
    if(InpHiddenSize3 > 0)
       layers += "x" + IntegerToString(InpHiddenSize3);
-   return StringFormat("%s_%s_%s-%s-%s_PA%d_L%d_%s_F%dx%d_TB%d_TT%.0f_ENT%d-%d_V523.lstm",
+   return StringFormat("%s_%s_%s-%s-%s_PA%d_L%d_%s_F%dx%d_TB%d_TT%.0f_ENT%d-%d_V590.lstm",
                        InpModelPrefix, sym, tf1, tf2, tf3, InpPredictAhead, InpLookback,
                        layers, FEAT_PER_BAR, OUTPUT_DIM, InpTrainBars, InpTestPct,
                        InpEntropyFastPeriod, InpEntropySlowPeriod);
@@ -2064,7 +2213,7 @@ void CreateInfoPanel()
    // MakeLabel nyní používá ChartID() interně,
    // takže stačí jen zavolat — funguje v hlavním i subokně
    MakeLabel(g_InfoPrefix + "T",
-             "Pure MTF LSTM v5.23 (reviewed)",
+             "Pure MTF LSTM v5.90 (reviewed)",
              15, 35, clrDodgerBlue, 10, true);
 }
 
@@ -2113,13 +2262,13 @@ void UpdateInfoPanel()
    MakeLabel(g_InfoPrefix + "Ep", StringFormat("Epochs: %d | VRAM: ~%.0f MB", g_TotalEpochs, g_EstVRAM_MB), 15, 106, clrSilver, 9, false);
    double trainAcc = (g_TrainTotal > 0) ? (double)g_TrainCorrect / g_TrainTotal * 100.0 : 0.0;
    color trainClr = (trainAcc > 55) ? clrLime : (trainAcc > 50) ? clrYellow : clrOrangeRed;
-   string trainStr = (g_TrainTotal == 0) ? "Train accuracy: --" : StringFormat("Train accuracy: %.1f%% (%d/%d)", trainAcc, g_TrainCorrect, g_TrainTotal);
+   string trainStr = (g_TrainTotal < InpMinSamplesForAccuracy) ? StringFormat("Train accuracy: -- (%d/%d min)", g_TrainTotal, InpMinSamplesForAccuracy) : StringFormat("Train accuracy: %.1f%% (%d/%d)", trainAcc, g_TrainCorrect, g_TrainTotal);
    MakeLabel(g_InfoPrefix + "TrainAcc", trainStr, 15, 123, trainClr, 9, false);
    double testAcc = (g_TestTotal > 0) ? (double)g_TestCorrect / g_TestTotal * 100.0 : 0.0;
    color testClr = (testAcc > 55) ? clrLime : (testAcc > 50) ? clrYellow : clrOrangeRed;
    int activeBoundary = GetActiveBoundary();
    int oosBarCount = activeBoundary - (InpPredictAhead + 1);
-   string testStr = (g_TestTotal == 0) ? StringFormat("OOS accuracy (%d bars): --", oosBarCount) : StringFormat("OOS accuracy: %.1f%% (%d/%d) [%d OOS bars]", testAcc, g_TestCorrect, g_TestTotal, oosBarCount);
+   string testStr = (g_TestTotal < InpMinSamplesForAccuracy) ? StringFormat("OOS accuracy (%d bars): -- (%d/%d min)", oosBarCount, g_TestTotal, InpMinSamplesForAccuracy) : StringFormat("OOS accuracy: %.1f%% (%d/%d) [%d OOS bars]", testAcc, g_TestCorrect, g_TestTotal, oosBarCount);
    MakeLabel(g_InfoPrefix + "TestAcc", testStr, 15, 140, testClr, 9, true);
    MakeLabel(g_InfoPrefix + "Coverage", StringFormat("Coverage: %.1f%% (%d/%d)", g_CoveragePct, g_TrainTotal + g_TestTotal, g_AccuracyTotalEligible), 15, 157, clrLightSteelBlue, 8, false);
    string gradStr;
@@ -2198,7 +2347,6 @@ void UpdateInfoPanel()
      }
    else
       MakeLabel(g_InfoPrefix + "GradWarn", "", 15, 364, clrDarkGray, 7, false);
-   ChartRedraw();
   }
 
 //+------------------------------------------------------------------+
@@ -2494,7 +2642,48 @@ string GetDLLError()
    string s = "";
    for(int i = 0; i < 512 && buf[i] != 0; i++)
       s += ShortToString(buf[i]);
-   return (StringLen(s) == 0) ? "unknown DLL error (prostě se to seklo)" : s;
+  return (StringLen(s) == 0) ? "unknown DLL error (prostě se to seklo)" : s;
+  }
+
+void FillModelMeta(ModelMetaV5 &m, const int stateSize)
+  {
+   m.magic = MODEL_MAGIC;
+   m.metaVersion = MODEL_META_VER;
+   m.featPerBar = FEAT_PER_BAR;
+   m.outputDim = OUTPUT_DIM;
+   m.lookback = InpLookback;
+   m.hidden1 = InpHiddenSize1;
+   m.hidden2 = InpHiddenSize2;
+   m.hidden3 = InpHiddenSize3;
+   m.predictAhead = InpPredictAhead;
+   m.tf1 = (int)InpTF1;
+   m.tf2 = (int)InpTF2;
+   m.tf3 = (int)InpTF3;
+   m.entropyFast = InpEntropyFastPeriod;
+   m.entropySlow = InpEntropySlowPeriod;
+   m.entropyStep = InpEntropyPriceStep;
+   m.gradCount = g_GraduationCount;
+   m.frozenBoundary = g_FrozenTestBoundary;
+   m.stateSize = stateSize;
+  }
+
+bool IsModelMetaCompatible(const ModelMetaV5 &m)
+  {
+   if(m.magic != MODEL_MAGIC || m.metaVersion != MODEL_META_VER)
+      return false;
+   if(m.featPerBar != FEAT_PER_BAR || m.outputDim != OUTPUT_DIM || m.lookback != InpLookback)
+      return false;
+   if(m.hidden1 != InpHiddenSize1 || m.hidden2 != InpHiddenSize2 || m.hidden3 != InpHiddenSize3)
+      return false;
+   if(m.predictAhead != InpPredictAhead)
+      return false;
+   if(m.tf1 != (int)InpTF1 || m.tf2 != (int)InpTF2 || m.tf3 != (int)InpTF3)
+      return false;
+   if(m.entropyFast != InpEntropyFastPeriod || m.entropySlow != InpEntropySlowPeriod || m.entropyStep != InpEntropyPriceStep)
+      return false;
+   if(m.stateSize < MIN_MODEL_STATE_BYTES)
+      return false;
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -2502,7 +2691,7 @@ string GetDLLError()
 //+------------------------------------------------------------------+
 bool SaveModel()
   {
-   if(g_NetHandle == 0 || StringLen(g_ModelFilePath) == 0)
+   if(g_NetHandle == 0 || StringLen(g_ModelFilePath) == 0 || !g_ModelReady)
       return false;
    int stateSize = DN_SaveState(g_NetHandle);
    if(stateSize <= 0)
@@ -2511,17 +2700,32 @@ bool SaveModel()
    ArrayResize(stateBuf, stateSize);
    if(!DN_GetState(g_NetHandle, stateBuf, stateSize))
       return false;
+   ModelMetaV5 meta;
+   FillModelMeta(meta, stateSize);
    int fh = FileOpen(g_ModelFilePath, FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(fh == INVALID_HANDLE)
       return false;
-   FileWriteInteger(fh, MODEL_MAGIC, INT_VALUE);
-   FileWriteInteger(fh, MODEL_META_VER, INT_VALUE);
-   FileWriteInteger(fh, g_FrozenTestBoundary, INT_VALUE);
-   FileWriteInteger(fh, g_GraduationCount, INT_VALUE);
-   FileWriteInteger(fh, stateSize, INT_VALUE);
+   FileWriteInteger(fh, meta.magic, INT_VALUE);
+   FileWriteInteger(fh, meta.metaVersion, INT_VALUE);
+   FileWriteInteger(fh, meta.featPerBar, INT_VALUE);
+   FileWriteInteger(fh, meta.outputDim, INT_VALUE);
+   FileWriteInteger(fh, meta.lookback, INT_VALUE);
+   FileWriteInteger(fh, meta.hidden1, INT_VALUE);
+   FileWriteInteger(fh, meta.hidden2, INT_VALUE);
+   FileWriteInteger(fh, meta.hidden3, INT_VALUE);
+   FileWriteInteger(fh, meta.predictAhead, INT_VALUE);
+   FileWriteInteger(fh, meta.tf1, INT_VALUE);
+   FileWriteInteger(fh, meta.tf2, INT_VALUE);
+   FileWriteInteger(fh, meta.tf3, INT_VALUE);
+   FileWriteInteger(fh, meta.entropyFast, INT_VALUE);
+   FileWriteInteger(fh, meta.entropySlow, INT_VALUE);
+   FileWriteInteger(fh, meta.entropyStep, INT_VALUE);
+   FileWriteInteger(fh, meta.gradCount, INT_VALUE);
+   FileWriteInteger(fh, meta.frozenBoundary, INT_VALUE);
+   FileWriteInteger(fh, meta.stateSize, INT_VALUE);
    FileWriteArray(fh, stateBuf, 0, stateSize);
    FileClose(fh);
-   Print(StringFormat("Model saved (%d bytes) -> %s | boundary=%d | grads=%d", stateSize, g_ModelFilePath, g_FrozenTestBoundary, g_GraduationCount));
+   LogMessage(LOG_OK, StringFormat("Model saved (%d bytes) -> %s | boundary=%d | grads=%d", stateSize, g_ModelFilePath, g_FrozenTestBoundary, g_GraduationCount));
    return true;
   }
 
@@ -2539,43 +2743,45 @@ bool LoadModel()
 
    ulong fs = FileSize(fh);
 
-   // Minimální velikost: 5x INT_VALUE (4 byty) = 20 bytů pro hlavičku
-   if(fs < 20 || fs > 100000000)
+   if(fs < 72 || fs > 100000000)
    {
       FileClose(fh);
-      Print("LoadModel: invalid file size: ", fs);
+      LogMessage(LOG_FAIL, "LoadModel: invalid file size: " + IntegerToString((int)fs));
       return false;
    }
-
-   int magic = FileReadInteger(fh, INT_VALUE);
-   if(magic != MODEL_MAGIC)
-   {
+   ModelMetaV5 meta;
+   meta.magic = FileReadInteger(fh, INT_VALUE);
+   meta.metaVersion = FileReadInteger(fh, INT_VALUE);
+   meta.featPerBar = FileReadInteger(fh, INT_VALUE);
+   meta.outputDim = FileReadInteger(fh, INT_VALUE);
+   meta.lookback = FileReadInteger(fh, INT_VALUE);
+   meta.hidden1 = FileReadInteger(fh, INT_VALUE);
+   meta.hidden2 = FileReadInteger(fh, INT_VALUE);
+   meta.hidden3 = FileReadInteger(fh, INT_VALUE);
+   meta.predictAhead = FileReadInteger(fh, INT_VALUE);
+   meta.tf1 = FileReadInteger(fh, INT_VALUE);
+   meta.tf2 = FileReadInteger(fh, INT_VALUE);
+   meta.tf3 = FileReadInteger(fh, INT_VALUE);
+   meta.entropyFast = FileReadInteger(fh, INT_VALUE);
+   meta.entropySlow = FileReadInteger(fh, INT_VALUE);
+   meta.entropyStep = FileReadInteger(fh, INT_VALUE);
+   meta.gradCount = FileReadInteger(fh, INT_VALUE);
+   meta.frozenBoundary = FileReadInteger(fh, INT_VALUE);
+   meta.stateSize = FileReadInteger(fh, INT_VALUE);
+   if(!IsModelMetaCompatible(meta))
+     {
       FileClose(fh);
-      Print("LoadModel: invalid magic number — tenhle soubor s námi nekamarádí.");
+      LogMessage(LOG_FAIL, "LoadModel: metadata incompatibilní s aktuálním nastavením.");
       return false;
-   }
-
-   int metaVer = FileReadInteger(fh, INT_VALUE);
-   if(metaVer < 3)
-   {
-      FileClose(fh);
-      Print("LoadModel: unsupported meta version: ", metaVer);
-      return false;
-   }
-
-   int boundary  = FileReadInteger(fh, INT_VALUE);
-   int gradCount = FileReadInteger(fh, INT_VALUE);
-   int stateSize = FileReadInteger(fh, INT_VALUE);
-
-   // Ověření: stateSize musí sedět s tím co zbývá v souboru
-   ulong expectedRemaining = fs - 20; // 5 * 4 bytů hlavičky
+     }
+   int stateSize = meta.stateSize;
+   ulong expectedRemaining = fs - 72;
    if(stateSize <= 0 || (ulong)stateSize > expectedRemaining)
-   {
+     {
       FileClose(fh);
-      Print(StringFormat("LoadModel: invalid state size: %d (remaining: %I64u)",
-                         stateSize, expectedRemaining));
+      LogMessage(LOG_FAIL, StringFormat("LoadModel: invalid state size: %d (remaining: %I64u)", stateSize, expectedRemaining));
       return false;
-   }
+     }
 
    char buf[];
    ArrayResize(buf, stateSize + 1);
@@ -2584,7 +2790,7 @@ bool LoadModel()
 
    if(bytesRead != stateSize)
    {
-      Print(StringFormat("LoadModel: read %d bytes, expected %d", bytesRead, stateSize));
+      LogMessage(LOG_FAIL, StringFormat("LoadModel: read %d bytes, expected %d", bytesRead, stateSize));
       return false;
    }
 
@@ -2592,15 +2798,14 @@ bool LoadModel()
 
    if(!DN_LoadState(g_NetHandle, buf))
    {
-      Print("LoadState fail: ", GetDLLError());
+      LogMessage(LOG_FAIL, "LoadState fail: " + GetDLLError());
       return false;
    }
-
-   g_FrozenTestBoundary = boundary;
-   g_GraduationCount    = gradCount;
+   g_FrozenTestBoundary = meta.frozenBoundary;
+   g_GraduationCount = meta.gradCount;
    g_BarsSinceLastGrad  = InpGradCooldownBars;
 
-   Print(StringFormat("Model loaded (%d bytes) <- %s | boundary=%d | grads=%d",
+   LogMessage(LOG_OK, StringFormat("Model loaded (%d bytes) <- %s | boundary=%d | grads=%d",
                       stateSize, g_ModelFilePath,
                       g_FrozenTestBoundary, g_GraduationCount));
    return true;
