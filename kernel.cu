@@ -51,6 +51,7 @@
 #include <numeric>
 #include <thread>
 #include <future>
+#include <exception>
 #include <limits>
 #include <chrono>
 
@@ -178,6 +179,10 @@ struct GPUMemory {
 
     MQL_BOOL alloc(size_t n) {
         if (n == 0) { free(); return MQL_TRUE; }
+        if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            SetError(L"Allocation size overflow");
+            return MQL_FALSE;
+        }
         if (n <= capacity) { count = n; return MQL_TRUE; }
         free();
         void* p = nullptr;
@@ -292,6 +297,10 @@ static inline unsigned toU32(size_t v) {
     return (unsigned)std::min(v, (size_t)std::numeric_limits<unsigned>::max());
 }
 
+static inline size_t CeilDivSize(size_t n, size_t d) {
+    return n / d + (n % d != 0 ? 1 : 0);
+}
+
 // ============================================================================
 // Training Progress Structure (lock-free readable from MQL5)
 // ============================================================================
@@ -354,42 +363,48 @@ __device__ __forceinline__ float warpReduceSumFloat(float v) {
 // ============================================================================
 // CUDA kernels
 // ============================================================================
-__global__ void kCopyD2F_vec4(int n, const double* __restrict__ in,
+__global__ void kCopyD2F_vec4(size_t n, const double* __restrict__ in,
     float* __restrict__ out)
 {
-    int tid = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (tid >= n) return;
-    if (tid + 3 < n) {
-        float4 v;
-        v.x = (float)in[tid];
-        v.y = (float)in[tid + 1];
-        v.z = (float)in[tid + 2];
-        v.w = (float)in[tid + 3];
-        *reinterpret_cast<float4*>(out + tid) = v;
-    }
-    else {
-        out[tid] = (float)in[tid];
-        if (tid + 1 < n) out[tid + 1] = (float)in[tid + 1];
-        if (tid + 2 < n) out[tid + 2] = (float)in[tid + 2];
+    // FIX #4 – size_t index + grid-stride loop; capped grids now copy all elements.
+    size_t tid = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    size_t stride = (size_t)blockDim.x * gridDim.x * 4;
+    for (; tid < n; tid += stride) {
+        if (tid + 3 < n) {
+            float4 v;
+            v.x = (float)in[tid];
+            v.y = (float)in[tid + 1];
+            v.z = (float)in[tid + 2];
+            v.w = (float)in[tid + 3];
+            *reinterpret_cast<float4*>(out + tid) = v;
+        }
+        else {
+            out[tid] = (float)in[tid];
+            if (tid + 1 < n) out[tid + 1] = (float)in[tid + 1];
+            if (tid + 2 < n) out[tid + 2] = (float)in[tid + 2];
+        }
     }
 }
 
-__global__ void kCopyF2D_vec4(int n, const float* __restrict__ in,
+__global__ void kCopyF2D_vec4(size_t n, const float* __restrict__ in,
     double* __restrict__ out)
 {
-    int tid = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (tid >= n) return;
-    if (tid + 3 < n) {
-        float4 v = *reinterpret_cast<const float4*>(in + tid);
-        out[tid] = (double)v.x;
-        out[tid + 1] = (double)v.y;
-        out[tid + 2] = (double)v.z;
-        out[tid + 3] = (double)v.w;
-    }
-    else {
-        out[tid] = (double)in[tid];
-        if (tid + 1 < n) out[tid + 1] = (double)in[tid + 1];
-        if (tid + 2 < n) out[tid + 2] = (double)in[tid + 2];
+    // FIX #4 – size_t index + grid-stride loop; capped grids now copy all elements.
+    size_t tid = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    size_t stride = (size_t)blockDim.x * gridDim.x * 4;
+    for (; tid < n; tid += stride) {
+        if (tid + 3 < n) {
+            float4 v = *reinterpret_cast<const float4*>(in + tid);
+            out[tid] = (double)v.x;
+            out[tid + 1] = (double)v.y;
+            out[tid + 2] = (double)v.z;
+            out[tid + 3] = (double)v.w;
+        }
+        else {
+            out[tid] = (double)in[tid];
+            if (tid + 1 < n) out[tid + 1] = (double)in[tid + 1];
+            if (tid + 2 < n) out[tid + 2] = (double)in[tid + 2];
+        }
     }
 }
 
@@ -408,13 +423,13 @@ __global__ void kLSTMGatesForward(
     float* __restrict__ g_cache,
     float* __restrict__ o_cache)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = hidden_size * batch;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)hidden_size * batch;
     if (idx >= total) return;
 
-    int h = idx % hidden_size;
-    int b = idx / hidden_size;
-    int stride = 4 * hidden_size;
+    size_t h = idx % (size_t)hidden_size;
+    size_t b = idx / (size_t)hidden_size;
+    size_t stride = (size_t)4 * hidden_size;
 
     float f = d_sigmoid(gates_raw[h + 0 * hidden_size + b * stride]);
     float i = d_sigmoid(gates_raw[h + 1 * hidden_size + b * stride]);
@@ -446,12 +461,12 @@ __global__ void kLSTMGatesBackward(
     float* __restrict__ dc_prev_out,
     float* __restrict__ dgates_raw)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = hidden_size * batch;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)hidden_size * batch;
     if (idx >= total) return;
 
-    int h = idx % hidden_size;
-    int b = idx / hidden_size;
+    size_t h = idx % (size_t)hidden_size;
+    size_t b = idx / (size_t)hidden_size;
 
     float o = o_cache[idx];
     float tanh_c = tanhf(c_cur[idx]);
@@ -465,7 +480,7 @@ __global__ void kLSTMGatesBackward(
 
     dc_prev_out[idx] = dc * f;
 
-    int stride = 4 * hidden_size;
+    size_t stride = (size_t)4 * hidden_size;
     dgates_raw[h + 0 * hidden_size + b * stride] = dc * cp * f * (1.0f - f);
     dgates_raw[h + 1 * hidden_size + b * stride] = dc * g * i * (1.0f - i);
     dgates_raw[h + 2 * hidden_size + b * stride] = dc * i * (1.0f - g * g);
@@ -486,18 +501,18 @@ __global__ void kConcatHX(int hidden_size, int input_size, int batch,
     const float* __restrict__ x,
     float* __restrict__ hx)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int concat_dim = hidden_size + input_size;
-    int total = concat_dim * batch;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t concat_dim = (size_t)hidden_size + input_size;
+    size_t total = concat_dim * batch;
     if (idx >= total) return;
 
-    int d = idx % concat_dim;
-    int b = idx / concat_dim;
+    size_t d = idx % concat_dim;
+    size_t b = idx / concat_dim;
 
     if (d < hidden_size)
-        hx[idx] = h_prev[d + b * hidden_size];
+        hx[idx] = h_prev[d + b * (size_t)hidden_size];
     else
-        hx[idx] = x[(d - hidden_size) + b * input_size];
+        hx[idx] = x[(d - hidden_size) + b * (size_t)input_size];
 }
 
 __global__ void kSplitDHX(int hidden_size, int input_size, int batch,
@@ -505,19 +520,19 @@ __global__ void kSplitDHX(int hidden_size, int input_size, int batch,
     float* __restrict__ dh_prev,
     float* __restrict__ dx)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int concat_dim = hidden_size + input_size;
-    int total = concat_dim * batch;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t concat_dim = (size_t)hidden_size + input_size;
+    size_t total = concat_dim * batch;
     if (idx >= total) return;
 
-    int d = idx % concat_dim;
-    int b = idx / concat_dim;
+    size_t d = idx % concat_dim;
+    size_t b = idx / concat_dim;
 
     if (d < hidden_size) {
-        if (dh_prev) dh_prev[d + b * hidden_size] = dhx[idx];
+        if (dh_prev) dh_prev[d + b * (size_t)hidden_size] = dhx[idx];
     }
     else {
-        if (dx) dx[(d - hidden_size) + b * input_size] = dhx[idx];
+        if (dx) dx[(d - hidden_size) + b * (size_t)input_size] = dhx[idx];
     }
 }
 
@@ -530,20 +545,20 @@ __global__ void kBiasLinear(int rows, int cols,
         A[row + col * rows] += bias[row];
 }
 
-__global__ void kMSEGrad(int n, const float* __restrict__ y,
+__global__ void kMSEGrad(size_t n, const float* __restrict__ y,
     const float* __restrict__ t, float* __restrict__ d)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) d[i] = 2.0f * (y[i] - t[i]) / (float)n;
 }
 
-__global__ void kMSEReduceWarp(int n, const float* __restrict__ y,
+__global__ void kMSEReduceWarp(size_t n, const float* __restrict__ y,
     const float* __restrict__ t, float* __restrict__ out_sum)
 {
     float sum = 0.0f;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride_val = blockDim.x * gridDim.x;
-    for (int i = idx; i < n; i += stride_val) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride_val = (size_t)blockDim.x * gridDim.x;
+    for (size_t i = idx; i < n; i += stride_val) {
         float d = y[i] - t[i];
         sum += d * d;
     }
@@ -561,13 +576,13 @@ __global__ void kMSEReduceWarp(int n, const float* __restrict__ y,
     }
 }
 
-__global__ void kL2NormReduceWarp(int n, const float* __restrict__ buf,
+__global__ void kL2NormReduceWarp(size_t n, const float* __restrict__ buf,
     float* __restrict__ out_sum)
 {
     float sum = 0.0f;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride_val = blockDim.x * gridDim.x;
-    for (int i = idx; i < n; i += stride_val) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride_val = (size_t)blockDim.x * gridDim.x;
+    for (size_t i = idx; i < n; i += stride_val) {
         float v = buf[i];
         sum += v * v;
     }
@@ -585,13 +600,13 @@ __global__ void kL2NormReduceWarp(int n, const float* __restrict__ buf,
     }
 }
 
-__global__ void kAdamW(int n, float* __restrict__ p,
+__global__ void kAdamW(size_t n, float* __restrict__ p,
     float* __restrict__ m, float* __restrict__ v,
     const float* __restrict__ g,
     float lr, float b1, float b2, float eps,
     float wd, float c1, float c2, float grad_scale)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float gi = g[i] / grad_scale;
         float mi = b1 * m[i] + (1.0f - b1) * gi;
@@ -606,11 +621,11 @@ __global__ void kAdamW(int n, float* __restrict__ p,
     }
 }
 
-__global__ void kDropoutForward(int n, float* __restrict__ A,
+__global__ void kDropoutForward(size_t n, float* __restrict__ A,
     const float* __restrict__ rand_vals, float drop_rate,
     unsigned char* __restrict__ mask)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         bool keep = (rand_vals[i] >= drop_rate);
         mask[i] = keep ? 1 : 0;
@@ -618,44 +633,44 @@ __global__ void kDropoutForward(int n, float* __restrict__ A,
     }
 }
 
-__global__ void kDropoutBackward(int n, float* __restrict__ dA,
+__global__ void kDropoutBackward(size_t n, float* __restrict__ dA,
     const unsigned char* __restrict__ mask, float drop_rate)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dA[i] = mask[i] ? dA[i] / (1.0f - drop_rate) : 0.0f;
 }
 
 __global__ void kTransposeToTimestep(int batch, int seq_len, int feat,
     const float* __restrict__ src, float* __restrict__ dst)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * seq_len * feat;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)batch * seq_len * feat;
     if (idx >= total) return;
 
-    int f = idx % feat;
-    int rem = idx / feat;
-    int t = rem % seq_len;
-    int b = rem / seq_len;
+    size_t f = idx % (size_t)feat;
+    size_t rem = idx / (size_t)feat;
+    size_t t = rem % (size_t)seq_len;
+    size_t b = rem / (size_t)seq_len;
 
-    dst[f + (t * batch + b) * feat] = src[idx];
+    dst[f + (t * (size_t)batch + b) * feat] = src[idx];
 }
 
 __global__ void kGatherTransposeSeq(int mb_size, int seq_len, int feat,
     const int* __restrict__ indices,
     const float* __restrict__ src, float* __restrict__ dst)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = mb_size * seq_len * feat;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)mb_size * seq_len * feat;
     if (idx >= total) return;
 
-    int f = idx % feat;
-    int rem = idx / feat;
-    int t = rem % seq_len;
-    int local_b = rem / seq_len;
+    size_t f = idx % (size_t)feat;
+    size_t rem = idx / (size_t)feat;
+    size_t t = rem % (size_t)seq_len;
+    size_t local_b = rem / (size_t)seq_len;
 
     int global_b = indices[local_b];
-    int src_idx = global_b * seq_len * feat + t * feat + f;
-    int dst_idx = f + (t * mb_size + local_b) * feat;
+    size_t src_idx = ((size_t)global_b * seq_len + t) * feat + f;
+    size_t dst_idx = f + (t * (size_t)mb_size + local_b) * feat;
     dst[dst_idx] = src[src_idx];
 }
 
@@ -663,22 +678,23 @@ __global__ void kGatherRows(int dim, int batch,
     const float* __restrict__ src, const int* __restrict__ indices,
     float* __restrict__ dst)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int n = dim * batch;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n = (size_t)dim * batch;
     if (idx < n) {
-        int b = idx / dim;
-        int d = idx % dim;
+        size_t b = idx / (size_t)dim;
+        size_t d = idx % (size_t)dim;
         int src_row = indices[b];
-        dst[d + b * dim] = src[d + src_row * dim];
+        dst[d + b * (size_t)dim] = src[d + (size_t)src_row * dim];
     }
 }
 
-__global__ void kMinMaxReduce256(int n, const float* __restrict__ buf,
+__global__ void kMinMaxReduce256(size_t n, const float* __restrict__ buf,
     float* __restrict__ out_min, float* __restrict__ out_max)
 {
     __shared__ float sh_min[256], sh_max[256];
     float lo = 1e30f, hi = -1e30f;
-    for (int i = blockIdx.x * 256 + threadIdx.x; i < n; i += 256 * gridDim.x) {
+    for (size_t i = (size_t)blockIdx.x * 256 + threadIdx.x;
+         i < n; i += (size_t)256 * gridDim.x) {
         float v = buf[i];
         lo = fminf(lo, v); hi = fmaxf(hi, v);
     }
@@ -697,10 +713,10 @@ __global__ void kMinMaxReduce256(int n, const float* __restrict__ buf,
     }
 }
 
-__global__ void kAddInplace(int n, float* __restrict__ dst,
+__global__ void kAddInplace(size_t n, float* __restrict__ dst,
     const float* __restrict__ src)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += src[i];
 }
 
@@ -757,7 +773,10 @@ struct LSTMLayer {
         use_dropout = (drop_rate > 0.0f);
         dropout_rate = std::min(drop_rate, 0.999f);
 
-        if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
+        if (input_size <= 0 || hidden_size <= 0 ||
+            input_size > std::numeric_limits<int>::max() - hidden_size ||
+            hidden_size > std::numeric_limits<int>::max() / 4)
+            return MQL_FALSE;
 
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
@@ -792,7 +811,10 @@ struct LSTMLayer {
         use_dropout = (drop_rate > 0.0f);
         dropout_rate = std::min(drop_rate, 0.999f);
 
-        if (input_size <= 0 || hidden_size <= 0) return MQL_FALSE;
+        if (input_size <= 0 || hidden_size <= 0 ||
+            input_size > std::numeric_limits<int>::max() - hidden_size ||
+            hidden_size > std::numeric_limits<int>::max() / 4)
+            return MQL_FALSE;
 
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
@@ -875,8 +897,8 @@ struct LSTMLayer {
             const float* c_prev = (t == 0) ? c_init.ptr : c_cache[t - 1].ptr;
             const float* x_t = X + (size_t)t * batch * I;
 
-            int total_concat = concat_dim * batch;
-            kConcatHX << <toU32((total_concat + 255) / 256), 256, 0, stream_h >> > (
+            size_t total_concat = (size_t)concat_dim * batch;
+            kConcatHX << <toU32(CeilDivSize(total_concat, 256)), 256, 0, stream_h >> > (
                 H, I, batch, h_prev, x_t, hx_cache[t].ptr);
             CUDA_CHECK_KERNEL_RET();
 
@@ -887,13 +909,14 @@ struct LSTMLayer {
 
             dim3 threads(16, 16);
             // x-dimension covers batch/cols, y-dimension covers gate_dim/rows.
-            dim3 blocks_bias(toU32((batch + 15) / 16), toU32((gate_dim + 15) / 16));
+            dim3 blocks_bias(toU32(CeilDivSize((size_t)batch, 16)),
+                toU32(CeilDivSize((size_t)gate_dim, 16))); // FIX #4 – bez int overflow
             kAddBiasInplace << <blocks_bias, threads, 0, stream_h >> > (
                 gate_dim, batch, gates_raw.ptr, b.ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            int total_hb = (int)hb_size;
-            kLSTMGatesForward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+            size_t total_hb = hb_size;
+            kLSTMGatesForward << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                 H, batch, gates_raw.ptr, c_prev,
                 c_cache[t].ptr, h_cache[t].ptr,
                 f_cache[t].ptr, i_cache[t].ptr,
@@ -911,7 +934,7 @@ struct LSTMLayer {
                     h_cache[t].ptr, hb_size * sizeof(float),
                     cudaMemcpyDeviceToDevice, stream_h));
 
-                kDropoutForward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+                kDropoutForward << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                     total_hb, h_drop_cache[t].ptr, dropout_rand.ptr,
                     dropout_rate, dropout_mask[t].ptr);
                 CUDA_CHECK_KERNEL_RET();
@@ -972,8 +995,8 @@ struct LSTMLayer {
                 CUDA_CHECK_RET(cudaMemcpyAsync(dh_inj.ptr, dh_src_t,
                     hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
 
-                int total_hb = (int)hb_size;
-                kAddInplace << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+                size_t total_hb = hb_size;
+                kAddInplace << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                     total_hb, dh_cur.ptr, dh_inj.ptr);
                 CUDA_CHECK_KERNEL_RET();
             }
@@ -986,16 +1009,16 @@ struct LSTMLayer {
                 dropout_mask_valid[t] &&
                 dropout_mask[t].ptr)
             {
-                int total_hb = (int)hb_size;
-                kDropoutBackward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+                size_t total_hb = hb_size;
+                kDropoutBackward << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                     total_hb, dh_cur.ptr, dropout_mask[t].ptr, dropout_rate);
                 CUDA_CHECK_KERNEL_RET();
             }
 
             const float* c_prev = (t == 0) ? c_init.ptr : c_cache[t - 1].ptr;
 
-            int total_hb = (int)hb_size;
-            kLSTMGatesBackward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+            size_t total_hb = hb_size;
+            kLSTMGatesBackward << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                 H, batch,
                 dh_cur.ptr, dc_cur.ptr,
                 c_prev, c_cache[t].ptr,
@@ -1020,8 +1043,8 @@ struct LSTMLayer {
                 &beta_zero, dhx.ptr, concat_dim));
 
             float* dx_t = dx_buf.ptr + (size_t)t * batch * I;
-            int total_concat = concat_dim * batch;
-            kSplitDHX << <toU32((total_concat + 255) / 256), 256, 0, stream_h >> > (
+            size_t total_concat = (size_t)concat_dim * batch;
+            kSplitDHX << <toU32(CeilDivSize(total_concat, 256)), 256, 0, stream_h >> > (
                 H, I, batch, dhx.ptr, dh_prev_tmp.ptr, dx_t);
             CUDA_CHECK_KERNEL_RET();
 
@@ -1045,14 +1068,14 @@ struct LSTMLayer {
 
         int concat_dim = input_size + hidden_size;
         int gate_dim = 4 * hidden_size;
-        int nW = concat_dim * gate_dim;
+        size_t nW = (size_t)concat_dim * gate_dim;
 
-        kAdamW << <toU32((nW + 255) / 256), 256, 0, stream_h >> > (
+        kAdamW << <toU32(CeilDivSize(nW, 256)), 256, 0, stream_h >> > (
             nW, W.ptr, mW.ptr, vW.ptr, dW.ptr,
             lr, b1, b2, eps, wd, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
 
-        kAdamW << <toU32((gate_dim + 255) / 256), 256, 0, stream_h >> > (
+        kAdamW << <toU32(CeilDivSize((size_t)gate_dim, 256)), 256, 0, stream_h >> > (
             gate_dim, b.ptr, mb.ptr, vb.ptr, db.ptr,
             lr, b1, b2, eps, 0.0f, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
@@ -1149,7 +1172,8 @@ struct OutputLayer {
             out_dim, batch, in_dim, &alpha, W.ptr, in_dim, h, in_dim,
             &beta_val, Y, out_dim));
         dim3 threads(16, 16);
-        dim3 blocks(toU32((batch + 15) / 16), toU32((out_dim + 15) / 16));
+        dim3 blocks(toU32(CeilDivSize((size_t)batch, 16)),
+            toU32(CeilDivSize((size_t)out_dim, 16))); // FIX #4 – bez int overflow
         kBiasLinear << <blocks, threads, 0, stream_h >> > (out_dim, batch, Y, b.ptr);
         CUDA_CHECK_KERNEL_RET();
         return MQL_TRUE;
@@ -1159,6 +1183,7 @@ struct OutputLayer {
         const float* dY, const float* h, float* dh_out,
         const float* ones_ptr, int batch)
     {
+        (void)stream_h;
         if (!is_valid) return MQL_FALSE;
         float alpha = 1.0f, beta_val = 0.0f;
 
@@ -1184,12 +1209,12 @@ struct OutputLayer {
     {
         if (!is_valid) return MQL_FALSE;
         const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
-        int nW = in_dim * out_dim;
-        kAdamW << <toU32((nW + 255) / 256), 256, 0, stream_h >> > (
+        size_t nW = (size_t)in_dim * out_dim;
+        kAdamW << <toU32(CeilDivSize(nW, 256)), 256, 0, stream_h >> > (
             nW, W.ptr, mW.ptr, vW.ptr, dW.ptr,
             lr, b1, b2, eps, wd, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
-        kAdamW << <toU32((out_dim + 255) / 256), 256, 0, stream_h >> > (
+        kAdamW << <toU32(CeilDivSize((size_t)out_dim, 256)), 256, 0, stream_h >> > (
             out_dim, b.ptr, mb.ptr, vb.ptr, db.ptr,
             lr, b1, b2, eps, 0.0f, c1, c2, grad_scale);
         CUDA_CHECK_KERNEL_RET();
@@ -1216,7 +1241,7 @@ struct OutputLayer {
     }
 };
 
-static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n);
+static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, size_t n);
 
 // ============================================================================
 // LSTMNet — Main network class
@@ -1350,32 +1375,33 @@ class LSTMNet {
 
         std::vector<int> hidx(eval_batch);
         double total_mse_sum = 0.0;
-        int total_out = 0;
+        size_t total_out = 0;
 
-        for (int start = 0; start < batch; start += eval_batch) {
-            int cur_batch = std::min(eval_batch, batch - start);
-            for (int i = 0; i < cur_batch; i++) hidx[i] = start + i;
+        for (size_t start = 0; start < (size_t)batch; start += eval_batch) {
+            int cur_batch = (int)std::min((size_t)eval_batch,
+                (size_t)batch - start);
+            for (int i = 0; i < cur_batch; i++) hidx[i] = (int)start + i;
 
             CUDA_CHECK_NEG(cudaMemcpyAsync(idx.ptr, hidx.data(),
                 (size_t)cur_batch * sizeof(int), cudaMemcpyHostToDevice, ctx.stream));
 
-            int total_x = cur_batch * seq_len * in_dim;
-            kGatherTransposeSeq << <toU32((total_x + 255) / 256), 256, 0, ctx.stream >> > (
+            size_t total_x = (size_t)cur_batch * seq_len * in_dim;
+            kGatherTransposeSeq << <toU32(CeilDivSize(total_x, 256)), 256, 0, ctx.stream >> > (
                 cur_batch, seq_len, in_dim, idx.ptr, X_full.ptr, X_mb_ts.ptr);
             { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #7 – okamžitý návrat při chybě kernel launch
 
-            int total_t = cur_batch * out_dim;
-            kGatherRows << <toU32((total_t + 255) / 256), 256, 0, ctx.stream >> > (
+            size_t total_t = (size_t)cur_batch * out_dim;
+            kGatherRows << <toU32(CeilDivSize(total_t, 256)), 256, 0, ctx.stream >> > (
                 out_dim, cur_batch, T_full.ptr, idx.ptr, T_mb.ptr);
             { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #7 – okamžitý návrat při chybě kernel launch
 
             if (!ForwardFull(ctx, X_mb_ts.ptr, seq_len, cur_batch, false, Y_eval.ptr))
                 return -1.0;
 
-            int nOut = cur_batch * out_dim;
+            size_t nOut = (size_t)cur_batch * out_dim;
             CUDA_CHECK_NEG(cudaMemsetAsync(mse_reduce_buf.ptr, 0, sizeof(float), ctx.stream));
 
-            kMSEReduceWarp << <toU32(std::min(((size_t)nOut + 255) / 256, (size_t)1024)), 256, 0, ctx.stream >> > (
+            kMSEReduceWarp << <toU32(std::min(CeilDivSize(nOut, 256), (size_t)1024)), 256, 0, ctx.stream >> > (
                 nOut, Y_eval.ptr, T_mb.ptr, mse_reduce_buf.ptr);
             { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { g_last_cuda.store((int)e); SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e)); return -1.0; } } // FIX #4/#7 – bezpečný grid výpočet + okamžitý návrat při chybě
 
@@ -1388,32 +1414,32 @@ class LSTMNet {
             total_out += nOut;
         }
 
-        if (total_out <= 0) return -1.0;
+        if (total_out == 0) return -1.0;
         return total_mse_sum / (double)total_out;
     }
 
     MQL_BOOL ApplyDropoutBackwardAllTimesteps(
-        LSTMLayer* layer, float* grad_buf, int seq_len, int batch,
+        LSTMLayer* layer, float* grad_buf, int sequence_length, int batch,
         cudaStream_t stream_h)
     {
         if (!layer->use_dropout || layer->dropout_rate <= 0.0f)
             return MQL_TRUE;
 
         size_t hb_size = (size_t)layer->hidden_size * batch;
-        int total_hb = (int)hb_size;
+        size_t total_hb = hb_size;
 
-        for (int t = 0; t < seq_len; t++) {
+        for (int t = 0; t < sequence_length; t++) {
             if (t < (int)layer->dropout_mask_valid.size() &&
                 layer->dropout_mask_valid[t] &&
                 t < (int)layer->dropout_mask.size() &&
                 layer->dropout_mask[t].ptr)
             {
                 float* g_t = grad_buf + (size_t)t * hb_size;
-                kDropoutBackward << <toU32((total_hb + 255) / 256), 256, 0, stream_h >> > (
+                kDropoutBackward << <toU32(CeilDivSize(total_hb, 256)), 256, 0, stream_h >> > (
                     total_hb, g_t, layer->dropout_mask[t].ptr, layer->dropout_rate);
+                CUDA_CHECK_KERNEL_RET();
             }
         }
-        CUDA_CHECK_KERNEL_RET();
         return MQL_TRUE;
     }
 
@@ -1431,8 +1457,11 @@ class LSTMNet {
         int nLayers = (int)lstm_layers.size();
         int H_last = lstm_layers.back()->hidden_size;
 
-        int nMiniBatches = (batch + mini_batch_size - 1) / mini_batch_size;
-        total_schedule_steps = max_epochs * nMiniBatches;
+        int nMiniBatches = (int)CeilDivSize((size_t)batch,
+            (size_t)mini_batch_size);
+        long long schedule_steps = (long long)max_epochs * nMiniBatches;
+        total_schedule_steps = (int)std::min(schedule_steps,
+            (long long)std::numeric_limits<int>::max());
         warmup_steps = std::min(500, std::max(1, total_schedule_steps / 10));
 
         // ── Progress init ──────────────────────────────────────────────
@@ -1494,12 +1523,14 @@ class LSTMNet {
                 b2_pow *= 0.999f;
                 float c1 = 1.0f / (1.0f - b1_pow);
                 float c2 = 1.0f / (1.0f - b2_pow);
-                float cur_lr = GetScheduledLR((int)step);
+                int schedule_step = (int)std::min(step,
+                    (unsigned long long)std::numeric_limits<int>::max());
+                float cur_lr = GetScheduledLR(schedule_step);
 
                 // ── Progress: minibatch update ─────────────────────────
                 m_progress.current_minibatch.store(mb + 1);
                 m_progress.current_lr.store(cur_lr);
-                m_progress.total_steps.store((int)step);
+                m_progress.total_steps.store(schedule_step);
                 {
                     float done_epochs = (float)(epoch - 1)
                         + (float)(mb + 1) / (float)nMiniBatches;
@@ -1514,21 +1545,21 @@ class LSTMNet {
                     (size_t)mb_size * sizeof(int),
                     cudaMemcpyHostToDevice, ctx.stream));
 
-                int total_x = mb_size * seq_len * in_dim;
-                kGatherTransposeSeq << <toU32((total_x + 255) / 256), 256, 0, ctx.stream >> > (
+                size_t total_x = (size_t)mb_size * seq_len * in_dim;
+                kGatherTransposeSeq << <toU32(CeilDivSize(total_x, 256)), 256, 0, ctx.stream >> > (
                     mb_size, seq_len, in_dim, mb_idx.ptr, X_full.ptr, X_mb_ts.ptr);
                 CUDA_CHECK_KERNEL_RET();
 
-                int total_t = mb_size * out_dim;
-                kGatherRows << <toU32((total_t + 255) / 256), 256, 0, ctx.stream >> > (
+                size_t total_t = (size_t)mb_size * out_dim;
+                kGatherRows << <toU32(CeilDivSize(total_t, 256)), 256, 0, ctx.stream >> > (
                     out_dim, mb_size, T_full.ptr, mb_idx.ptr, T_mb.ptr);
                 CUDA_CHECK_KERNEL_RET();
 
                 if (!ForwardFull(ctx, X_mb_ts.ptr, seq_len, mb_size, true, Y_pred_mb.ptr))
                     return MQL_FALSE;
 
-                int nOut = mb_size * out_dim;
-                kMSEGrad << <toU32((nOut + 255) / 256), 256, 0, ctx.stream >> > (
+                size_t nOut = (size_t)mb_size * out_dim;
+                kMSEGrad << <toU32(CeilDivSize(nOut, 256)), 256, 0, ctx.stream >> > (
                     nOut, Y_pred_mb.ptr, T_mb.ptr, dLoss_mb.ptr);
                 CUDA_CHECK_KERNEL_RET();
 
@@ -1574,15 +1605,15 @@ class LSTMNet {
                     for (int li = 0; li < nLayers; li++) {
                         LSTMLayer* layer = lstm_layers[li].get();
                         if (layer->dW.ptr && layer->dW.count > 0) {
-                            int nDW = (int)layer->dW.count;
-                            kL2NormReduceWarp << <toU32(std::min(((size_t)nDW + 255) / 256, (size_t)1024)),
+                            size_t nDW = layer->dW.count;
+                            kL2NormReduceWarp << <toU32(std::min(CeilDivSize(nDW, 256), (size_t)1024)),
                                 256, 0, ctx.stream >> > (
                                     nDW, layer->dW.ptr, grad_norm_reduce.ptr);
                             CUDA_CHECK_KERNEL_RET();
                         }
                         if (layer->db.ptr && layer->db.count > 0) {
-                            int nDb = (int)layer->db.count;
-                            kL2NormReduceWarp << <toU32(std::min(((size_t)nDb + 255) / 256, (size_t)1024)),
+                            size_t nDb = layer->db.count;
+                            kL2NormReduceWarp << <toU32(std::min(CeilDivSize(nDb, 256), (size_t)1024)),
                                 256, 0, ctx.stream >> > (
                                     nDb, layer->db.ptr, grad_norm_reduce.ptr);
                             CUDA_CHECK_KERNEL_RET();
@@ -1590,15 +1621,15 @@ class LSTMNet {
                     }
 
                     if (output_layer->dW.ptr && output_layer->dW.count > 0) {
-                        int nDW = (int)output_layer->dW.count;
-                        kL2NormReduceWarp << <toU32(std::min(((size_t)nDW + 255) / 256, (size_t)1024)),
+                        size_t nDW = output_layer->dW.count;
+                        kL2NormReduceWarp << <toU32(std::min(CeilDivSize(nDW, 256), (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nDW, output_layer->dW.ptr, grad_norm_reduce.ptr);
                         CUDA_CHECK_KERNEL_RET();
                     }
                     if (output_layer->db.ptr && output_layer->db.count > 0) {
-                        int nDb = (int)output_layer->db.count;
-                        kL2NormReduceWarp << <toU32(std::min(((size_t)nDb + 255) / 256, (size_t)1024)),
+                        size_t nDb = output_layer->db.count;
+                        kL2NormReduceWarp << <toU32(std::min(CeilDivSize(nDb, 256), (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nDb, output_layer->db.ptr, grad_norm_reduce.ptr);
                         CUDA_CHECK_KERNEL_RET();
@@ -1627,14 +1658,15 @@ class LSTMNet {
                     if (output_layer->dW.ptr && output_layer->dW.count > 0) {
                         CUDA_CHECK_RET(cudaMemsetAsync(grad_norm_reduce.ptr,
                             0, sizeof(float), ctx.stream));
-                        int nW = (int)output_layer->dW.count;
-                        kL2NormReduceWarp << <toU32(std::min(((size_t)nW + 255) / 256, (size_t)1024)),
+                        size_t nW = output_layer->dW.count;
+                        kL2NormReduceWarp << <toU32(std::min(CeilDivSize(nW, 256), (size_t)1024)),
                             256, 0, ctx.stream >> > (
                                 nW, output_layer->dW.ptr, grad_norm_reduce.ptr);
+                        CUDA_CHECK_KERNEL_RET();
                         float gn = 0.0f;
-                        cudaMemcpyAsync(&gn, grad_norm_reduce.ptr, sizeof(float),
-                            cudaMemcpyDeviceToHost, ctx.stream);
-                        cudaStreamSynchronize(ctx.stream);
+                        CUDA_CHECK_RET(cudaMemcpyAsync(&gn, grad_norm_reduce.ptr,
+                            sizeof(float), cudaMemcpyDeviceToHost, ctx.stream));
+                        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
                         m_progress.grad_norm.store(sqrtf(gn));
                     }
                 }
@@ -1646,6 +1678,7 @@ class LSTMNet {
             bool collect = (epoch == 1 || epoch == max_epochs || (epoch % 50) == 0);
             if (collect) {
                 last_full_train_mse = ComputeFullTrainMSE(ctx);
+                if (last_full_train_mse < 0.0) return MQL_FALSE; // FIX #7 – nepropagovat CUDA chybu jako úspěšný trénink
 
                 // ── Progress: MSE update ───────────────────────────────
                 m_progress.last_mse.store((float)last_full_train_mse);
@@ -1665,8 +1698,10 @@ class LSTMNet {
         m_progress.UpdateTiming();
         // ───────────────────────────────────────────────────────────────
 
-        if (last_full_train_mse <= 0.0)
+        if (last_full_train_mse <= 0.0) {
             last_full_train_mse = ComputeFullTrainMSE(ctx);
+            if (last_full_train_mse < 0.0) return MQL_FALSE; // FIX #7 – finální evaluace musí uspět
+        }
 
         m_progress.last_mse.store((float)last_full_train_mse);
 
@@ -1687,23 +1722,23 @@ public:
         double sq_sum = 0.0;
         for (const auto& l : lstm_layers) {
             if (l->dW.ptr && l->dW.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx->stream, l->dW.ptr, (int)l->dW.count);
+                double n = ComputeDeviceL2Norm(ctx->stream, l->dW.ptr, l->dW.count);
                 sq_sum += n * n;
             }
             if (l->db.ptr && l->db.count > 0) {
-                double n = ComputeDeviceL2Norm(ctx->stream, l->db.ptr, (int)l->db.count);
+                double n = ComputeDeviceL2Norm(ctx->stream, l->db.ptr, l->db.count);
                 sq_sum += n * n;
             }
         }
         if (output_layer) {
             if (output_layer->dW.ptr && output_layer->dW.count > 0) {
                 double n = ComputeDeviceL2Norm(ctx->stream, output_layer->dW.ptr,
-                    (int)output_layer->dW.count);
+                    output_layer->dW.count);
                 sq_sum += n * n;
             }
             if (output_layer->db.ptr && output_layer->db.count > 0) {
                 double n = ComputeDeviceL2Norm(ctx->stream, output_layer->db.ptr,
-                    (int)output_layer->db.count);
+                    output_layer->db.count);
                 sq_sum += n * n;
             }
         }
@@ -1718,13 +1753,13 @@ public:
         if (layer_idx >= 0 && layer_idx < (int)lstm_layers.size()) {
             const LSTMLayer* layer = lstm_layers[(size_t)layer_idx].get();
             if (!layer->W.ptr || layer->W.count == 0) return 0.0f;
-            return (float)ComputeDeviceL2Norm(ctx->stream, layer->W.ptr, (int)layer->W.count);
+            return (float)ComputeDeviceL2Norm(ctx->stream, layer->W.ptr, layer->W.count);
         }
 
         if (output_layer && layer_idx == (int)lstm_layers.size()) {
             if (!output_layer->W.ptr || output_layer->W.count == 0) return 0.0f;
             return (float)ComputeDeviceL2Norm(ctx->stream, output_layer->W.ptr,
-                (int)output_layer->W.count);
+                output_layer->W.count);
         }
 
         return 0.0f;
@@ -1769,57 +1804,83 @@ public:
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
         double lr, double wd, std::future<void>& out_lock_future)
     {
-        if (m_state.load() == TS_TRAINING) return MQL_FALSE;
+        if (m_state.load() == TS_TRAINING) {
+            SetError(L"Training is already in progress");
+            return MQL_FALSE;
+        }
 
         if (m_worker.joinable()) {
             m_worker.join();
         }
 
-        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+        if (max_epochs <= 0 || loaded_samples <= 0 ||
+            lstm_layers.empty() || !output_layer) {
+            SetError(L"Async training parameters or network state are invalid");
             return MQL_FALSE;
+        }
 
-        m_stop_flag.store(false);
-        m_state.store(TS_TRAINING);
         // FIX #2 – handshake mezi volajícím a worker threadem pro garantované převzetí zámku.
-        auto lock_promise = std::make_shared<std::promise<void>>();
-        out_lock_future = lock_promise->get_future(); // HOTFIX #D
-
-        // HOTFIX #E – ochrana před výjimkou konstruktoru std::thread.
-        // Pokud thread nelze vytvořit (system_error), lock_promise->set_value()
-        // by nikdy neproběhlo a lock_future.get() v DN_TrainAsync by čekal
-        // věčně → DEADLOCK. Catch blok odblokuje čekatele a nastaví chybu.
         try {
+            auto lock_promise = std::make_shared<std::promise<void>>();
+            out_lock_future = lock_promise->get_future();
+            m_stop_flag.store(false);
+            m_state.store(TS_TRAINING);
+
             m_worker = std::thread([this, max_epochs, target_mse,
                                     lr, wd, lock_promise]() {
-                std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
-                lock_promise->set_value();
+                bool lock_handoff_done = false;
+                try {
+                    std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
+                    lock_promise->set_value();
+                    lock_handoff_done = true;
 
-                GPUContext ctx;
-                if (!ctx.Init(0)) {
-                    m_state.store(TS_ERROR);
-                    return;
+                    GPUContext ctx;
+                    if (!ctx.Init(0)) {
+                        m_state.store(TS_ERROR);
+                        return;
+                    }
+
+                    MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse,
+                                                    lr, wd);
+
+                    if (ctx.stream) {
+                        cudaError_t e = cudaStreamSynchronize(ctx.stream);
+                        if (e != cudaSuccess) {
+                            g_last_cuda.store((int)e);
+                            SetError(L"[CUDA] %S", cudaGetErrorString(e));
+                            result = MQL_FALSE;
+                        }
+                    }
+
+                    // FIX #2 – stav je finální ještě před uvolněním exkluzivního locku.
+                    m_state.store(result ? TS_COMPLETED : TS_ERROR);
                 }
-
-                MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse,
-                                                lr, wd);
-
-                if (ctx.stream) cudaStreamSynchronize(ctx.stream);
-
-                excl_lock.unlock();
-                m_state.store(result ? TS_COMPLETED : TS_ERROR);
+                catch (const std::exception& ex) {
+                    if (!lock_handoff_done) {
+                        try { lock_promise->set_exception(std::current_exception()); }
+                        catch (...) {}
+                    }
+                    SetError(L"[Async worker] %S", ex.what());
+                    m_state.store(TS_ERROR);
+                }
+                catch (...) {
+                    if (!lock_handoff_done) {
+                        try { lock_promise->set_exception(std::current_exception()); }
+                        catch (...) {}
+                    }
+                    SetError(L"[Async worker] Unknown exception");
+                    m_state.store(TS_ERROR);
+                }
             });
         }
-        catch (const std::system_error& ex) {
-            // HOTFIX #E – thread se nepodařilo vytvořit.
-            // Odblokuj čekatele na lock_future.get() a nastav chybový stav.
+        catch (const std::exception& ex) {
             m_state.store(TS_ERROR);
-            try {
-                lock_promise->set_value();
-            }
-            catch (const std::future_error&) {
-                // promise již má hodnotu – ignoruj
-            }
             SetError(L"[Async] Failed to create worker thread: %S", ex.what());
+            return MQL_FALSE;
+        }
+        catch (...) {
+            m_state.store(TS_ERROR);
+            SetError(L"[Async] Failed to create worker thread");
             return MQL_FALSE;
         }
 
@@ -1830,7 +1891,8 @@ public:
         double lr, double wd, double* out_mse, int* out_epochs)
     {
         if (m_state.load() == TS_TRAINING) return MQL_FALSE;
-        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+        if (max_epochs <= 0 || loaded_samples <= 0 ||
+            lstm_layers.empty() || !output_layer)
             return MQL_FALSE;
 
         GPUContext* ctx = GetThreadGPUContext(0);
@@ -1839,7 +1901,14 @@ public:
         m_stop_flag.store(false);
         m_state.store(TS_TRAINING);
         MQL_BOOL result = TrainInternal(*ctx, max_epochs, target_mse, lr, wd);
-        if (ctx->stream) cudaStreamSynchronize(ctx->stream);
+        if (ctx->stream) {
+            cudaError_t e = cudaStreamSynchronize(ctx->stream);
+            if (e != cudaSuccess) {
+                g_last_cuda.store((int)e);
+                SetError(L"[CUDA] %S", cudaGetErrorString(e));
+                result = MQL_FALSE;
+            }
+        }
         m_state.store(result ? TS_COMPLETED : TS_ERROR);
 
         if (result) {
@@ -1858,6 +1927,8 @@ public:
     ~LSTMNet() {
         m_stop_flag.store(true);
         if (m_worker.joinable()) m_worker.join();
+        // Síť je pevně alokována na device 0; DN_Free může běžet z jiného host threadu.
+        cudaSetDevice(0);
         lstm_layers.clear();
         output_layer.reset();
     }
@@ -1888,6 +1959,8 @@ public:
     }
 
     MQL_BOOL AddLayer(int in, int out, int act, int use_ln, float dropout) {
+        (void)act;
+        (void)use_ln;
         return AddLSTMLayer(in, out, dropout);
     }
 
@@ -1930,7 +2003,12 @@ public:
     MQL_BOOL LoadBatch(const double* X, const double* T, int batch,
         int in_dim, int out_dim, int layout)
     {
-        if (!init_ok || !X || !T) return MQL_FALSE;
+        (void)layout;
+        if (!init_ok || !X || !T || batch <= 0 ||
+            in_dim <= 0 || out_dim <= 0 || seq_len <= 0) {
+            SetError(L"LoadBatch: invalid arguments");
+            return MQL_FALSE;
+        }
 
         GPUContext* ctx = GetThreadGPUContext(0);
         if (!ctx) return MQL_FALSE;
@@ -1961,10 +2039,12 @@ public:
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpT.ptr, T, nT * sizeof(double),
             cudaMemcpyHostToDevice, ctx->stream));
 
-        kCopyD2F_vec4 << <toU32(std::min((nX + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
-            ((int)nX, tmpX.ptr, X_full.ptr);
-        kCopyD2F_vec4 << <toU32(std::min((nT + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
-            ((int)nT, tmpT.ptr, T_full.ptr);
+        kCopyD2F_vec4 << <toU32(std::min(CeilDivSize(nX, 1024), (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
+            (nX, tmpX.ptr, X_full.ptr);
+        CUDA_CHECK_KERNEL_RET();
+        kCopyD2F_vec4 << <toU32(std::min(CeilDivSize(nT, 1024), (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
+            (nT, tmpT.ptr, T_full.ptr);
+        CUDA_CHECK_KERNEL_RET();
 
         int max_b = std::max(batch, mini_batch_size);
         if (ones.count < (size_t)max_b) {
@@ -1975,27 +2055,26 @@ public:
         }
         if (!mse_reduce_buf.alloc(1)) return MQL_FALSE;
 
+        // FIX #5 – reset Adam momentů při načtení nového batch datasetu.
+        for (auto& l : lstm_layers) {
+            if (!l->mW.zero()) return MQL_FALSE;
+            if (!l->vW.zero()) return MQL_FALSE;
+            if (!l->mb.zero()) return MQL_FALSE;
+            if (!l->vb.zero()) return MQL_FALSE;
+        }
+        if (output_layer) {
+            if (!output_layer->mW.zero()) return MQL_FALSE;
+            if (!output_layer->vW.zero()) return MQL_FALSE;
+            if (!output_layer->mb.zero()) return MQL_FALSE;
+            if (!output_layer->vb.zero()) return MQL_FALSE;
+        }
+
+        CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
         host_indices.resize(batch);
         std::iota(host_indices.begin(), host_indices.end(), 0);
         loaded_samples = batch;
         loaded_in_dim = feature_dim;
         loaded_out_dim = out_dim;
-
-        // FIX #5 – reset Adam momentů při načtení nového batch datasetu.
-        for (auto& l : lstm_layers) {
-            if (!l->mW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!l->vW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!l->mb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!l->vb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-        }
-        if (output_layer) {
-            if (!output_layer->mW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!output_layer->vW.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!output_layer->mb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-            if (!output_layer->vb.zeroAsync(ctx->stream)) return MQL_FALSE; // HOTFIX #B
-        }
-
-        CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
         b1_pow = 1.0f; b2_pow = 1.0f; step = 0;
         last_full_train_mse = 0.0;
         return MQL_TRUE;
@@ -2004,7 +2083,12 @@ public:
     MQL_BOOL PredictBatch(const double* X, int batch, int in_dim,
         int layout, double* out_Y)
     {
-        if (!init_ok || !X || !out_Y) return MQL_FALSE;
+        (void)layout;
+        if (!init_ok || !X || !out_Y || batch <= 0 ||
+            in_dim <= 0 || seq_len <= 0) {
+            SetError(L"PredictBatch: invalid arguments");
+            return MQL_FALSE;
+        }
 
         GPUContext* ctx = GetThreadGPUContext(0);
         if (!ctx) return MQL_FALSE;
@@ -2026,12 +2110,14 @@ public:
         if (!X_float.alloc(nX) || !tmpDX.alloc(nX)) return MQL_FALSE;
         CUDA_CHECK_RET(cudaMemcpyAsync(tmpDX.ptr, X, nX * sizeof(double),
             cudaMemcpyHostToDevice, ctx->stream));
-        kCopyD2F_vec4 << <toU32(std::min((nX + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
-            ((int)nX, tmpDX.ptr, X_float.ptr);
+        kCopyD2F_vec4 << <toU32(std::min(CeilDivSize(nX, 1024), (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
+            (nX, tmpDX.ptr, X_float.ptr);
+        CUDA_CHECK_KERNEL_RET();
 
         if (!X_ts.alloc(nX)) return MQL_FALSE;
-        kTransposeToTimestep << <toU32((nX + 255) / 256), 256, 0, ctx->stream >> >
+        kTransposeToTimestep << <toU32(CeilDivSize(nX, 256)), 256, 0, ctx->stream >> >
             (batch, seq_len, feature_dim, X_float.ptr, X_ts.ptr);
+        CUDA_CHECK_KERNEL_RET();
 
         if (ones.count < (size_t)batch) {
             if (!ones.alloc((size_t)batch)) return MQL_FALSE;
@@ -2045,8 +2131,9 @@ public:
             return MQL_FALSE;
 
         if (!outDY.alloc(nY)) return MQL_FALSE;
-        kCopyF2D_vec4 << <toU32(std::min((nY + 1023) / 1024, (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
-            ((int)nY, Y_float.ptr, outDY.ptr);
+        kCopyF2D_vec4 << <toU32(std::min(CeilDivSize(nY, 1024), (size_t)4096)), 256, 0, ctx->stream >> > // FIX #4 – size_t výpočet grid dim bez overflow
+            (nY, Y_float.ptr, outDY.ptr);
+        CUDA_CHECK_KERNEL_RET();
         CUDA_CHECK_RET(cudaMemcpyAsync(out_Y, outDY.ptr, nY * sizeof(double),
             cudaMemcpyDeviceToHost, ctx->stream));
         CUDA_CHECK_RET(cudaStreamSynchronize(ctx->stream));
@@ -2067,6 +2154,7 @@ public:
 
     MQL_BOOL Save(std::string& out_buf) {
         if (lstm_layers.empty() || !output_layer) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaDeviceSynchronize());
         std::stringstream ss;
         ss << std::fixed << std::setprecision(8)
             << "LSTM_V1\nSEQ_LEN " << seq_len
@@ -2076,18 +2164,22 @@ public:
             int g = 4 * l->hidden_size;
             ss << l->input_size << " " << l->hidden_size << " "
                 << l->dropout_rate << "\n";
-            std::vector<float> Wv(dim * g), bv(g);
-            cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * 4, cudaMemcpyDeviceToHost);
-            cudaMemcpy(bv.data(), l->b.ptr, bv.size() * 4, cudaMemcpyDeviceToHost);
+            std::vector<float> Wv((size_t)dim * g), bv(g);
+            CUDA_CHECK_RET(cudaMemcpy(Wv.data(), l->W.ptr,
+                Wv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK_RET(cudaMemcpy(bv.data(), l->b.ptr,
+                bv.size() * sizeof(float), cudaMemcpyDeviceToHost));
             for (float x : Wv) ss << x << " "; ss << "\n";
             for (float x : bv) ss << x << " "; ss << "\n";
         }
         ss << "OUTPUT " << output_layer->in_dim << " "
             << output_layer->out_dim << "\n";
-        int dim = output_layer->in_dim * output_layer->out_dim;
+        size_t dim = (size_t)output_layer->in_dim * output_layer->out_dim;
         std::vector<float> Wv(dim), bv(output_layer->out_dim);
-        cudaMemcpy(Wv.data(), output_layer->W.ptr, dim * 4, cudaMemcpyDeviceToHost);
-        cudaMemcpy(bv.data(), output_layer->b.ptr, bv.size() * 4, cudaMemcpyDeviceToHost);
+        CUDA_CHECK_RET(cudaMemcpy(Wv.data(), output_layer->W.ptr,
+            dim * sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK_RET(cudaMemcpy(bv.data(), output_layer->b.ptr,
+            bv.size() * sizeof(float), cudaMemcpyDeviceToHost));
         for (float x : Wv) ss << x << " "; ss << "\n";
         for (float x : bv) ss << x << " "; ss << "\n";
         out_buf = ss.str();
@@ -2100,31 +2192,44 @@ public:
         std::string t;
         if (!(ss >> t) || t != "LSTM_V1") return MQL_FALSE;
         if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
+        if (seq_len <= 0) return MQL_FALSE;
         if (!(ss >> t) || t != "LSTM_LAYERS") return MQL_FALSE;
         int nl; if (!(ss >> nl)) return MQL_FALSE;
+        if (nl <= 0) return MQL_FALSE;
         lstm_layers.clear();
         for (int i = 0; i < nl; i++) {
             int in_d, hid_d; float drop;
             if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE;
+            if (i > 0 && in_d != lstm_layers.back()->hidden_size)
+                return MQL_FALSE;
             auto l = std::make_unique<LSTMLayer>();
             if (!l->InitFromData(in_d, hid_d, drop)) return MQL_FALSE;
             int dim = in_d + hid_d, g = 4 * hid_d;
-            std::vector<float> Wv(dim * g), bv(g);
-            for (size_t k = 0; k < Wv.size(); k++) ss >> Wv[k];
-            for (size_t k = 0; k < bv.size(); k++) ss >> bv[k];
-            cudaMemcpy(l->W.ptr, Wv.data(), Wv.size() * 4, cudaMemcpyHostToDevice);
-            cudaMemcpy(l->b.ptr, bv.data(), bv.size() * 4, cudaMemcpyHostToDevice);
+            std::vector<float> Wv((size_t)dim * g), bv(g);
+            for (size_t k = 0; k < Wv.size(); k++)
+                if (!(ss >> Wv[k])) return MQL_FALSE;
+            for (size_t k = 0; k < bv.size(); k++)
+                if (!(ss >> bv[k])) return MQL_FALSE;
+            CUDA_CHECK_RET(cudaMemcpy(l->W.ptr, Wv.data(),
+                Wv.size() * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK_RET(cudaMemcpy(l->b.ptr, bv.data(),
+                bv.size() * sizeof(float), cudaMemcpyHostToDevice));
             lstm_layers.push_back(std::move(l));
         }
         if (!(ss >> t) || t != "OUTPUT") return MQL_FALSE;
         int oi, oo; if (!(ss >> oi >> oo)) return MQL_FALSE;
+        if (oi != lstm_layers.back()->hidden_size) return MQL_FALSE;
         output_layer = std::make_unique<OutputLayer>();
         if (!output_layer->InitFromData(oi, oo)) return MQL_FALSE;
-        std::vector<float> Wv(oi * oo), bv(oo);
-        for (size_t k = 0; k < Wv.size(); k++) ss >> Wv[k];
-        for (size_t k = 0; k < bv.size(); k++) ss >> bv[k];
-        cudaMemcpy(output_layer->W.ptr, Wv.data(), Wv.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(output_layer->b.ptr, bv.data(), bv.size() * 4, cudaMemcpyHostToDevice);
+        std::vector<float> Wv((size_t)oi * oo), bv(oo);
+        for (size_t k = 0; k < Wv.size(); k++)
+            if (!(ss >> Wv[k])) return MQL_FALSE;
+        for (size_t k = 0; k < bv.size(); k++)
+            if (!(ss >> bv[k])) return MQL_FALSE;
+        CUDA_CHECK_RET(cudaMemcpy(output_layer->W.ptr, Wv.data(),
+            Wv.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK_RET(cudaMemcpy(output_layer->b.ptr, bv.data(),
+            bv.size() * sizeof(float), cudaMemcpyHostToDevice));
         return MQL_TRUE;
     }
 };
@@ -2133,7 +2238,8 @@ public:
 // DLL Exports
 // ============================================================================
 static std::map<int, std::shared_ptr<LSTMNet>> g_nets;
-static std::atomic<unsigned> g_id{ 1u }; // FIX #9 – atomický identifikátor pro DN_Create
+static std::atomic<int>  g_id{ 1 }; // FIX #9 – atomický identifikátor pro DN_Create
+static std::atomic<bool> g_id_exhausted{ false }; // FIX #9 – po dosažení INT_MAX už nikdy nerecyklovat handle
 static std::mutex g_map_mtx;
 
 enum LockResult { LR_OK, LR_NOT_FOUND, LR_BUSY }; // FIX #10 – explicitní stav lock výsledku
@@ -2171,21 +2277,36 @@ static MQL_BOOL AcquireNetExclusiveOrSetError(int h, std::shared_ptr<LSTMNet>& n
     return MQL_TRUE;
 }
 
-static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n) {
-    if (!buf || n <= 0) return 0.0;
+static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, size_t n) {
+    if (!buf || n == 0) return 0.0;
 
     GPUMemory<float> reduce;
     if (!reduce.alloc(1)) return 0.0;
 
-    CUDA_CHECK_VOID(cudaMemsetAsync(reduce.ptr, 0, sizeof(float), stream_h));
-    kL2NormReduceWarp << <toU32(std::min(((size_t)n + 255) / 256, (size_t)1024)), 256, 0, stream_h >> > ( // FIX #4 – size_t výpočet grid dim bez overflow
+    cudaError_t e = cudaMemsetAsync(reduce.ptr, 0, sizeof(float), stream_h);
+    if (e != cudaSuccess) {
+        g_last_cuda.store((int)e);
+        SetError(L"[CUDA] %S", cudaGetErrorString(e));
+        return 0.0;
+    }
+    kL2NormReduceWarp << <toU32(std::min(CeilDivSize(n, 256), (size_t)1024)), 256, 0, stream_h >> > ( // FIX #4 – size_t výpočet grid dim bez overflow
         n, buf, reduce.ptr);
-    CUDA_CHECK_VOID(cudaGetLastError());
+    e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        g_last_cuda.store((int)e);
+        SetError(L"[CUDA LAUNCH] %S", cudaGetErrorString(e));
+        return 0.0;
+    }
 
     float sum = 0.0f;
-    CUDA_CHECK_VOID(cudaMemcpyAsync(&sum, reduce.ptr, sizeof(float),
-        cudaMemcpyDeviceToHost, stream_h));
-    CUDA_CHECK_VOID(cudaStreamSynchronize(stream_h));
+    e = cudaMemcpyAsync(&sum, reduce.ptr, sizeof(float),
+        cudaMemcpyDeviceToHost, stream_h);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(stream_h);
+    if (e != cudaSuccess) {
+        g_last_cuda.store((int)e);
+        SetError(L"[CUDA] %S", cudaGetErrorString(e));
+        return 0.0;
+    }
 
     return std::sqrt((double)sum);
 }
@@ -2194,13 +2315,23 @@ DLL_EXPORT int DLL_CALL DN_Create() {
     auto net = std::make_shared<LSTMNet>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
-    unsigned uid = g_id.fetch_add(1u); // HOTFIX #C
-    if (uid == 0u ||
-        uid > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+    if (g_id_exhausted.load()) {
         SetError(L"DN_Create: network handle overflow");
         return 0;
     }
-    int id = static_cast<int>(uid);
+    int id = g_id.fetch_add(1); // FIX #9 – atomické přidělení beze změny API handle
+    if (id <= 0) {
+        g_id_exhausted.store(true);
+        SetError(L"DN_Create: network handle overflow");
+        return 0;
+    }
+    if (id == std::numeric_limits<int>::max())
+        g_id_exhausted.store(true);
+    if (g_nets.find(id) != g_nets.end()) {
+        g_id_exhausted.store(true);
+        SetError(L"DN_Create: network handle collision");
+        return 0;
+    }
     g_nets[id] = net;
     return id;
 }
@@ -2315,8 +2446,18 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     MQL_BOOL result = net->StartTrainingAsync_Locked(
         epochs, target_mse, lr, wd, lock_future);
     if (!result) return MQL_FALSE;
-    lk.unlock(); // HOTFIX #D
-    lock_future.get(); // HOTFIX #D
+    lk.unlock(); // FIX #2 – worker musí dostat možnost převzít net_mtx
+    try {
+        lock_future.get(); // FIX #2 – návrat až po potvrzeném převzetí locku workerem
+    }
+    catch (const std::exception& ex) {
+        SetError(L"[Async lock handoff] %S", ex.what());
+        return MQL_FALSE;
+    }
+    catch (...) {
+        SetError(L"[Async lock handoff] Unknown exception");
+        return MQL_FALSE;
+    }
     return MQL_TRUE;
 }
 
@@ -2457,6 +2598,10 @@ DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
     std::shared_ptr<LSTMNet> net;
     if (!AcquireNetExclusiveOrSetError(h, net, lk)) return 0;
     if (!net->Save(net->serialize_buf)) return 0;
+    if (net->serialize_buf.size() >= (size_t)std::numeric_limits<int>::max()) {
+        SetError(L"Serialized state is too large");
+        return 0;
+    }
     return (int)net->serialize_buf.size() + 1;
 }
 
@@ -2464,6 +2609,10 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
     std::unique_lock<std::shared_mutex> lk;
     std::shared_ptr<LSTMNet> net;
     if (!AcquireNetExclusiveOrSetError(h, net, lk)) return MQL_FALSE;
+    if (!buf || max_len <= 0) {
+        SetError(L"DN_GetState: invalid output buffer");
+        return MQL_FALSE;
+    }
     const auto& s = net->serialize_buf;
     if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
     int copy_len = std::min((int)s.size(), max_len - 1);
@@ -2492,20 +2641,18 @@ DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
 // FIX #1  – Opraveno aliasování dc_cur/dc_prev_out v LSTMLayer::Backward přes dc_prev buffer + std::swap.
 // FIX #2  – Přidán promise/future handshake v StartTrainingAsync_Locked pro bezpečné předání exkluzivního locku workeru.
 // FIX #3  – Odstraněn dvojitý dropout backward na posledním timestepu; aplikace přesunuta do LSTMLayer::Backward.
-// FIX #4  – Výpočty grid dim sjednoceny na size_t + toU32 na všech relevantních launch místech.
+// FIX #4  – Výpočty grid dim sjednoceny na size_t + toU32; vektorové copy kernely používají grid-stride a nekončí po 4 194 304 prvcích.
 // FIX #5  – V LoadBatch resetovány Adam momenty (mW/vW/mb/vb) všech LSTM vrstev i output vrstvy.
 // FIX #6  – V SaveBest/RestoreBest přidán cudaDeviceSynchronize pro konzistentní snapshot/restore vah.
-// FIX #7  – ComputeFullTrainMSE používá CUDA_CHECK_NEG a okamžitě vrací -1.0 při CUDA chybě/launch error.
+// FIX #7  – ComputeFullTrainMSE používá CUDA_CHECK_NEG, vrací -1.0 při CUDA chybě a TrainInternal tuto chybu propaguje.
 // FIX #8  – Stabilizován Adam update (m_hat/v_hat, clamp v_hat, bezpečnější sqrtf).
-// FIX #9  – g_id změněno na std::atomic<unsigned> s fetch_add + kontrolou overflow v DN_Create.
+// FIX #9  – g_id změněno na std::atomic<int> s fetch_add, kontrolou overflow a trvalým zablokováním recyklace handle.
 // FIX #10 – FindAndLockExclusive vrací LR_OK/LR_NOT_FOUND/LR_BUSY + přesnější chybové hlášky v exportech.
 // HOTFIX #A – Doplněny bounds checky t < dropout_mask_valid.size() a t < dropout_mask.size() před indexací v LSTMLayer::Backward.
-// HOTFIX #B – V LoadBatch změněn reset Adam momentů z zero() na zeroAsync(ctx->stream) pro správné stream pořadí.
-// HOTFIX #C – g_id převedeno na std::atomic<unsigned> + bezpečná kontrola overflow v DN_Create před castem na int.
+// HOTFIX #B – V LoadBatch je reset Adam momentů synchronní přes zero() a úspěch datasetu se publikuje až po synchronizaci streamu.
+// HOTFIX #C – g_id používá std::atomic<int>; po dosažení INT_MAX se generátor trvale označí jako vyčerpaný.
 // HOTFIX #D – StartTrainingAsync_Locked už nemanipuluje s externím lockem; handshake future čekání přesunuto do DN_TrainAsync.
-// HOTFIX #E – StartTrainingAsync_Locked: try/catch kolem std::thread
-//             konstruktoru zabraňuje deadlocku při selhání vytvoření
-//             vlákna (std::system_error); catch odblokuje lock_future
-//             a nastaví TS_ERROR.
+// HOTFIX #E – StartTrainingAsync_Locked ošetřuje konstrukci std::thread i výjimky workeru;
+//             selhání před převzetím mutexu se přenese přes future a nastaví TS_ERROR.
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
