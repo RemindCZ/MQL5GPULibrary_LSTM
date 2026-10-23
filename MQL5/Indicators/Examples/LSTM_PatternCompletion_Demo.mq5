@@ -34,34 +34,7 @@
 #property indicator_style2  STYLE_SOLID
 #property indicator_width2  2
 
-#import "MQL5GPULibrary_LSTM.dll"
-   int    DN_Create();
-   void   DN_Free(int h);
-   int    DN_SetSequenceLength(int h, int seq_len);
-   int    DN_SetMiniBatchSize(int h, int mbs);
-   int    DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
-   int    DN_SetOutputDim(int h, int out_dim);
-
-   int    DN_LoadBatch(int h, const double &X[], const double &T[],
-                       int batch, int in_dim, int out_dim, int layout);
-
-   int    DN_TrainAsync(int h, int epochs, double target_mse,
-                        double lr, double wd);
-   int    DN_GetTrainingStatus(int h);
-   void   DN_StopTraining(int h);
-
-   int    DN_GetProgressAll(int h,
-             int &epoch, int &total_epochs,
-             int &mb, int &total_mb,
-             double &lr, double &mse, double &best_mse,
-             double &grad_norm, double &pct,
-             double &elapsed_sec, double &eta_sec);
-
-   int    DN_PredictBatch(int h, const double &X[], int batch,
-                          int in_dim, int layout, double &Y[]);
-
-   void   DN_GetError(short &buf[], int len);
-#import
+#include <MQL5GPULibrary.mqh>
 
 // -------------------- Inputs --------------------
 input group "Pattern Encoding"

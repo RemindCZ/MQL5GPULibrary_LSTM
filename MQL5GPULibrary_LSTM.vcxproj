@@ -17,7 +17,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <CharacterSet>MultiByte</CharacterSet>
     <PlatformToolset>v143</PlatformToolset>
@@ -30,8 +30,12 @@
     <PlatformToolset>v143</PlatformToolset>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <DN_CudaVersion Condition="'$(DN_CudaVersion)'==''">13.0</DN_CudaVersion>
+    <CudaCodeGeneration Condition="'$(CudaCodeGeneration)'==''">compute_86,sm_86</CudaCodeGeneration>
+  </PropertyGroup>
   <ImportGroup Label="ExtensionSettings">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.0.props" />
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA $(DN_CudaVersion).props" />
   </ImportGroup>
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
@@ -53,10 +57,13 @@
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>cudart_static.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>cublas.lib;curand.lib;cudart.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
+      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <CudaRuntime>Shared</CudaRuntime>
+      <CodeGeneration>$(CudaCodeGeneration)</CodeGeneration>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -73,20 +80,27 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>cublas.lib;cudart_static.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>cublas.lib;curand.lib;cudart.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
+      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
       <CudaRuntime>Shared</CudaRuntime>
-      <CodeGeneration>compute_86,sm_86</CodeGeneration>
+      <CodeGeneration>$(CudaCodeGeneration)</CodeGeneration>
       <GPUDebugInfo>false</GPUDebugInfo>
       <GenerateLineInfo>true</GenerateLineInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <CudaCompile Include="kernel.cu">
+      <AdditionalDependencies>$(ProjectDir)include\model_validation.h;$(ProjectDir)include\checkpoint.h;$(ProjectDir)include\MQL5GPULibrary.h;%(AdditionalDependencies)</AdditionalDependencies>
       <DeploymentContent>true</DeploymentContent>
     </CudaCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\model_validation.h" />
+    <ClInclude Include="include\checkpoint.h" />
+    <ClInclude Include="include\MQL5GPULibrary.h" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="readme.md">
@@ -101,6 +115,6 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
-    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.0.targets" />
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA $(DN_CudaVersion).targets" />
   </ImportGroup>
 </Project>

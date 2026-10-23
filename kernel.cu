@@ -1,4 +1,4 @@
-// kernel.cu — LSTM DLL v2.1.0 (Async Support + Progress Reporting)
+// kernel.cu — Recurrent CUDA DLL v2.2.0
 // FIX SUMMARY: P01, P02, P03, P04/P12, P05, P06, P07, P08, P09, P10, P11, P13, P14
 // Pure LSTM implementation with CUDA acceleration
 // Features: Async training, Dropout, Multi-layer, Persistent buffers, Progress
@@ -53,6 +53,11 @@
 #include <thread>
 #include <limits>
 #include <chrono>
+#include <locale>
+#include "include/model_validation.h"
+#include "include/checkpoint.h"
+#define DN_BUILDING_LIBRARY
+#include "include/MQL5GPULibrary.h"
 
 #pragma comment(lib, "cudart.lib")
 #pragma comment(lib, "cublas.lib")
@@ -109,6 +114,14 @@ static void SetError(const wchar_t* fmt, ...) {
         return MQL_FALSE;                                             \
     }                                                                 \
 }while(0)
+
+#define CUDA_CHECK_MSE(x) do { \
+    cudaError_t error = (x); \
+    if (error != cudaSuccess) { \
+        SetError(L"Loss evaluation CUDA error: %S", cudaGetErrorString(error)); \
+        return -1.0; \
+    } \
+} while (0)
 
 #define CUDA_CHECK_VOID(x) do{                                        \
     cudaError_t e=(x);                                                \
@@ -170,7 +183,10 @@ struct GPUMemory {
     MQL_BOOL alloc(size_t n) {
         if (n == 0) { free(); return MQL_TRUE; }
         if (n <= capacity) { count = n; return MQL_TRUE; }
-        free();
+        if (n > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            SetError(L"GPU allocation size overflow");
+            return MQL_FALSE;
+        }
         void* p = nullptr;
         cudaError_t e = cudaMalloc(&p, n * sizeof(T));
         if (e != cudaSuccess) {
@@ -178,6 +194,7 @@ struct GPUMemory {
             SetError(L"OOM %llu bytes", (unsigned long long)(n * sizeof(T)));
             return MQL_FALSE;
         }
+        free();
         ptr = (T*)p;
         capacity = n;
         count = n;
@@ -238,16 +255,16 @@ struct GPUContext {
             SetError(L"[GPUContext] cublasCreate failed");
             return MQL_FALSE;
         }
-        cublasSetStream(blas, stream);
+        CUBLAS_CHECK_RET(cublasSetStream(blas, stream));
         if (curandCreateGenerator(&curand_gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
             cublasDestroy(blas); blas = nullptr;
             cudaStreamDestroy(stream); stream = nullptr;
             SetError(L"[GPUContext] curandCreateGenerator failed");
             return MQL_FALSE;
         }
-        curandSetPseudoRandomGeneratorSeed(curand_gen,
-            (unsigned long long)std::random_device{}());
-        curandSetStream(curand_gen, stream);
+        CURAND_CHECK_RET(curandSetPseudoRandomGeneratorSeed(curand_gen,
+            (unsigned long long)std::random_device{}()));
+        CURAND_CHECK_RET(curandSetStream(curand_gen, stream));
         ok = true;
         return MQL_TRUE;
     }
@@ -847,7 +864,35 @@ public:
         cudaStream_t stream_h) = 0;
     virtual MQL_BOOL SaveBest() = 0;
     virtual MQL_BOOL RestoreBest() = 0;
-    virtual const float* GetOutputH(int t, bool training) const = 0;
+    virtual const float* GetOutputH(int t, bool training) const {
+        if (training && use_dropout && dropout_rate > 0.0f &&
+            t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
+            t < (int)h_drop_cache.size() && h_drop_cache[t].ptr)
+        {
+            return h_drop_cache[t].ptr;
+        }
+        return h_cache[t].ptr;
+    }
+
+    MQL_BOOL ApplyOutputDropout(int sl, int batch, bool training,
+        cudaStream_t stream, curandGenerator_t generator) {
+        dropout_mask_valid.assign(sl, false);
+        if (!training || !use_dropout) return MQL_TRUE;
+        h_drop_cache.resize(sl); dropout_mask.resize(sl);
+        const size_t n = (size_t)hidden_size * batch;
+        if (!dropout_rand.alloc(RoundUpEven(n))) return MQL_FALSE;
+        for (int t = 0; t < sl; ++t) {
+            if (!h_drop_cache[t].alloc(n) || !dropout_mask[t].alloc(n)) return MQL_FALSE;
+            CURAND_CHECK_RET(curandGenerateUniform(generator, dropout_rand.ptr, RoundUpEven(n)));
+            CUDA_CHECK_RET(cudaMemcpyAsync(h_drop_cache[t].ptr, h_cache[t].ptr,
+                n * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            kDropoutForward<<<toU32((n + 255) / 256), 256, 0, stream>>>(
+                (int)n, h_drop_cache[t].ptr, dropout_rand.ptr, dropout_rate, dropout_mask[t].ptr);
+            CUDA_CHECK_KERNEL_RET();
+            dropout_mask_valid[t] = true;
+        }
+        return MQL_TRUE;
+    }
     virtual int GetInputSize() const = 0;
     virtual int GetHiddenSize() const = 0;
     virtual float GetDropoutRate() const = 0;
@@ -944,15 +989,6 @@ struct LSTMLayer : public RecurrentLayer {
         return MQL_TRUE;
     }
 
-    const float* GetOutputH(int t, bool training) const override {
-        if (training && use_dropout && dropout_rate > 0.0f &&
-            t < (int)dropout_mask_valid.size() && dropout_mask_valid[t] &&
-            t < (int)h_drop_cache.size() && h_drop_cache[t].ptr)
-        {
-            return h_drop_cache[t].ptr;
-        }
-        return h_cache[t].ptr;
-    }
 
     MQL_BOOL Forward(cublasHandle_t blas_h, cudaStream_t stream_h,
         const float* X, int seq_len, int batch,
@@ -1276,7 +1312,7 @@ struct GRULayer : public RecurrentLayer {
         f_cache.resize(seq_len); i_cache.resize(seq_len); g_cache.resize(seq_len);
         nh_cache.resize(seq_len);
         h_drop_cache.resize(seq_len); dropout_mask.resize(seq_len); dropout_mask_valid.assign(seq_len, false);
-        if (!h_init.alloc(hb_size) || !h_init.zero()) return MQL_FALSE;
+        if (!h_init.alloc(hb_size) || !h_init.zeroAsync(stream_h)) return MQL_FALSE;
         GPUMemory<float> zr_raw, nx_raw, nh_raw;
         if (!zr_raw.alloc((size_t)2 * H * batch)) return MQL_FALSE;   // FIX P01
         if (!nx_raw.alloc((size_t)H * batch)) return MQL_FALSE;
@@ -1314,7 +1350,7 @@ struct GRULayer : public RecurrentLayer {
                 h_cache[t].ptr, f_cache[t].ptr, i_cache[t].ptr, g_cache[t].ptr, nh_cache[t].ptr);
             CUDA_CHECK_KERNEL_RET();
         }
-        return MQL_TRUE;
+        return ApplyOutputDropout(seq_len, batch, training, stream_h, curand_gen);
     }
 
     MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
@@ -1326,21 +1362,23 @@ struct GRULayer : public RecurrentLayer {
         int concat_dim = I + H;
         size_t hb_size = (size_t)H * batch;
 
-        if (!dW.alloc((size_t)concat_dim * (2 * H)) || !dW.zero()) return MQL_FALSE;
-        if (!db.alloc(2 * H) || !db.zero()) return MQL_FALSE;
-        if (!dWn_x.alloc((size_t)I * H) || !dWn_x.zero()) return MQL_FALSE;
-        if (!dWn_h.alloc((size_t)H * H) || !dWn_h.zero()) return MQL_FALSE;
-        if (!dbn_x.alloc(H) || !dbn_x.zero()) return MQL_FALSE;
-        if (!dbn_h.alloc(H) || !dbn_h.zero()) return MQL_FALSE;
+        if (!dW.alloc((size_t)concat_dim * (2 * H)) || !dW.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!db.alloc(2 * H) || !db.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!dWn_x.alloc((size_t)I * H) || !dWn_x.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!dWn_h.alloc((size_t)H * H) || !dWn_h.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!dbn_x.alloc(H) || !dbn_x.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!dbn_h.alloc(H) || !dbn_h.zeroAsync(stream_h)) return MQL_FALSE;
         if (!dx_buf.alloc((size_t)seq_len * batch * I)) return MQL_FALSE;
 
         GPUMemory<float> dh_cur, dh_prev_tmp, dhx_zr, dz_raw, dr_raw, dnx_raw, dnh_raw;
+        GPUMemory<float> dgates_raw, dh_from_nh;
+        if (!dgates_raw.alloc((size_t)2 * H * batch) || !dh_from_nh.alloc(hb_size)) return MQL_FALSE;
         if (!dh_cur.alloc(hb_size) || !dh_prev_tmp.alloc(hb_size)) return MQL_FALSE;
         if (!dhx_zr.alloc((size_t)concat_dim * batch)) return MQL_FALSE;
         if (!dz_raw.alloc((size_t)H * batch) || !dr_raw.alloc((size_t)H * batch)) return MQL_FALSE;
         if (!dnx_raw.alloc((size_t)H * batch) || !dnh_raw.alloc((size_t)H * batch)) return MQL_FALSE;
         if (dh_last) CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_last, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
-        else if (!dh_cur.zero()) return MQL_FALSE;
+        else if (!dh_cur.zeroAsync(stream_h)) return MQL_FALSE;
 
         float alpha = 1.0f, beta_zero = 0.0f, beta_one = 1.0f;
         for (int t = seq_len - 1; t >= 0; --t) {
@@ -1355,10 +1393,10 @@ struct GRULayer : public RecurrentLayer {
                 h_prev, dh_prev_tmp.ptr, dz_raw.ptr, dr_raw.ptr, dnx_raw.ptr, dnh_raw.ptr);
             CUDA_CHECK_KERNEL_RET();
 
-            GPUMemory<float> dgates_raw;
-            if (!dgates_raw.alloc((size_t)2 * H * batch)) return MQL_FALSE;
-            CUDA_CHECK_RET(cudaMemcpyAsync(dgates_raw.ptr, dz_raw.ptr, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
-            CUDA_CHECK_RET(cudaMemcpyAsync(dgates_raw.ptr + hb_size, dr_raw.ptr, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
+            // Each sample column contains [dz(H), dr(H)], rather than all dz then all dr.
+            kConcatHX<<<toU32((2 * hb_size + 255) / 256), 256, 0, stream_h>>>(
+                H, H, batch, dz_raw.ptr, dr_raw.ptr, dgates_raw.ptr);
+            CUDA_CHECK_KERNEL_RET();
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_T,
                 concat_dim, 2 * H, batch, &alpha, hx_cache[t].ptr, concat_dim, dgates_raw.ptr, 2 * H,
                 &beta_one, dW.ptr, concat_dim));
@@ -1378,8 +1416,9 @@ struct GRULayer : public RecurrentLayer {
             kSplitDHX<<<toU32(((size_t)concat_dim * batch + 255) / 256), 256, 0, stream_h>>>(
                 H, I, batch, dhx_zr.ptr, dh_cur.ptr, dx_t);
             CUDA_CHECK_KERNEL_RET();
-            GPUMemory<float> dh_from_nh;
-            if (!dh_from_nh.alloc(hb_size)) return MQL_FALSE;
+            // Input gradient includes both the gates and the candidate projection.
+            CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
+                I, batch, H, &alpha, Wn_x.ptr, I, dnx_raw.ptr, H, &beta_one, dx_t, I));
             CUBLAS_CHECK_RET(cublasSgemm(blas_h, CUBLAS_OP_N, CUBLAS_OP_N,
                 H, batch, H, &alpha, Wn_h.ptr, H, dnh_raw.ptr, H, &beta_zero, dh_from_nh.ptr, H));
             // FIX P05: combine independent contributions without duplication.
@@ -1486,7 +1525,7 @@ struct RNNLayer : public RecurrentLayer {
         int concat_dim = I + H, gate_dim = H;
         size_t hb_size = (size_t)H * batch;
         h_cache.resize(seq_len); hx_cache.resize(seq_len);
-        if (!h_init.alloc(hb_size) || !h_init.zero()) return MQL_FALSE;
+        if (!h_init.alloc(hb_size) || !h_init.zeroAsync(stream_h)) return MQL_FALSE;
         GPUMemory<float> preact;
         if (!preact.alloc((size_t)gate_dim * batch)) return MQL_FALSE; // FIX P09
         for (int t = 0; t < seq_len; t++) {
@@ -1505,7 +1544,7 @@ struct RNNLayer : public RecurrentLayer {
             kRNNForward<<<toU32((hb_size + 255) / 256), 256, 0, stream_h>>>(H, batch, preact.ptr, h_cache[t].ptr);
             CUDA_CHECK_KERNEL_RET();
         }
-        return MQL_TRUE;
+        return ApplyOutputDropout(seq_len, batch, training, stream_h, curand_gen);
     }
 
     MQL_BOOL Backward(cublasHandle_t blas_h, cudaStream_t stream_h,
@@ -1516,13 +1555,13 @@ struct RNNLayer : public RecurrentLayer {
         int H = hidden_size, I = input_size;
         int concat_dim = I + H, gate_dim = H;
         size_t hb_size = (size_t)H * batch;
-        if (!dW.alloc((size_t)concat_dim * gate_dim) || !dW.zero()) return MQL_FALSE;
-        if (!db.alloc(gate_dim) || !db.zero()) return MQL_FALSE;
+        if (!dW.alloc((size_t)concat_dim * gate_dim) || !dW.zeroAsync(stream_h)) return MQL_FALSE;
+        if (!db.alloc(gate_dim) || !db.zeroAsync(stream_h)) return MQL_FALSE;
         if (!dx_buf.alloc((size_t)seq_len * batch * I)) return MQL_FALSE;
         GPUMemory<float> dh_cur, dhx, dpreact;
         if (!dh_cur.alloc(hb_size) || !dhx.alloc((size_t)concat_dim * batch) || !dpreact.alloc((size_t)gate_dim * batch)) return MQL_FALSE;
         if (dh_last) CUDA_CHECK_RET(cudaMemcpyAsync(dh_cur.ptr, dh_last, hb_size * sizeof(float), cudaMemcpyDeviceToDevice, stream_h));
-        else if (!dh_cur.zero()) return MQL_FALSE;
+        else if (!dh_cur.zeroAsync(stream_h)) return MQL_FALSE;
         float alpha = 1.0f, beta_zero = 0.0f, beta_one = 1.0f;
         for (int t = seq_len - 1; t >= 0; --t) {
             if (dh_above_seq) {
@@ -1799,8 +1838,10 @@ class SequenceModel {
     std::atomic<int>  m_state{ TS_IDLE };
     std::atomic<bool> m_stop_flag{ false };
     std::thread       m_worker;
-    double            m_final_mse = 0.0;
-    int               m_final_epochs = 0;
+    std::atomic<double> m_final_mse{0.0};
+    std::atomic<int> m_final_epochs{0};
+    std::mutex m_worker_mtx;
+    std::atomic<bool> m_closed{false};
 
     // Progress reporting
     TrainingProgress m_progress;
@@ -1910,33 +1951,33 @@ class SequenceModel {
             int cur_batch = std::min(eval_batch, batch - start);
             for (int i = 0; i < cur_batch; i++) hidx[i] = start + i;
 
-            CUDA_CHECK_VOID(cudaMemcpyAsync(idx.ptr, hidx.data(),
+            CUDA_CHECK_MSE(cudaMemcpyAsync(idx.ptr, hidx.data(),
                 (size_t)cur_batch * sizeof(int), cudaMemcpyHostToDevice, ctx.stream));
 
             int total_x = cur_batch * seq_len * in_dim;
             kGatherTransposeSeq << <toU32((total_x + 255) / 256), 256, 0, ctx.stream >> > (
                 cur_batch, seq_len, in_dim, idx.ptr, X_full.ptr, X_mb_ts.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            CUDA_CHECK_MSE(cudaGetLastError());
 
             int total_t = cur_batch * out_dim;
             kGatherRows << <toU32((total_t + 255) / 256), 256, 0, ctx.stream >> > (
                 out_dim, cur_batch, T_full.ptr, idx.ptr, T_mb.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            CUDA_CHECK_MSE(cudaGetLastError());
 
             if (!ForwardFull(ctx, X_mb_ts.ptr, seq_len, cur_batch, false, Y_eval.ptr))
                 return -1.0;
 
             int nOut = cur_batch * out_dim;
-            CUDA_CHECK_VOID(cudaMemsetAsync(mse_reduce_buf.ptr, 0, sizeof(float), ctx.stream));
+            CUDA_CHECK_MSE(cudaMemsetAsync(mse_reduce_buf.ptr, 0, sizeof(float), ctx.stream));
 
             kMSEReduceWarp << <std::min((nOut + 255) / 256, 1024), 256, 0, ctx.stream >> > (
                 nOut, Y_eval.ptr, T_mb.ptr, mse_reduce_buf.ptr);
-            CUDA_CHECK_VOID(cudaGetLastError());
+            CUDA_CHECK_MSE(cudaGetLastError());
 
             float sum = 0.0f;
-            CUDA_CHECK_VOID(cudaMemcpyAsync(&sum, mse_reduce_buf.ptr,
+            CUDA_CHECK_MSE(cudaMemcpyAsync(&sum, mse_reduce_buf.ptr,
                 sizeof(float), cudaMemcpyDeviceToHost, ctx.stream));
-            CUDA_CHECK_VOID(cudaStreamSynchronize(ctx.stream));
+            CUDA_CHECK_MSE(cudaStreamSynchronize(ctx.stream));
 
             total_mse_sum += (double)sum;
             total_out += nOut;
@@ -1978,6 +2019,10 @@ class SequenceModel {
             lstm_layers.empty() || !output_layer || !output_layer->is_valid)
             return MQL_FALSE;
 
+        if (!ValidateShape(loaded_samples, loaded_in_dim * seq_len, loaded_out_dim, 0)) {
+            SetError(L"Training buffers exceed supported tensor dimensions");
+            return MQL_FALSE;
+        }
         base_lr = (float)lr;
         int batch = loaded_samples;
         int out_dim = loaded_out_dim;
@@ -1985,7 +2030,7 @@ class SequenceModel {
         int nLayers = (int)lstm_layers.size();
         int H_last = lstm_layers.back()->hidden_size;
 
-        int nMiniBatches = (batch + mini_batch_size - 1) / mini_batch_size;
+        int nMiniBatches = 1 + (batch - 1) / mini_batch_size;
         const int total_schedule_steps = max_epochs * nMiniBatches;
         int warmup_steps = total_schedule_steps / 10;
         if (warmup_steps < 1) warmup_steps = 1;
@@ -2054,7 +2099,7 @@ class SequenceModel {
                 b2_pow *= 0.999f;
                 float c1 = 1.0f / (1.0f - b1_pow);
                 float c2 = 1.0f / (1.0f - b2_pow);
-                float cur_lr = GetScheduledLR((int)step);
+                float cur_lr = GetScheduledLR((epoch - 1) * nMiniBatches + mb);
 
                 // ── Progress: minibatch update ─────────────────────────
                 m_progress.current_minibatch.store(mb + 1);
@@ -2167,6 +2212,10 @@ class SequenceModel {
                 float gsum = 0.0f;
                 CUDA_CHECK_RET(cudaMemcpyAsync(&gsum, grad_norm_reduce.ptr, sizeof(float), cudaMemcpyDeviceToHost, ctx.stream));
                 CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
+                if (!std::isfinite(gsum)) {
+                    SetError(L"Non-finite gradient norm; reduce learning rate or rescale inputs");
+                    return MQL_FALSE;
+                }
                 float gnorm = sqrtf(std::max(0.0f, gsum));
                 if (grad_clip > 0.0f && gnorm > grad_clip && gnorm > 1e-12f) {
                     float scale = grad_clip / gnorm;
@@ -2185,23 +2234,8 @@ class SequenceModel {
                     grad_clip, ctx.stream))
                     return MQL_FALSE;
 
-                // ── Progress: grad norm (every 10 minibatches) ─────────
-                if ((mb % 10) == 0) {
-                    if (output_layer->dW.ptr && output_layer->dW.count > 0) {
-                        CUDA_CHECK_RET(cudaMemsetAsync(grad_norm_reduce.ptr,
-                            0, sizeof(float), ctx.stream));
-                        int nW = (int)output_layer->dW.count;
-                        kL2NormReduceWarp << <std::min((nW + 255) / 256, 1024),
-                            256, 0, ctx.stream >> > (
-                                nW, output_layer->dW.ptr, grad_norm_reduce.ptr);
-                        float gn = 0.0f;
-                        cudaMemcpyAsync(&gn, grad_norm_reduce.ptr, sizeof(float),
-                            cudaMemcpyDeviceToHost, ctx.stream);
-                        cudaStreamSynchronize(ctx.stream);
-                        m_progress.grad_norm.store(sqrtf(gn));
-                    }
-                }
-                // ───────────────────────────────────────────────────────
+                m_progress.grad_norm.store(gnorm);
+
             }
 
             final_epoch = epoch;
@@ -2209,6 +2243,10 @@ class SequenceModel {
             bool collect = (epoch == 1 || epoch == max_epochs || (epoch % 50) == 0);
             if (collect) {
                 last_full_train_mse = ComputeFullTrainMSE(ctx);
+                if (!std::isfinite(last_full_train_mse) || last_full_train_mse < 0.0) {
+                    SetError(L"Loss evaluation failed or training diverged");
+                    return MQL_FALSE;
+                }
 
                 // ── Progress: MSE update ───────────────────────────────
                 m_progress.last_mse.store((float)last_full_train_mse);
@@ -2217,7 +2255,7 @@ class SequenceModel {
                     m_progress.best_mse.store((float)last_full_train_mse);
                 // ───────────────────────────────────────────────────────
 
-                if (target_mse > 0.0 && last_full_train_mse > 0.0 &&
+                if (target_mse > 0.0 && last_full_train_mse >= 0.0 &&
                     last_full_train_mse <= target_mse)
                     break;
             }
@@ -2228,8 +2266,14 @@ class SequenceModel {
         m_progress.UpdateTiming();
         // ───────────────────────────────────────────────────────────────
 
-        if (last_full_train_mse <= 0.0)
-            last_full_train_mse = ComputeFullTrainMSE(ctx);
+        // Always evaluate the actual final weights, including after cancellation.
+        last_full_train_mse = ComputeFullTrainMSE(ctx);
+        if (!std::isfinite(last_full_train_mse) || last_full_train_mse < 0.0) {
+            SetError(L"Final loss evaluation failed or produced a non-finite value");
+            return MQL_FALSE;
+        }
+        m_progress.best_mse.store(std::min(m_progress.best_mse.load(), (float)last_full_train_mse));
+        m_progress.eta_ms.store(0);
 
         m_progress.last_mse.store((float)last_full_train_mse);
 
@@ -2258,6 +2302,14 @@ public:
             if (l->db.ptr && l->db.count > 0) {
                 double n = ComputeDeviceL2Norm(diag_ctx.stream, l->db.ptr, (int)l->db.count);
                 sq_sum += n * n;
+            }
+            if (const auto* g = dynamic_cast<const GRULayer*>(l.get())) {
+                for (const auto* buf : { &g->dWn_x, &g->dWn_h, &g->dbn_x, &g->dbn_h }) {
+                    if (buf->ptr && buf->count) {
+                        double n = ComputeDeviceL2Norm(diag_ctx.stream, buf->ptr, (int)buf->count);
+                        sq_sum += n * n;
+                    }
+                }
             }
         }
         if (output_layer) {
@@ -2306,15 +2358,15 @@ public:
     int GetStatus() const { return m_state.load(); }
 
     void GetResult(double& mse, int& ep) const {
-        mse = m_final_mse;
-        ep = m_final_epochs;
+        mse = m_final_mse.load();
+        ep = m_final_epochs.load();
     }
 
     void StopTraining() {
         m_stop_flag.store(true);
     }
     void WaitForTrainingComplete() {
-        // FIX P06: allow synchronous API to block until worker exits.
+        std::lock_guard<std::mutex> worker_lock(m_worker_mtx);
         if (m_worker.joinable()) m_worker.join();
     }
 
@@ -2336,34 +2388,52 @@ public:
     MQL_BOOL StartTrainingAsync_Locked(int max_epochs, double target_mse,
         double lr, double wd)
     {
-        if (m_state.load() == TS_TRAINING) return MQL_FALSE;
-
-        if (m_worker.joinable()) {
-            m_worker.join();
-        }
-
-        if (loaded_samples <= 0 || lstm_layers.empty() || !output_layer)
+        if (m_closed.load() || m_state.load() == TS_TRAINING) {
+            SetError(L"Model is closed or already training");
             return MQL_FALSE;
-
+        }
+        if (!dn::training(max_epochs, target_mse, lr, wd) ||
+            loaded_samples <= 0 || lstm_layers.empty() || !output_layer ||
+            !dn::product(max_epochs, 1 + (loaded_samples - 1) / mini_batch_size)) {
+            SetError(L"Invalid training parameters or no loaded training data");
+            return MQL_FALSE;
+        }
+        std::lock_guard<std::mutex> worker_lock(m_worker_mtx);
+        if (m_worker.joinable()) m_worker.join();
         m_stop_flag.store(false);
+        // Clear cancellation before checking closed, so a racing Close cannot lose its stop request.
+        if (m_closed.load()) { SetError(L"Model is closed"); return MQL_FALSE; }
+        m_final_mse.store(0.0);
+        m_final_epochs.store(0);
+        m_progress.Reset();
         m_state.store(TS_TRAINING);
-
-        m_worker = std::thread([this, max_epochs, target_mse, lr, wd]() {
-            std::unique_lock<std::shared_mutex> excl_lock(this->net_mtx);
-
-            GPUContext ctx;
-            if (!ctx.Init(0)) {
-                m_state.store(TS_ERROR);
-                return;
-            }
-
-            MQL_BOOL result = TrainInternal(ctx, max_epochs, target_mse, lr, wd);
-
-            if (ctx.stream) cudaStreamSynchronize(ctx.stream);
-
-            excl_lock.unlock();
-            m_state.store(result ? TS_COMPLETED : TS_ERROR);
+        try {
+            m_worker = std::thread([this, max_epochs, target_mse, lr, wd]() {
+                MQL_BOOL result = MQL_FALSE;
+                {
+                    std::unique_lock<std::shared_mutex> excl_lock(net_mtx);
+                    try {
+                        GPUContext ctx;
+                        if (ctx.Init(0)) {
+                            result = TrainInternal(ctx, max_epochs, target_mse, lr, wd);
+                            if (cudaStreamSynchronize(ctx.stream) != cudaSuccess) {
+                                SetError(L"Training stream synchronization failed");
+                                result = MQL_FALSE;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        SetError(L"Training exception: %S", e.what());
+                    } catch (...) {
+                        SetError(L"Unknown training exception");
+                    }
+                }
+                m_state.store(result ? TS_COMPLETED : TS_ERROR);
             });
+        } catch (const std::exception& e) {
+            m_state.store(TS_ERROR);
+            SetError(L"Cannot start training thread: %S", e.what());
+            return MQL_FALSE;
+        }
 
         return MQL_TRUE;
     }
@@ -2383,12 +2453,47 @@ public:
         output_layer.reset();
     }
 
+    bool IsClosed() const { return m_closed.load(); }
+    void Close() {
+        m_closed.store(true);
+        StopTraining();
+        WaitForTrainingComplete();
+        std::unique_lock<std::shared_mutex> lock(net_mtx);
+    }
+    void InvalidateBatch() {
+        loaded_samples = loaded_in_dim = loaded_out_dim = 0;
+        X_full.free(); T_full.free(); host_indices.clear();
+    }
     void SetGradClip(float v) { grad_clip = v; }
-    void SetSequenceLength(int sl) { seq_len = std::max(1, sl); }
-    void SetMiniBatchSize(int mbs) { mini_batch_size = std::max(1, mbs); }
+    void SetSequenceLength(int sl) {
+        if (sl != seq_len) InvalidateBatch();
+        seq_len = sl;
+    }
+    void SetMiniBatchSize(int mbs) { mini_batch_size = mbs; }
+
+    bool ValidateShape(int batch, int in_dim, int out_dim, int layout) const {
+        if (layout != 0 || seq_len <= 0 || in_dim <= 0 || in_dim % seq_len ||
+            !dn::product(batch, in_dim) || !dn::product(batch, out_dim)) return false;
+        int features = in_dim / seq_len;
+        int work_batch = std::max(batch, mini_batch_size);
+        if (!dn::product(work_batch, in_dim) || !dn::product(work_batch, out_dim)) return false;
+        for (const auto& l : lstm_layers) {
+            if (!dn::layer(features, l->hidden_size, l->dropout_rate) ||
+                (l->input_size != 0 && l->input_size != features) ||
+                !dn::product(work_batch, l->hidden_size, seq_len) ||
+                !dn::product(work_batch, l->hidden_size, 4) ||
+                !dn::product(work_batch, features + l->hidden_size)) return false;
+            features = l->hidden_size;
+        }
+        return !lstm_layers.empty() && dn::product(features, out_dim);
+    }
 
     MQL_BOOL AddTypedLayer(SequenceLayerType lt, int in_dim, int hidden_size, float dropout = 0.0f) {
-        if (!init_ok) return MQL_FALSE;
+        if (!init_ok || lstm_layers.size() >= 1024 || !dn::layer(in_dim, hidden_size, dropout) ||
+            (in_dim > 0 && !lstm_layers.empty() && in_dim != lstm_layers.back()->hidden_size)) {
+            SetError(L"Invalid recurrent layer dimensions or dropout");
+            return MQL_FALSE;
+        }
         std::unique_ptr<RecurrentLayer> l;
         if (lt == SequenceLayerType::GRU) l = std::make_unique<GRULayer>();
         else if (lt == SequenceLayerType::RNN) l = std::make_unique<RNNLayer>();
@@ -2403,6 +2508,8 @@ public:
         }
         lstm_layers.push_back(std::move(l));
         layer_types.push_back(lt);
+        output_layer.reset();
+        InvalidateBatch();
         return MQL_TRUE;
     }
 
@@ -2419,12 +2526,22 @@ public:
     }
 
     MQL_BOOL SetOutputLayer(int out_dim) {
-        if (!init_ok || lstm_layers.empty()) return MQL_FALSE;
-        output_layer = std::make_unique<OutputLayer>();
-        return output_layer->Init(lstm_layers.back()->hidden_size, out_dim);
+        if (!init_ok || lstm_layers.empty() || !dn::product(lstm_layers.back()->hidden_size, out_dim)) {
+            SetError(L"Invalid output dimensions or no recurrent layers");
+            return MQL_FALSE;
+        }
+        auto next = std::make_unique<OutputLayer>();
+        if (!next->Init(lstm_layers.back()->hidden_size, out_dim)) return MQL_FALSE;
+        output_layer = std::move(next);
+        InvalidateBatch();
+        return MQL_TRUE;
     }
 
     MQL_BOOL AddLayer(int in, int out, int act, int use_ln, float dropout) {
+        if (act < 0 || act > 2 || use_ln != 0) {
+            SetError(L"Layer type must be 0 (LSTM), 1 (GRU), or 2 (RNN); layer normalization is unsupported");
+            return MQL_FALSE;
+        }
         if (act == 1) return AddGRULayer(in, out, dropout);
         if (act == 2) return AddRNNLayer(in, out, dropout);
         return AddLSTMLayer(in, out, dropout);
@@ -2433,8 +2550,11 @@ public:
     MQL_BOOL BindInputIfNeeded(int in_dim) {
         if (lstm_layers.empty()) return MQL_FALSE;
         RecurrentLayer* L0 = lstm_layers[0].get();
-        if (!L0->is_valid || L0->input_size != in_dim) {
-            L0->FreeAll();
+        if (L0->input_size != 0 && L0->input_size != in_dim) {
+            SetError(L"Input feature count differs from model architecture");
+            return MQL_FALSE;
+        }
+        if (!L0->is_valid) {
             return L0->Init(in_dim, L0->hidden_size, L0->dropout_rate);
         }
         return MQL_TRUE;
@@ -2461,15 +2581,42 @@ public:
     }
 
     MQL_BOOL RestoreWeights() {
-        for (auto& l : lstm_layers) if (!l->RestoreBest()) return MQL_FALSE;
-        if (output_layer) return output_layer->RestoreBest();
+        if (!output_layer || !output_layer->has_snapshot) {
+            SetError(L"No complete weight snapshot"); return MQL_FALSE;
+        }
+        for (const auto& l : lstm_layers) if (!l->has_snapshot) {
+            SetError(L"No complete weight snapshot"); return MQL_FALSE;
+        }
+        for (auto& l : lstm_layers) {
+            if (!l->RestoreBest()) return MQL_FALSE;
+            for (auto* buf : { &l->mW, &l->vW, &l->mb, &l->vb })
+                if (!buf->zero()) return MQL_FALSE;
+            if (auto* g = dynamic_cast<GRULayer*>(l.get())) {
+                for (auto* buf : { &g->mWn_x, &g->vWn_x, &g->mWn_h, &g->vWn_h,
+                    &g->mbn_x, &g->vbn_x, &g->mbn_h, &g->vbn_h })
+                    if (!buf->zero()) return MQL_FALSE;
+            }
+        }
+        if (!output_layer->RestoreBest()) return MQL_FALSE;
+        for (auto* buf : { &output_layer->mW, &output_layer->vW, &output_layer->mb, &output_layer->vb })
+            if (!buf->zero()) return MQL_FALSE;
+        step = 0; b1_pow = b2_pow = 1.0f;
         return MQL_TRUE;
     }
 
     MQL_BOOL LoadBatch(const double* X, const double* T, int batch,
         int in_dim, int out_dim, int layout)
     {
-        if (!init_ok || !X || !T) return MQL_FALSE;
+        if (!init_ok || !X || !T || !ValidateShape(batch, in_dim, out_dim, layout) ||
+            (output_layer && output_layer->out_dim != out_dim)) {
+            SetError(L"Invalid training tensor shape, layout, or null buffer");
+            return MQL_FALSE;
+        }
+        for (size_t i = 0; i < (size_t)batch * in_dim; ++i)
+            if (!dn::finite_float(X[i])) { SetError(L"Non-finite input data"); return MQL_FALSE; }
+        for (size_t i = 0; i < (size_t)batch * out_dim; ++i)
+            if (!dn::finite_float(T[i])) { SetError(L"Non-finite target data"); return MQL_FALSE; }
+        InvalidateBatch();
 
         GPUContext ctx;
         if (!ctx.Init(0)) return MQL_FALSE;
@@ -2517,12 +2664,11 @@ public:
 
         host_indices.resize(batch);
         std::iota(host_indices.begin(), host_indices.end(), 0);
+        CUDA_CHECK_KERNEL_RET();
+        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
         loaded_samples = batch;
         loaded_in_dim = feature_dim;
         loaded_out_dim = out_dim;
-
-        CUDA_CHECK_RET(cudaStreamSynchronize(ctx.stream));
-        b1_pow = 1.0f; b2_pow = 1.0f; step = 0;
         last_full_train_mse = 0.0;
         return MQL_TRUE;
     }
@@ -2530,7 +2676,13 @@ public:
     MQL_BOOL PredictBatch(const double* X, int batch, int in_dim,
         int layout, double* out_Y)
     {
-        if (!init_ok || !X || !out_Y) return MQL_FALSE;
+        if (!init_ok || !X || !out_Y || !output_layer ||
+            !ValidateShape(batch, in_dim, output_layer->out_dim, layout)) {
+            SetError(L"Invalid prediction shape, layout, null buffer, or missing output layer");
+            return MQL_FALSE;
+        }
+        for (size_t i = 0; i < (size_t)batch * in_dim; ++i)
+            if (!dn::finite_float(X[i])) { SetError(L"Non-finite prediction data"); return MQL_FALSE; }
 
         GPUContext ctx;
         if (!ctx.Init(0)) return MQL_FALSE;
@@ -2592,9 +2744,14 @@ public:
     std::string serialize_buf;
 
     MQL_BOOL Save(std::string& out_buf) {
-        if (lstm_layers.empty() || !output_layer) return MQL_FALSE;
+        if (lstm_layers.empty() || !output_layer || !output_layer->is_valid) return MQL_FALSE;
+        for (const auto& l : lstm_layers) if (!l->is_valid) {
+            SetError(L"Cannot serialize an unbound layer; load data or predict first");
+            return MQL_FALSE;
+        }
         std::stringstream ss;
-        ss << std::fixed << std::setprecision(8)
+        ss.imbue(std::locale::classic());
+        ss << std::setprecision(std::numeric_limits<float>::max_digits10)
             << "SEQMODEL_V3\nSEQ_LEN " << seq_len
             << "\nLAYERS " << lstm_layers.size() << "\n";
         for (size_t li = 0; li < lstm_layers.size(); ++li) {
@@ -2638,80 +2795,50 @@ public:
     }
 
     MQL_BOOL Load(const char* data) {
-        if (!data || !init_ok) return MQL_FALSE;
-        std::istringstream ss(data);
-        std::string t;
-        bool legacy_v1 = false;
-        if (!(ss >> t)) return MQL_FALSE;
-        bool v3 = false;
-        if (t == "SEQMODEL_V3") {
-            v3 = true;
-            if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
-            if (!(ss >> t) || t != "LAYERS") return MQL_FALSE;
-        }
-        else if (t == "SEQMODEL_V2") {
-            if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
-            if (!(ss >> t) || t != "LAYERS") return MQL_FALSE;
-        }
-        else if (t == "LSTM_V1") {
-            legacy_v1 = true;
-            if (!(ss >> t) || t != "SEQ_LEN" || !(ss >> seq_len)) return MQL_FALSE;
-            if (!(ss >> t) || t != "LSTM_LAYERS") return MQL_FALSE;
-        }
-        else {
-            return MQL_FALSE;
-        }
-        int nl; if (!(ss >> nl)) return MQL_FALSE;
-        lstm_layers.clear();
-        layer_types.clear();
-        for (int i = 0; i < nl; i++) {
-            int in_d, hid_d; float drop; int lt = (int)SequenceLayerType::LSTM;
-            if (legacy_v1) {
-                if (!(ss >> in_d >> hid_d >> drop)) return MQL_FALSE;
-            } else {
-                if (!(ss >> lt >> in_d >> hid_d >> drop)) return MQL_FALSE;
+        if (!data || !init_ok) { SetError(L"Null checkpoint or uninitialized model"); return MQL_FALSE; }
+        std::istringstream input(data);
+        const auto state = dn::read_checkpoint(input);
+        std::vector<std::unique_ptr<RecurrentLayer>> next_layers;
+        std::vector<SequenceLayerType> next_types;
+        auto copy = [](GPUMemory<float>& dst, const std::vector<float>& src) -> MQL_BOOL {
+            if (dst.count != src.size()) return MQL_FALSE;
+            CUDA_CHECK_RET(cudaMemcpy(dst.ptr, src.data(), src.size() * sizeof(float), cudaMemcpyHostToDevice));
+            return MQL_TRUE;
+        };
+        for (const auto& saved : state.layers) {
+            std::unique_ptr<RecurrentLayer> layer;
+            if (saved.type == 1) layer = std::make_unique<GRULayer>();
+            else if (saved.type == 0) layer = std::make_unique<RNNLayer>();
+            else layer = std::make_unique<LSTMLayer>();
+            if (!layer->InitFromData(saved.input, saved.hidden, saved.dropout) ||
+                !copy(layer->W, saved.weights) || !copy(layer->b, saved.bias)) return MQL_FALSE;
+            if (saved.type == 1) {
+                auto* gru = static_cast<GRULayer*>(layer.get());
+                if (!copy(gru->Wn_x, saved.candidate_x) || !copy(gru->Wn_h, saved.candidate_h) ||
+                    !copy(gru->bn_x, saved.bias_x) || !copy(gru->bn_h, saved.bias_h)) return MQL_FALSE;
             }
-            // FIX P03: factory by serialized layer type.
-            std::unique_ptr<RecurrentLayer> l;
-            SequenceLayerType ltype = legacy_v1 ? SequenceLayerType::LSTM : (SequenceLayerType)lt;
-            if (ltype == SequenceLayerType::GRU) l = std::make_unique<GRULayer>();
-            else if (ltype == SequenceLayerType::RNN) l = std::make_unique<RNNLayer>();
-            else l = std::make_unique<LSTMLayer>();
-            if (!l->InitFromData(in_d, hid_d, drop)) return MQL_FALSE;
-            size_t w_count = l->W.count, b_count = l->b.count;
-            if (v3) { if (!(ss >> w_count >> b_count)) return MQL_FALSE; }
-            std::vector<float> Wv(w_count), bv(b_count);
-            for (size_t k = 0; k < Wv.size(); k++) ss >> Wv[k];
-            for (size_t k = 0; k < bv.size(); k++) ss >> bv[k];
-            CUDA_CHECK_RET(cudaMemcpy(l->W.ptr, Wv.data(), Wv.size() * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-            CUDA_CHECK_RET(cudaMemcpy(l->b.ptr, bv.data(), bv.size() * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-            if (v3 && ltype == SequenceLayerType::GRU) {
-                auto* g = dynamic_cast<GRULayer*>(l.get());
-                size_t c1, c2, c3, c4; if (!(ss >> c1 >> c2 >> c3 >> c4)) return MQL_FALSE;
-                std::vector<float> Wnx(c1), Wnh(c2), bnx(c3), bnh(c4);
-                for (size_t k = 0; k < c1; ++k) ss >> Wnx[k];
-                for (size_t k = 0; k < c2; ++k) ss >> Wnh[k];
-                for (size_t k = 0; k < c3; ++k) ss >> bnx[k];
-                for (size_t k = 0; k < c4; ++k) ss >> bnh[k];
-                CUDA_CHECK_RET(cudaMemcpy(g->Wn_x.ptr, Wnx.data(), c1 * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-                CUDA_CHECK_RET(cudaMemcpy(g->Wn_h.ptr, Wnh.data(), c2 * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-                CUDA_CHECK_RET(cudaMemcpy(g->bn_x.ptr, bnx.data(), c3 * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-                CUDA_CHECK_RET(cudaMemcpy(g->bn_h.ptr, bnh.data(), c4 * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-            }
-            lstm_layers.push_back(std::move(l));
-            layer_types.push_back(ltype);
+            next_layers.push_back(std::move(layer));
+            next_types.push_back(static_cast<SequenceLayerType>(saved.type));
         }
-        if (!(ss >> t) || t != "OUTPUT") return MQL_FALSE;
-        int oi, oo; if (!(ss >> oi >> oo)) return MQL_FALSE;
-        output_layer = std::make_unique<OutputLayer>();
-        if (!output_layer->InitFromData(oi, oo)) return MQL_FALSE;
-        std::vector<float> Wv(oi * oo), bv(oo);
-        for (size_t k = 0; k < Wv.size(); k++) ss >> Wv[k];
-        for (size_t k = 0; k < bv.size(); k++) ss >> bv[k];
-        CUDA_CHECK_RET(cudaMemcpy(output_layer->W.ptr, Wv.data(), Wv.size() * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
-        CUDA_CHECK_RET(cudaMemcpy(output_layer->b.ptr, bv.data(), bv.size() * sizeof(float), cudaMemcpyHostToDevice)); // FIX P11
+        auto next_output = std::make_unique<OutputLayer>();
+        if (!next_output->InitFromData(state.output_input, state.output) ||
+            !copy(next_output->W, state.weights) || !copy(next_output->b, state.bias)) return MQL_FALSE;
+
+        // Commit only after parsing, allocations and all uploads succeed.
+        lstm_layers.swap(next_layers);
+        layer_types.swap(next_types);
+        output_layer.swap(next_output);
+        seq_len = state.sequence;
+        InvalidateBatch();
+        inter_layer_ts.clear();
+        serialize_buf.clear();
+        step = 0; b1_pow = b2_pow = 1.0f;
+        last_full_train_mse = 0.0;
+        m_final_mse.store(0.0); m_final_epochs.store(0);
+        m_progress.Reset(); m_state.store(TS_IDLE);
         return MQL_TRUE;
     }
+
 };
 
 // ============================================================================
@@ -2722,11 +2849,19 @@ static int        g_id = 1;
 static std::mutex g_map_mtx;
 
 static std::shared_ptr<SequenceModel> FindAndLockExclusive(int h, std::unique_lock<std::shared_mutex>& lk) {
-    std::lock_guard<std::mutex> map_lk(g_map_mtx);
-    auto it = g_nets.find(h);
-    if (it == g_nets.end()) return nullptr;
-    std::shared_ptr<SequenceModel> net = it->second;
-    lk = std::unique_lock<std::shared_mutex>(net->net_mtx);
+    std::shared_ptr<SequenceModel> net;
+    {
+        std::lock_guard<std::mutex> map_lk(g_map_mtx);
+        auto it = g_nets.find(h);
+        if (it == g_nets.end()) { SetError(L"Invalid model handle %d", h); return nullptr; }
+        net = it->second;
+    }
+    lk = std::unique_lock<std::shared_mutex>(net->net_mtx, std::try_to_lock);
+    if (!lk.owns_lock() || net->GetStatus() == TS_TRAINING || net->IsClosed()) {
+        if (lk.owns_lock()) lk.unlock();
+        SetError(L"Model is busy training, in use, or closed");
+        return nullptr;
+    }
     return net;
 }
 
@@ -2756,16 +2891,19 @@ static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n
     return std::sqrt((double)sum);
 }
 
-DLL_EXPORT int DLL_CALL DN_Create() {
+DLL_EXPORT int DLL_CALL DN_Create() try {
     auto net = std::make_shared<SequenceModel>();
     if (!net->IsInitOK()) return 0;
     std::lock_guard<std::mutex> l(g_map_mtx);
+    if (g_id == std::numeric_limits<int>::max()) {
+        SetError(L"Model handle space exhausted"); return 0;
+    }
     int id = g_id++;
     g_nets[id] = net;
     return id;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_Create", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT void DLL_CALL DN_Free(int h) {
+DLL_EXPORT void DLL_CALL DN_Free(int h) try {
     std::shared_ptr<SequenceModel> victim;
     {
         std::lock_guard<std::mutex> map_lk(g_map_mtx);
@@ -2774,101 +2912,113 @@ DLL_EXPORT void DLL_CALL DN_Free(int h) {
         victim = it->second;
         g_nets.erase(it);
     }
-    victim->StopTraining();
-    {
-        std::unique_lock<std::shared_mutex> lk(victim->net_mtx);
-    }
-}
+    victim->Close();
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_Free", e.what()); return; } catch (...) { SetError(L"Unhandled DLL exception"); return; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetSequenceLength(int h, int seq_len) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
+    if (seq_len <= 0) { SetError(L"Sequence length must be positive"); return MQL_FALSE; }
     net->SetSequenceLength(seq_len);
     return MQL_TRUE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SetSequenceLength", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_SetMiniBatchSize(int h, int mbs) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetMiniBatchSize(int h, int mbs) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
+    if (mbs <= 0) { SetError(L"Mini-batch size must be positive"); return MQL_FALSE; }
     net->SetMiniBatchSize(mbs);
     return MQL_TRUE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SetMiniBatchSize", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_AddLayerEx(int h, int in, int out, int act,
     int ln, double drop)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->AddLayer(in, out, act, ln, (float)drop) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_AddLayerEx", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_AddGRULayer(int h, int in, int out, double drop)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->AddGRULayer(in, out, (float)drop) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_AddGRULayer", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_AddRNNLayer(int h, int in, int out, double drop)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->AddRNNLayer(in, out, (float)drop) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_AddRNNLayer", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGradClip(int h, double clip) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
+    if (!dn::finite_float(clip) || clip < 0) { SetError(L"Gradient clip must be finite and nonnegative"); return MQL_FALSE; }
     net->SetGradClip((float)clip);
     return MQL_TRUE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SetGradClip", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetOutputDim(int h, int out_dim) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     return net->SetOutputLayer(out_dim);
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SetOutputDim", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadBatch(int h, const double* X,
     const double* T, int batch, int in, int out, int l)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->LoadBatch(X, T, batch, in, out, l) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_LoadBatch", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_PredictBatch(int h, const double* X,
     int batch, int in, int l, double* Y)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->PredictBatch(X, batch, in, l, Y) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_PredictBatch", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_SnapshotWeights(int h) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SnapshotWeights(int h) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->SnapshotWeights() : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SnapshotWeights", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_RestoreWeights(int h) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_RestoreWeights(int h) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->RestoreWeights() : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_RestoreWeights", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 // --- Async exports ---
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
     double target_mse, double lr, double wd)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     // FIX P06: DN_Train is synchronous.
     MQL_BOOL ok = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
@@ -2876,101 +3026,104 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_Train(int h, int epochs,
     if (!ok) return MQL_FALSE;
     net->WaitForTrainingComplete();
     return (net->GetStatus() == TS_COMPLETED) ? MQL_TRUE : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_Train", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_TrainAsync(int h, int epochs,
     double target_mse, double lr, double wd)
-{
+try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     MQL_BOOL result = net->StartTrainingAsync_Locked(epochs, target_mse, lr, wd);
     return result;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_TrainAsync", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) {
+DLL_EXPORT int DLL_CALL DN_GetTrainingStatus(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetStatus() : -1;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetTrainingStatus", e.what()); return TS_ERROR; } catch (...) { SetError(L"Unhandled DLL exception"); return TS_ERROR; }
 
 DLL_EXPORT void DLL_CALL DN_GetTrainingResult(int h, double* out_mse,
     int* out_epochs)
-{
+try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
+    if (out_mse) *out_mse = 0.0;
+    if (out_epochs) *out_epochs = 0;
     if (net) {
         double m; int e;
         net->GetResult(m, e);
         if (out_mse)    *out_mse = m;
         if (out_epochs) *out_epochs = e;
     }
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetTrainingResult", e.what()); return; } catch (...) { SetError(L"Unhandled DLL exception"); return; }
 
-DLL_EXPORT void DLL_CALL DN_StopTraining(int h) {
+DLL_EXPORT void DLL_CALL DN_StopTraining(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     if (net) net->StopTraining();
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_StopTraining", e.what()); return; } catch (...) { SetError(L"Unhandled DLL exception"); return; }
 
 // --- Progress exports (ALL LOCK-FREE) ---
 
-DLL_EXPORT int DLL_CALL DN_GetProgressEpoch(int h) {
+DLL_EXPORT int DLL_CALL DN_GetProgressEpoch(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressEpoch() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressEpoch", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_GetProgressTotalEpochs(int h) {
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalEpochs(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalEpochs() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressTotalEpochs", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_GetProgressMiniBatch(int h) {
+DLL_EXPORT int DLL_CALL DN_GetProgressMiniBatch(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressMiniBatch() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressMiniBatch", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_GetProgressTotalMiniBatches(int h) {
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalMiniBatches(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalMiniBatches() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressTotalMiniBatches", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressLR(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressLR(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressLR() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressLR", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressMSE(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressMSE(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressMSE() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressMSE", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressBestMSE(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressBestMSE(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressBestMSE() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressBestMSE", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressGradNorm(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressGradNorm(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressGradNorm() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressGradNorm", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_GetProgressTotalSteps(int h) {
+DLL_EXPORT int DLL_CALL DN_GetProgressTotalSteps(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? net->GetProgressTotalSteps() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressTotalSteps", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressPercent(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressPercent(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressPercent() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressPercent", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressElapsedSec(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressElapsedSec(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressElapsedMs() / 1000.0 : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressElapsedSec", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetProgressETASec(int h) {
+DLL_EXPORT double DLL_CALL DN_GetProgressETASec(int h) try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     return net ? (double)net->GetProgressETAMs() / 1000.0 : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressETASec", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
     int* out_epoch, int* out_total_epochs,
@@ -2978,7 +3131,7 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
     double* out_lr, double* out_mse, double* out_best_mse,
     double* out_grad_norm, double* out_pct,
     double* out_elapsed_sec, double* out_eta_sec)
-{
+try {
     std::shared_ptr<SequenceModel> net = FindNetNoLock(h);
     if (!net) return MQL_FALSE;
 
@@ -2995,60 +3148,66 @@ DLL_EXPORT MQL_BOOL DLL_CALL DN_GetProgressAll(int h,
     if (out_eta_sec)      *out_eta_sec = (double)net->GetProgressETAMs() / 1000.0;
 
     return MQL_TRUE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetProgressAll", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
 // --- State / diagnostics ---
 
-DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) {
+DLL_EXPORT int DLL_CALL DN_GetLayerCount(int h) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->GetLayerCount() : 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetLayerCount", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) {
+DLL_EXPORT double DLL_CALL DN_GetLayerWeightNorm(int h, int l) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetLayerWeightNorm(l) : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetLayerWeightNorm", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) {
+DLL_EXPORT double DLL_CALL DN_GetGradNorm(int h) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? (double)net->GetGradNorm() : 0.0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetGradNorm", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT int DLL_CALL DN_SaveState(int h) {
+DLL_EXPORT int DLL_CALL DN_SaveState(int h) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return 0;
     if (!net->Save(net->serialize_buf)) return 0;
     return (int)net->serialize_buf.size() + 1;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_SaveState", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_GetState(int h, char* buf, int max_len) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     if (!net) return MQL_FALSE;
     const auto& s = net->serialize_buf;
-    if (s.empty() || max_len < (int)s.size() + 1) return MQL_FALSE;
+    if (!buf || s.empty() || max_len <= 0 || (size_t)max_len <= s.size()) { SetError(L"State buffer is null or too small; call DN_SaveState first"); return MQL_FALSE; }
     memcpy(buf, s.c_str(), s.size());
     buf[s.size()] = 0;
     return MQL_TRUE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetState", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadState(int h, const char* buf) {
+DLL_EXPORT MQL_BOOL DLL_CALL DN_LoadState(int h, const char* buf) try {
+    std::shared_ptr<SequenceModel> net;
     std::unique_lock<std::shared_mutex> lk;
-    std::shared_ptr<SequenceModel> net = FindAndLockExclusive(h, lk);
+    net = FindAndLockExclusive(h, lk);
     return net ? net->Load(buf) : MQL_FALSE;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_LoadState", e.what()); return 0; } catch (...) { SetError(L"Unhandled DLL exception"); return 0; }
 
-DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) {
+DLL_EXPORT void DLL_CALL DN_GetError(short* buf, int len) try {
     if (!buf || len <= 0) return;
     std::lock_guard<std::mutex> lk(g_err_mtx);
     int copy_len = std::min((int)g_last_err_w.size(), len - 1);
     for (int i = 0; i < copy_len; i++)
         buf[i] = (short)g_last_err_w[(size_t)i];
     buf[copy_len] = 0;
-}
+} catch (const std::exception& e) { SetError(L"%S: %S", "DN_GetError", e.what()); return; } catch (...) { SetError(L"Unhandled DLL exception"); return; }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
