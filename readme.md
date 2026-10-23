@@ -1,10 +1,28 @@
 # MQL5GPULibrary_LSTM
 
-CUDA recurrent neural networks for MetaTrader 5: stacked **LSTM, GRU and tanh RNN** layers, a linear output head, AdamW training, dropout, gradient clipping and asynchronous progress reporting.
+CUDA neural networks for MetaTrader 5 and standalone Windows applications. Version **2.3.0** supports configurable acyclic graphs of **LSTM, GRU, tanh RNN, Dense and Identity** layers, branches, concatenation, residual sums and multiple outputs. AdamW, dropout, gradient clipping and asynchronous training retain the original sequential C ABI.
 
 Author: **Tomáš Bělák** · [MIT license](LICENSE.txt) · [Česky](docs/README.cs.md)
 
 ![LSTM](LSTM.gif)
+
+## Cross-asset forecasts and manual
+
+The new [LSTM_CrossAsset_Forecast](MQL5/Indicators/LSTM_CrossAsset_Forecast.mq5) indicator uses closed bars from the target chart and configurable predictor markets. Suggested starting setup: **AUDUSD H1**, with **NZDUSD, USDJPY and USDCAD** as drivers. Use the exact symbol names available on your IC Trading account. Commodities can also be selected; mismatched market sessions reduce synchronized history.
+
+It trains a separate candidate asynchronously, uses train-only normalization and a purged chronological holdout, and draws six direct forecast horizons into the future. By default a candidate must beat the zero-return persistence baseline; otherwise the prior accepted model or a visibly gray baseline remains. Error bands are validation RMSE bands, not calibrated confidence intervals. No currency's forecastability or profitability is established by this example.
+
+- [Comprehensive Czech PDF manual](docs/MQL5GPULibrary_Manual_cs.pdf) and [reviewable source](docs/MANUAL.cs.md).
+- [Topology, data and deployment guide](docs/MANUAL.cs.md), including all indicator inputs and runtime dependencies.
+- [Standalone CSV training](examples/train_csv.py) and [saved-model inference](examples/predict_csv.py), using the standard-library [Python client](python/mql5gpu.py).
+
+Example topology string (one line):
+
+```text
+lstm:32:linear:0.10:concat:-1;gru:16:linear:0.10:concat:-1;dense:24:tanh:0:concat:0,1
+```
+
+Each node is `type:width:activation:dropout:merge:parents`. External input is `-1`; earlier nodes are zero-based. `concat` joins feature channels; `sum` requires equal widths. Dense activations are linear/tanh/relu/sigmoid. All nodes must reach the output. This supports arbitrary graphs of the listed operations, not unimplemented operations such as attention or convolution.
 
 ## Build and test
 
@@ -21,12 +39,12 @@ Set `CMAKE_CUDA_ARCHITECTURES` for the deployment GPU. Output: `build/Release/MQ
 ## Install in MT5
 
 1. Build the DLL from this source revision and copy it to the terminal data directory, `MQL5/Libraries`.
-2. Copy `MQL5/Include/MQL5GPULibrary.mqh` to `MQL5/Include`.
+2. Copy both files in `MQL5/Include/` to the terminal's `MQL5/Include`.
 3. Copy the indicators and `MQL5/Scripts/LSTM_SmokeTest.mq5` into their corresponding terminal directories. `LSTM_Pure_MTF_EA.mq5` is an Expert Advisor; place it under `MQL5/Experts` when using it as an EA.
 4. Make the CUDA runtime, cuBLAS and cuRAND DLLs available to the terminal, enable DLL imports, and compile the desired MQL5 source in MetaEditor.
 5. Run `LSTM_SmokeTest` to verify synthetic-data training and prediction before using an indicator.
 
-The smoke script makes no trades. The indicators and EA are examples; model validation and trading performance are separate from library correctness. Generated DLLs are local build artifacts, not source-controlled releases.
+The smoke script and new cross-asset indicator make no trades. The older indicators and EA remain examples; model validation and trading performance are separate from library correctness. Generated DLL/EX5 files are local release artifacts. Build a package with `tools/package_release.ps1` after compiling MQL5 and building the PDF. The package includes `tools/Install-MT5.ps1`; its optional `-CopyCudaRuntime` copies CUDA 13 dependencies from your installed toolkit. The NVIDIA driver and Visual C++ x64 runtime remain prerequisites.
 
 ## API essentials
 
@@ -58,7 +76,7 @@ See [the API contract](docs/API.md) for buffer lengths, lifecycle, state formats
 
 ## What is tested
 
-Portable tests validate dimension overflow, malformed checkpoint handling and consistency of all 38 exported signatures across CUDA, C and MQL5. GPU tests exercise all recurrent types, stacked networks, CPU reference equations and numerical gradient norms, serialization rollback, asynchronous lifecycle and final loss reporting. Tests run against the newly built DLL; they do not claim to verify trading profitability or MetaEditor compilation.
+Portable tests validate dimension overflow, graph/checkpoint parsing, leakage prevention and consistency of all 45 exported signatures across CUDA, C and MQL5. GPU tests exercise recurrent and branched graphs, CPU reference equations and numerical gradient norms, serialization rollback, asynchronous lifecycle and standalone CSV model save/reload. The new indicator and smoke test also compile in IC Trading MetaEditor with zero errors and warnings. See the [validation record](docs/VALIDATION.md) for tested scope and limitations.
 
 GitHub Actions runs portable checks on Windows and Linux. GPU checks are an explicit workflow for a Windows runner labeled `cuda`; hosted CPU checks do not substitute for GPU verification.
 
@@ -67,11 +85,13 @@ GitHub Actions runs portable checks on Windows and Linux. GPU checks are an expl
 | Path | Purpose |
 | --- | --- |
 | `kernel.cu` | CUDA kernels, recurrent layers, training and DLL exports |
+| `src/graph_layers.cuh`, `include/topology.h` | Dense/Identity CUDA operations and graph validation |
 | `include/` | C ABI, shared dimension validation and CPU checkpoint parser |
 | `MQL5/Include/` | One shared DLL import declaration for all examples |
 | `MQL5/Indicators/`, `MQL5/Scripts/` | MT5 examples and smoke test |
 | `tests/`, `tools/check_api.py` | CPU, ABI and GPU regression checks |
 | `docs/` | API, build and Czech usage documentation |
+| `python/`, `examples/` | Standalone time-series pipeline without MT5 |
 | `CMakeLists.txt`, `*.sln`, `*.vcxproj` | Build entry points |
 
 [Changes](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Implementation guide](func_docu.md)

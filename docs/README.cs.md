@@ -1,6 +1,12 @@
 # MQL5GPULibrary_LSTM — český návod
 
-Autor: **Tomáš Bělák**. Knihovna propojuje MetaTrader 5 s CUDA implementací LSTM, GRU a RNN. Podporuje více vrstev, AdamW, dropout, ořezávání gradientů, asynchronní trénink a ukládání vah.
+Autor: **Tomáš Bělák**. Verze **2.3.0** podporuje acyklické grafy LSTM, GRU, RNN, Dense a Identity s libovolnou hloubkou, šířkami, větvením, konkatenací a reziduálními součty v mezích paměti a validovaných rozměrů. Obsahuje AdamW, dropout, ořezávání gradientů, asynchronní trénink a checkpointy V4.
+
+**[Komplexní PDF manuál](MQL5GPULibrary_Manual_cs.pdf)** · [Text manuálu](MANUAL.cs.md) · [Ověřené testy](VALIDATION.md)
+
+Nový indikátor `LSTM_CrossAsset_Forecast` předpovídá několik budoucích uzavíracích cen cílového grafu s pomocí dalších trhů. Výchozí nastavení je AUDUSD H1 a NZDUSD, USDJPY, USDCAD; použijte přesné názvy z IC Trading Market Watch. Komodity lze zvolit také. Vstupem jsou uzavřené svíčky, normalizace používá jen trénovací období a kandidát musí standardně překonat persistenci na oddělené chronologické validaci. Bez vyhovujícího modelu se zobrazuje šedá reference. Žádná z uvedených měn nemá tímto doloženou predikovatelnost.
+
+Samostatné použití bez MT5 zajišťuje `python/mql5gpu.py` a příklady `examples/train_csv.py`, `examples/predict_csv.py`. Uložený model zahrnuje váhy i metadata normalizace; Windows x64, NVIDIA GPU a příslušný CUDA runtime jsou stále potřebné.
 
 ## Sestavení
 
@@ -17,7 +23,7 @@ Architekturu `86` upravte podle GPU; odpovídá zde ověřené RTX 3060. DLL vzn
 ## Instalace do MT5
 
 1. DLL zkopírujte do `MQL5/Libraries` v datové složce terminálu.
-2. Společný soubor `MQL5/Include/MQL5GPULibrary.mqh` zkopírujte do `MQL5/Include`.
+2. Oba soubory z `MQL5/Include/` zkopírujte do `MQL5/Include`.
 3. Indikátory a skript `LSTM_SmokeTest.mq5` umístěte do odpovídajících složek. Soubor `LSTM_Pure_MTF_EA.mq5` patří při použití jako EA do `MQL5/Experts`.
 4. Zajistěte dostupnost CUDA runtime, cuBLAS a cuRAND pro proces terminálu, povolte import DLL a zdroje zkompilujte v MetaEditoru.
 5. Spusťte smoke test se syntetickými daty. Skript neprovádí obchody.
@@ -34,4 +40,4 @@ Architekturu `86` upravte podle GPU; odpovídá zde ověřené RTX 3060. DLL vzn
 
 [Úplný kontrakt API](API.md) · [Přehled oprav](../CHANGELOG.md)
 
-Testy knihovny neověřují výnosnost obchodní strategie. Způsob normalizace, časové rozdělení trénovacích/testovacích dat a validaci modelu je potřeba řešit v konkrétní aplikaci.
+Nový indikátor a smoke test byly zkompilovány v IC Trading MetaEditoru bez chyb a varování. Předpřipravený balíček obsahuje DLL i EX5 a instalátor; konkrétní brokerovou historii a běh na živém grafu je nutné ověřit v terminálu. Testy knihovny neověřují výnosnost obchodní strategie.

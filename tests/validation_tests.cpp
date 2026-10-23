@@ -37,6 +37,17 @@ int main() {
     CHECK(dn::read_checkpoint(v1).layers[0].type == 2);
     std::istringstream v2("SEQMODEL_V2 SEQ_LEN 1 LAYERS 1 0 1 1 0 0 0 0 OUTPUT 1 1 1 0");
     CHECK(dn::read_checkpoint(v2).layers[0].type == 0);
+    const std::string graph = "SEQMODEL_V4 SEQ_LEN 2 INPUT 1 LAYERS 2 "
+        "3 1 1 0 NODE 1 0 1 -1 1 1 0.5 0 "
+        "4 1 1 0 NODE 0 1 2 -1 0 0 0 OUTPUT_NODE 1 OUTPUT 1 1 0.25 0";
+    std::istringstream v4(graph);
+    auto dag = dn::read_checkpoint(v4);
+    CHECK(dag.graph && dag.input == 1 && dag.output_node == 1);
+    CHECK(dag.layers[1].node.parents.size() == 2 && dag.layers[1].weights.empty());
+    CHECK(dn::merged_width(dn::NodeSpec{0, 0, {-1, 0}}, 2, {3}) == 5);
+    CHECK(dn::merged_width(dn::NodeSpec{0, 1, {-1, 0}}, 2, {2}) == 2);
+    CHECK(!dn::all_reach_output({{0,0,{-1}}, {0,0,{-1}}}, 1));
+    CHECK(!dn::all_reach_output({{0,0,{1}}, {0,0,{0}}}, 1));
     const std::string invalid[] = {
         "", "SEQMODEL_V3 SEQ_LEN 0 LAYERS 1", "SEQMODEL_V3 SEQ_LEN 1 LAYERS -1",
         "SEQMODEL_V3 SEQ_LEN 1 LAYERS 999999999",
@@ -45,7 +56,11 @@ int main() {
         "SEQMODEL_V3 SEQ_LEN 1 LAYERS 1 2 1 1 0 999999999 4",
         "SEQMODEL_V3 SEQ_LEN 1 LAYERS 1 2 1 1 0 8 4 nan",
         "SEQMODEL_V2 SEQ_LEN 1 LAYERS 1 1 1 1 0",
-        valid + " junk", valid.substr(0, valid.size() - 2)
+        valid + " junk", valid.substr(0, valid.size() - 2),
+        graph + " trailing", graph.substr(0, graph.size()-2),
+        "SEQMODEL_V4 SEQ_LEN 2 INPUT 1 LAYERS 1 3 1 1 0 NODE 0 0 1 0",
+        "SEQMODEL_V4 SEQ_LEN 2 INPUT 2 LAYERS 1 4 2 1 0 NODE 0 0 1 -1",
+        "SEQMODEL_V4 SEQ_LEN 2 INPUT 1 LAYERS 1 3 1 1 0 NODE 0 0 65"
     };
     for (const auto& text : invalid) {
         bool rejected = false;

@@ -6,6 +6,9 @@ build/
 build-*/
 dist/
 .venv/
+*.ex5
+output/
+tmp/
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 

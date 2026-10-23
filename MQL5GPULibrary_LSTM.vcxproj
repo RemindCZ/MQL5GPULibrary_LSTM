@@ -93,7 +93,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <CudaCompile Include="kernel.cu">
-      <AdditionalDependencies>$(ProjectDir)include\model_validation.h;$(ProjectDir)include\checkpoint.h;$(ProjectDir)include\MQL5GPULibrary.h;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(ProjectDir)include\model_validation.h;$(ProjectDir)include\checkpoint.h;$(ProjectDir)include\MQL5GPULibrary.h;$(ProjectDir)include\topology.h;$(ProjectDir)src\graph_layers.cuh;%(AdditionalDependencies)</AdditionalDependencies>
       <DeploymentContent>true</DeploymentContent>
     </CudaCompile>
   </ItemGroup>

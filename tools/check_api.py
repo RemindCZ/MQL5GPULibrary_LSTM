@@ -18,7 +18,7 @@ def signatures(text, pattern, mql=False):
                 raise ValueError(f'{name}: cannot parse {argument!r}')
             const, dtype, pointer, param_name, array = match.groups()
             if mql and pointer:
-                expected_array = param_name in ('X', 'T', 'Y', 'buf')
+                expected_array = param_name in ('X', 'T', 'Y', 'buf', 'parents')
                 if bool(array) != expected_array:
                     raise ValueError(f'{name}: incorrect MQL array/scalar reference for {param_name}')
             types.append((bool(const), dtype, bool(pointer)))

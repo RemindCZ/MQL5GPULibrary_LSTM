@@ -52,4 +52,23 @@ Optional memory checking using NVIDIA Compute Sanitizer:
 
 ## MetaEditor verification
 
-Install the shared include in the terminal data folder, compile all modified MQL5 examples in MetaEditor, then run `LSTM_SmokeTest` with DLL imports enabled. CTest validates the DLL and import contracts, not the MetaEditor compiler or live terminal behavior. Use synthetic/demo data for integration checks.
+Compile the new cross-asset indicator and smoke test against the repository's include files:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/compile_mql.ps1
+# Use -MetaEditor 'C:\path\MetaEditor64.exe' for a different installation.
+```
+
+The script defaults to IC Trading (MU) MT5 and requires fresh EX5/log output with zero errors and warnings. The execution-policy override applies to this process only. CTest validates DLL/import contracts, not a live chart. After installation, run `LSTM_SmokeTest` with DLL imports enabled, then check the indicator on a demo chart.
+
+## Manual and release package
+
+```powershell
+python -m pip install reportlab
+python tools/build_manual.py
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/package_release.ps1
+```
+
+The PDF builder uses Arial/Consolas from Windows Fonts and writes `output/pdf/MQL5GPULibrary_Manual_cs.pdf`. Review rendered pages before distributing a changed document. A reviewed copy is kept under `docs/`. The package requires the Release DLL/import library, compiled EX5 files and PDF, then creates `output/release/MQL5GPULibrary-2.3.0.zip` with a SHA256 manifest. It refuses to overwrite an existing package directory; choose a new `-OutputDirectory` for a new build.
+
+The package installer accepts the terminal **data** directory. `-CopyCudaRuntime -CudaPath <toolkit>` copies `cublas64_13.dll`, `cublasLt64_13.dll` and `curand64_10.dll` from the user's toolkit into MQL5/Libraries. Those third-party binaries are not included in the ZIP. NVIDIA driver and VC++ x64 runtime installation remain separate prerequisites. Close MT5 before upgrading a loaded DLL; use `-Force` only to replace this package's existing files.

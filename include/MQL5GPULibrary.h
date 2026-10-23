@@ -15,6 +15,13 @@
 extern "C" {
 #endif
 
+DN_API int DN_CALL DN_GetVersion(void);
+DN_API int DN_CALL DN_BeginGraph(int h, int features, int sequence);
+DN_API int DN_CALL DN_AddGraphNode(int h, int type, int width, int activation, double dropout, const int* parents, int parent_count, int merge);
+DN_API int DN_CALL DN_SetGraphOutput(int h, int node, int outputs);
+DN_API int DN_CALL DN_GetInputDim(int h);
+DN_API int DN_CALL DN_GetOutputDim(int h);
+DN_API int DN_CALL DN_GetSequenceLength(int h);
 DN_API int DN_CALL DN_Create(void);
 DN_API void DN_CALL DN_Free(int h);
 DN_API int DN_CALL DN_SetSequenceLength(int h, int seq_len);
