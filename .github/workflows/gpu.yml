@@ -1,0 +1,25 @@
+name: Windows GPU checks
+on:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: CUDA architecture number supported by the runner
+        required: true
+        default: '86'
+permissions:
+  contents: read
+jobs:
+  gpu:
+    runs-on: [self-hosted, Windows, X64, cuda]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: pwsh
+        env:
+          DN_ARCH: ${{ inputs.architectures }}
+        run: cmake -S . -B build -A x64 "-DCMAKE_CUDA_ARCHITECTURES=$env:DN_ARCH"
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Test on GPU
+        run: ctest --test-dir build -C Release --output-on-failure
