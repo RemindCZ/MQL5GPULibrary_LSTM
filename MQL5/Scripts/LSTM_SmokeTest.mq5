@@ -1,6 +1,7 @@
 #property strict
 #property script_show_inputs
 #include <MQL5GPULibrary.mqh>
+#include <MQL5GPUTopology.mqh>
 
 // Synthetic data only; does not submit orders or read account information.
 string LastLibraryError()
@@ -39,6 +40,20 @@ void OnStart()
    else
    {
       Print("LSTM smoke test failed: ", LastLibraryError());
+   }
+   if(ok)
+   {
+      string reason;
+      double graph_targets[8]={0.4,0.5,0.5,0.6,0.6,0.7,0.7,0.8};
+      double graph_prediction[8];
+      ok=GPUBuildTopology(h,1,3,2,
+         "lstm:4:linear:0:concat:-1;gru:4:linear:0:concat:-1;identity:0:linear:0:sum:0,1;dense:3:tanh:0:concat:2,-1",reason)
+         && DN_LoadBatch(h,x,graph_targets,4,3,2,0)
+         && DN_Train(h,20,0,0.005,0)
+         && DN_PredictBatch(h,x,4,3,0,graph_prediction);
+      if(ok) PrintFormat("Graph smoke test passed: version=%d, outputs=%d, prediction=%.6f",
+                         DN_GetVersion(),DN_GetOutputDim(h),graph_prediction[7]);
+      else Print("Graph smoke test failed: ",reason," ",LastLibraryError());
    }
    DN_Free(h);
 }

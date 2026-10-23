@@ -1,6 +1,22 @@
 # DLL API contract
 
-The authoritative declarations are [MQL5GPULibrary.h](../include/MQL5GPULibrary.h) and [MQL5GPULibrary.mqh](../MQL5/Include/MQL5GPULibrary.mqh). ABI: x64 Windows, C linkage, `__stdcall`, `int` booleans (1 success, 0 failure), double buffers at the boundary, float32 on the GPU.
+The authoritative declarations are [MQL5GPULibrary.h](../include/MQL5GPULibrary.h) and [MQL5GPULibrary.mqh](../MQL5/Include/MQL5GPULibrary.mqh), with 45 exports in version 2.3.0. ABI: x64 Windows, C linkage, `__stdcall`, `int` booleans (1 success, 0 failure), double buffers at the boundary, float32 on the GPU. Handle, node-ID, size, status and telemetry functions have the distinct return values documented below.
+
+## Graph API (2.3.0)
+
+`DN_GetVersion()` returns `20300`. `DN_BeginGraph(h, features, sequence)` clears the previous architecture/data and starts a graph with fixed input width. Add nodes in topological order using `DN_AddGraphNode(h, type, width, activation, dropout, parents, parent_count, merge)`.
+
+- Public types: **0=LSTM, 1=GRU, 2=RNN, 3=Dense, 4=Identity**.
+- Activation: Dense supports **0=linear, 1=tanh, 2=ReLU, 3=sigmoid**. Other types require 0; their internal recurrent activations are unchanged.
+- Parents: external input **-1**, or IDs of earlier nodes; caller supplies `parent_count` valid integers (1–64).
+- Merge: **0=concatenate** in parent order; **1=sum**, requiring equal parent widths.
+- Identity: width 0 infers merged width; any explicit width must match. Other widths must be positive.
+- Dropout: finite `0 <= dropout < 1`, including after Dense/Identity outputs.
+- Return: **node ID >= 0 on success, -1 on failure**. Zero is a successful first node.
+
+`DN_SetGraphOutput(h, node, outputs)` creates a linear head from the last timestep of the selected node. Every created node must contribute to that output. Cycles, forward references, disconnected branches and incompatible sums are rejected. The limit is 1024 nodes, plus tensor-index and available-memory limits. `DN_GetInputDim`, `DN_GetOutputDim`, and `DN_GetSequenceLength` return the configured dimensions (zero on error; input/head may be zero before configuration).
+
+Dense/Identity operate per timestep, not across time. Use a recurrent node or engineered lag features to incorporate temporal history. `DN_SetOutputDim` selects the final graph node; sequential AddLayer calls are rejected in graph mode. Building a topology is not an all-or-nothing replacement transaction: configure a separate handle to retain an active model on a builder failure. The MQL/Python helper syntax and examples are in [the manual](MANUAL.cs.md).
 
 ## Ownership and concurrency
 
@@ -62,7 +78,7 @@ Outputs are independent atomic samples, not an indivisible snapshot. `grad_norm`
 2. Allocate that many `char` bytes, then call `DN_GetState(h, buffer, size)`.
 3. Store the ASCII text; pass a NUL-terminated copy to `DN_LoadState`.
 
-New saves use `SEQMODEL_V3`, the classic locale and float32 round-trip precision. Checkpoints contain architecture, dropout and weights/biases, not optimizer moments, training data, RNG state or preprocessing parameters. Save normalization and feature ordering separately.
+New sequential saves use `SEQMODEL_V3`; graph saves use `SEQMODEL_V4`, adding external input width, node activations, merge modes, parent lists and output-node selection. Both use the classic locale and float32 round-trip precision. Checkpoints contain architecture, dropout and weights/biases, not optimizer moments, training data, RNG state or preprocessing parameters. Save normalization and feature ordering separately. V4 appends on-disk Dense=3 and Identity=4; V1–V3 compatibility is unchanged.
 
 The parser validates version, positive dimensions, layer connectivity, tensor counts, finite weights and end-of-file before allocating GPU state. Loading builds replacement layers and commits only when every upload succeeds. Invalid or truncated state preserves the current model. Successful loading clears training data, snapshots, cached serialization, optimizer state and telemetry; call LoadBatch to train again.
 

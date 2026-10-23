@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.3.0 — unreleased
+
+- Add an acyclic graph builder with LSTM/GRU/RNN/Dense/Identity nodes, arbitrary widths, concatenation, residual sums, dense activations and multi-output linear heads.
+- Implement graph forward/backward propagation, shared-parent gradient accumulation, dropout and AdamW for pointwise layers, with independent numerical-gradient tests.
+- Add version/shape introspection, 45 synchronized exports and validated V4 graph checkpoints while preserving V1–V3 readers and the legacy sequential ABI.
+- Add the cross-asset MT5 forecast indicator: closed-bar alignment, training-only normalization, purged holdout, persistence comparison, candidate promotion, future curves, residual bands and prospective CSV logging.
+- Add a standard-library Python client and standalone CSV training/inference with saved preprocessing metadata.
+- Compile the new indicator and smoke script in MetaEditor; add packaging/installation tools and a comprehensive Czech PDF manual.
+
 ## 2.2.0 — unreleased
 
 ### Correctness

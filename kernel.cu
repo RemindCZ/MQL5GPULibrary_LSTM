@@ -1,4 +1,4 @@
-// kernel.cu — Recurrent CUDA DLL v2.2.0
+// kernel.cu — Graph/recurrent CUDA DLL v2.3.0
 // FIX SUMMARY: P01, P02, P03, P04/P12, P05, P06, P07, P08, P09, P10, P11, P13, P14
 // Pure LSTM implementation with CUDA acceleration
 // Features: Async training, Dropout, Multi-layer, Persistent buffers, Progress
@@ -827,7 +827,8 @@ enum class SequenceLayerType : int {
     RNN = 0,
     GRU = 1,
     LSTM = 2,
-    ATTENTION = 3
+    DENSE = 3,
+    IDENTITY = 4
 };
 
 class RecurrentLayer {
@@ -1642,6 +1643,8 @@ struct AttentionLayer {
 // ============================================================================
 // OutputLayer (linear projection)
 // ============================================================================
+#include "src/graph_layers.cuh"
+
 struct OutputLayer {
     int  in_dim = 0;
     int  out_dim = 0;
@@ -1806,6 +1809,18 @@ class SequenceModel {
     std::unique_ptr<OutputLayer> output_layer;
 
     int seq_len = 1;
+    bool graph_mode = false;
+    int graph_input = 0;
+    int graph_output = -1;
+    std::vector<dn::NodeSpec> graph_nodes;
+    std::vector<GPUMemory<float>> graph_inputs, graph_values, graph_gradients;
+
+    int OutputNode() const { return graph_mode ? graph_output : (int)lstm_layers.size()-1; }
+    RecurrentLayer* OutputSource() const {
+        int n=OutputNode();
+        return n>=0 && n<(int)lstm_layers.size() ? lstm_layers[n].get() : nullptr;
+    }
+
 
     GPUMemory<float> X_full, T_full;
     GPUMemory<float> ones;
@@ -1854,9 +1869,68 @@ class SequenceModel {
         return base_lr;
     }
 
+    MQL_BOOL ForwardGraph(GPUContext& ctx, const float* raw, int sl, int batch, bool training, float* y) {
+        graph_inputs.resize(lstm_layers.size()); graph_values.resize(lstm_layers.size());
+        int columns = sl*batch;
+        for (size_t i=0; i<lstm_layers.size(); ++i) {
+            auto& layer=*lstm_layers[i];
+            auto& input=graph_inputs[i]; auto& output=graph_values[i];
+            if (!input.alloc((size_t)columns*layer.input_size) ||
+                !output.alloc((size_t)columns*layer.hidden_size)) return MQL_FALSE;
+            if (graph_nodes[i].merge==1 && !input.zeroAsync(ctx.stream)) return MQL_FALSE;
+            int offset=0;
+            for (int parent : graph_nodes[i].parents) {
+                int width=parent<0 ? graph_input : lstm_layers[parent]->hidden_size;
+                const float* source=parent<0 ? raw : graph_values[parent].ptr;
+                if (graph_nodes[i].merge==1)
+                    kAddInplace<<<toU32(((size_t)columns*width+255)/256),256,0,ctx.stream>>>(columns*width,input.ptr,source);
+                else {
+                    kGraphSlice<<<toU32(((size_t)columns*width+255)/256),256,0,ctx.stream>>>(
+                        columns,width,layer.input_size,offset,source,input.ptr,false);
+                    offset+=width;
+                }
+                CUDA_CHECK_KERNEL_RET();
+            }
+            if (!layer.Forward(ctx.blas,ctx.stream,input.ptr,sl,batch,training,ctx.curand_gen)) return MQL_FALSE;
+            for (int t=0; t<sl; ++t)
+                CUDA_CHECK_RET(cudaMemcpyAsync(output.ptr+(size_t)t*batch*layer.hidden_size,
+                    layer.GetOutputH(t,training),(size_t)batch*layer.hidden_size*sizeof(float),cudaMemcpyDeviceToDevice,ctx.stream));
+        }
+        return output_layer->Forward(ctx.blas,ctx.stream,OutputSource()->GetOutputH(sl-1,training),y,batch);
+    }
+
+    MQL_BOOL BackwardGraph(GPUContext& ctx, const float* final_gradient, int sl, int batch) {
+        graph_gradients.resize(lstm_layers.size());
+        for (size_t i=0; i<lstm_layers.size(); ++i) {
+            if (!graph_gradients[i].alloc((size_t)sl*batch*lstm_layers[i]->hidden_size) ||
+                !graph_gradients[i].zeroAsync(ctx.stream)) return MQL_FALSE;
+        }
+        int width=OutputSource()->hidden_size;
+        CUDA_CHECK_RET(cudaMemcpyAsync(graph_gradients[graph_output].ptr+(size_t)(sl-1)*batch*width,
+            final_gradient,(size_t)batch*width*sizeof(float),cudaMemcpyDeviceToDevice,ctx.stream));
+        for (int i=(int)lstm_layers.size()-1; i>=0; --i) {
+            auto& layer=*lstm_layers[i];
+            if (!ApplyDropoutBackwardAllTimesteps(&layer,graph_gradients[i].ptr,sl,batch,ctx.stream) ||
+                !layer.Backward(ctx.blas,ctx.stream,nullptr,graph_gradients[i].ptr,sl,batch,ones.ptr)) return MQL_FALSE;
+            int offset=0;
+            for (int parent : graph_nodes[i].parents) {
+                int w=parent<0 ? graph_input : lstm_layers[parent]->hidden_size;
+                if (parent>=0) {
+                    kGraphSlice<<<toU32(((size_t)sl*batch*w+255)/256),256,0,ctx.stream>>>(
+                        sl*batch,w,layer.input_size,graph_nodes[i].merge ? 0 : offset,
+                        layer.dx_buf.ptr,graph_gradients[parent].ptr,true);
+                    CUDA_CHECK_KERNEL_RET();
+                }
+                if (!graph_nodes[i].merge) offset+=w;
+            }
+        }
+        return MQL_TRUE;
+    }
+
     MQL_BOOL ForwardFull(GPUContext& ctx, const float* X_timestep_major,
         int sl, int batch, bool training, float* Y_buf)
     {
+        if (graph_mode) return ForwardGraph(ctx,X_timestep_major,sl,batch,training,Y_buf);
         int nLayers = (int)lstm_layers.size();
         if (nLayers == 0 || !output_layer || !output_layer->is_valid)
             return MQL_FALSE;
@@ -1915,7 +1989,7 @@ class SequenceModel {
                 return MQL_FALSE;
         }
 
-        RecurrentLayer* last_lstm = lstm_layers.back().get();
+        RecurrentLayer* last_lstm = OutputSource();
         const float* h_last = last_lstm->GetOutputH(sl - 1, training);
 
         if (!output_layer->Forward(ctx.blas, ctx.stream, h_last, Y_buf, batch))
@@ -2028,7 +2102,7 @@ class SequenceModel {
         int out_dim = loaded_out_dim;
         int in_dim = loaded_in_dim;
         int nLayers = (int)lstm_layers.size();
-        int H_last = lstm_layers.back()->hidden_size;
+        int H_last = OutputSource()->hidden_size;
 
         int nMiniBatches = 1 + (batch - 1) / mini_batch_size;
         const int total_schedule_steps = max_epochs * nMiniBatches;
@@ -2138,7 +2212,7 @@ class SequenceModel {
                 CUDA_CHECK_KERNEL_RET();
 
                 // --- BACKWARD ---
-                RecurrentLayer* last_lstm = lstm_layers.back().get();
+                RecurrentLayer* last_lstm = OutputSource();
                 const float* h_for_output = last_lstm->GetOutputH(seq_len - 1, true);
                 bool used_dropout_on_h =
                     (h_for_output != last_lstm->h_cache[seq_len - 1].ptr);
@@ -2147,6 +2221,9 @@ class SequenceModel {
                     h_for_output, dh_buf_mb.ptr, ones.ptr, mb_size))
                     return MQL_FALSE;
 
+                if (graph_mode) {
+                    if (!BackwardGraph(ctx,dh_buf_mb.ptr,seq_len,mb_size)) return MQL_FALSE;
+                } else {
                 if (used_dropout_on_h) {
                     size_t hb_size = (size_t)H_last * mb_size;
                     int total_hb = (int)hb_size;
@@ -2184,6 +2261,8 @@ class SequenceModel {
                     if (!layer->Backward(ctx.blas, ctx.stream, dh_last_ptr,
                         dh_above, seq_len, mb_size, ones.ptr))
                         return MQL_FALSE;
+                }
+
                 }
 
                 // FIX P07: global gradient norm clipping across all trainable tensors.
@@ -2453,6 +2532,58 @@ public:
         output_layer.reset();
     }
 
+    MQL_BOOL BeginGraph(int features, int sequence) {
+        if (!dn::product(features,sequence)) { SetError(L"Invalid graph input dimensions"); return MQL_FALSE; }
+        lstm_layers.clear(); layer_types.clear(); output_layer.reset();
+        graph_nodes.clear(); graph_inputs.clear(); graph_values.clear(); graph_gradients.clear();
+        inter_layer_ts.clear(); InvalidateBatch(); serialize_buf.clear();
+        graph_mode=true; graph_input=features; graph_output=-1; seq_len=sequence;
+        step=0; b1_pow=b2_pow=1.0f; m_progress.Reset(); m_state.store(TS_IDLE);
+        m_final_mse.store(0); m_final_epochs.store(0);
+        return MQL_TRUE;
+    }
+    int AddGraphNode(int type,int width,int activation,double drop,const int* parents,int count,int merge) {
+        if (!graph_mode || !parents || count<=0 || count>64 || graph_nodes.size()>=1024 ||
+            type<0 || type>4 || activation<0 || activation>3 || (type!=3 && activation!=0)) {
+            SetError(L"Invalid graph node configuration"); return -1;
+        }
+        dn::NodeSpec spec; spec.activation=activation; spec.merge=merge;
+        spec.parents.assign(parents,parents+count);
+        std::vector<int> widths;
+        for (const auto& l : lstm_layers) widths.push_back(l->hidden_size);
+        int in=dn::merged_width(spec,graph_input,widths);
+        if (type==4 && width==0) width=in;
+        if (!dn::layer(in,width,drop) || (type==4 && width!=in)) {
+            SetError(L"Invalid graph width or dropout"); return -1;
+        }
+        std::unique_ptr<RecurrentLayer> layer;
+        if (type==0) layer=std::make_unique<LSTMLayer>();
+        else if (type==1) layer=std::make_unique<GRULayer>();
+        else if (type==2) layer=std::make_unique<RNNLayer>();
+        else layer=std::make_unique<PointwiseLayer>(activation,type==4);
+        if (!layer->Init(in,width,(float)drop)) return -1;
+        auto disk_type=layer->GetType();
+        // Reserve all containers before committing a new node.
+        lstm_layers.reserve(lstm_layers.size()+1); layer_types.reserve(layer_types.size()+1);
+        graph_nodes.reserve(graph_nodes.size()+1);
+        lstm_layers.push_back(std::move(layer)); layer_types.push_back(disk_type); graph_nodes.push_back(std::move(spec));
+        output_layer.reset(); graph_output=-1; InvalidateBatch();
+        return (int)graph_nodes.size()-1;
+    }
+    MQL_BOOL SetGraphOutput(int node,int out) {
+        if (!graph_mode || !dn::all_reach_output(graph_nodes,node) ||
+            !dn::product(lstm_layers[node]->hidden_size,out)) {
+            SetError(L"Every graph node must reach the selected output; output width must be positive"); return MQL_FALSE;
+        }
+        auto head=std::make_unique<OutputLayer>();
+        if (!head->Init(lstm_layers[node]->hidden_size,out)) return MQL_FALSE;
+        output_layer=std::move(head); graph_output=node; InvalidateBatch();
+        return MQL_TRUE;
+    }
+    int GetInputDim() const { return graph_mode ? graph_input : lstm_layers.empty() ? 0 : lstm_layers.front()->input_size; }
+    int GetOutputDim() const { return output_layer ? output_layer->out_dim : 0; }
+    int GetSequenceLength() const { return seq_len; }
+
     bool IsClosed() const { return m_closed.load(); }
     void Close() {
         m_closed.store(true);
@@ -2477,6 +2608,14 @@ public:
         int features = in_dim / seq_len;
         int work_batch = std::max(batch, mini_batch_size);
         if (!dn::product(work_batch, in_dim) || !dn::product(work_batch, out_dim)) return false;
+        if (graph_mode) {
+            if (features!=graph_input || !dn::all_reach_output(graph_nodes,graph_output)) return false;
+            for (const auto& l : lstm_layers) {
+                if (!dn::product(work_batch,l->input_size,seq_len) || !dn::product(work_batch,l->hidden_size,seq_len) ||
+                    !dn::product(work_batch,l->hidden_size,4) || !dn::product(work_batch,l->input_size+l->hidden_size)) return false;
+            }
+            return dn::product(OutputSource()->hidden_size,out_dim);
+        }
         for (const auto& l : lstm_layers) {
             if (!dn::layer(features, l->hidden_size, l->dropout_rate) ||
                 (l->input_size != 0 && l->input_size != features) ||
@@ -2489,6 +2628,7 @@ public:
     }
 
     MQL_BOOL AddTypedLayer(SequenceLayerType lt, int in_dim, int hidden_size, float dropout = 0.0f) {
+        if (graph_mode) { SetError(L"Use DN_AddGraphNode while building a graph"); return MQL_FALSE; }
         if (!init_ok || lstm_layers.size() >= 1024 || !dn::layer(in_dim, hidden_size, dropout) ||
             (in_dim > 0 && !lstm_layers.empty() && in_dim != lstm_layers.back()->hidden_size)) {
             SetError(L"Invalid recurrent layer dimensions or dropout");
@@ -2526,6 +2666,7 @@ public:
     }
 
     MQL_BOOL SetOutputLayer(int out_dim) {
+        if (graph_mode) return SetGraphOutput((int)lstm_layers.size()-1,out_dim);
         if (!init_ok || lstm_layers.empty() || !dn::product(lstm_layers.back()->hidden_size, out_dim)) {
             SetError(L"Invalid output dimensions or no recurrent layers");
             return MQL_FALSE;
@@ -2548,6 +2689,7 @@ public:
     }
 
     MQL_BOOL BindInputIfNeeded(int in_dim) {
+        if (graph_mode) return in_dim==graph_input ? MQL_TRUE : MQL_FALSE;
         if (lstm_layers.empty()) return MQL_FALSE;
         RecurrentLayer* L0 = lstm_layers[0].get();
         if (L0->input_size != 0 && L0->input_size != in_dim) {
@@ -2561,6 +2703,7 @@ public:
     }
 
     MQL_BOOL BindIntermediateLayers() {
+        if (graph_mode) return MQL_TRUE;
         for (int i = 1; i < (int)lstm_layers.size(); i++) {
             int prev_hidden = lstm_layers[i - 1]->hidden_size;
             RecurrentLayer* cur = lstm_layers[i].get();
@@ -2752,18 +2895,25 @@ public:
         std::stringstream ss;
         ss.imbue(std::locale::classic());
         ss << std::setprecision(std::numeric_limits<float>::max_digits10)
-            << "SEQMODEL_V3\nSEQ_LEN " << seq_len
-            << "\nLAYERS " << lstm_layers.size() << "\n";
+            << (graph_mode ? "SEQMODEL_V4\nSEQ_LEN " : "SEQMODEL_V3\nSEQ_LEN ") << seq_len;
+        if (graph_mode) ss << "\nINPUT " << graph_input;
+        ss << "\nLAYERS " << lstm_layers.size() << "\n";
         for (size_t li = 0; li < lstm_layers.size(); ++li) {
             auto& l = lstm_layers[li];
             int dim = l->input_size + l->hidden_size;
             int lt = (int)((li < layer_types.size()) ? layer_types[li] : SequenceLayerType::LSTM);
             ss << lt << " " << l->input_size << " " << l->hidden_size << " "
                 << l->dropout_rate << "\n";
+            if (graph_mode) {
+                const auto& node=graph_nodes[li];
+                ss << "NODE " << node.activation << " " << node.merge << " " << node.parents.size();
+                for (int parent : node.parents) ss << " " << parent;
+                ss << "\n";
+            }
             // FIX P02: layer-type specific gate dimensions and tensor layout.
             std::vector<float> Wv(l->W.count), bv(l->b.count);
-            CUDA_CHECK_RET(cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            CUDA_CHECK_RET(cudaMemcpy(bv.data(), l->b.ptr, bv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            if (!Wv.empty()) CUDA_CHECK_RET(cudaMemcpy(Wv.data(), l->W.ptr, Wv.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            if (!bv.empty()) CUDA_CHECK_RET(cudaMemcpy(bv.data(), l->b.ptr, bv.size() * sizeof(float), cudaMemcpyDeviceToHost));
             ss << Wv.size() << " " << bv.size() << "\n";
             for (float x : Wv) ss << x << " "; ss << "\n";
             for (float x : bv) ss << x << " "; ss << "\n";
@@ -2782,6 +2932,7 @@ public:
                 for (float x : bnh) ss << x << " "; ss << "\n";
             }
         }
+        if (graph_mode) ss << "OUTPUT_NODE " << graph_output << "\n";
         ss << "OUTPUT " << output_layer->in_dim << " "
             << output_layer->out_dim << "\n";
         int dim = output_layer->in_dim * output_layer->out_dim;
@@ -2802,6 +2953,7 @@ public:
         std::vector<SequenceLayerType> next_types;
         auto copy = [](GPUMemory<float>& dst, const std::vector<float>& src) -> MQL_BOOL {
             if (dst.count != src.size()) return MQL_FALSE;
+            if (src.empty()) return MQL_TRUE;
             CUDA_CHECK_RET(cudaMemcpy(dst.ptr, src.data(), src.size() * sizeof(float), cudaMemcpyHostToDevice));
             return MQL_TRUE;
         };
@@ -2809,6 +2961,7 @@ public:
             std::unique_ptr<RecurrentLayer> layer;
             if (saved.type == 1) layer = std::make_unique<GRULayer>();
             else if (saved.type == 0) layer = std::make_unique<RNNLayer>();
+            else if (saved.type >= 3) layer = std::make_unique<PointwiseLayer>(saved.node.activation,saved.type==4);
             else layer = std::make_unique<LSTMLayer>();
             if (!layer->InitFromData(saved.input, saved.hidden, saved.dropout) ||
                 !copy(layer->W, saved.weights) || !copy(layer->b, saved.bias)) return MQL_FALSE;
@@ -2824,10 +2977,14 @@ public:
         if (!next_output->InitFromData(state.output_input, state.output) ||
             !copy(next_output->W, state.weights) || !copy(next_output->b, state.bias)) return MQL_FALSE;
 
+        std::vector<dn::NodeSpec> next_nodes;
+        if (state.graph) for (const auto& saved : state.layers) next_nodes.push_back(saved.node);
         // Commit only after parsing, allocations and all uploads succeed.
         lstm_layers.swap(next_layers);
         layer_types.swap(next_types);
         output_layer.swap(next_output);
+        graph_mode=state.graph; graph_input=state.input; graph_output=state.output_node;
+        graph_nodes.swap(next_nodes); graph_inputs.clear(); graph_values.clear(); graph_gradients.clear();
         seq_len = state.sequence;
         InvalidateBatch();
         inter_layer_ts.clear();
@@ -2890,6 +3047,52 @@ static double ComputeDeviceL2Norm(cudaStream_t stream_h, const float* buf, int n
 
     return std::sqrt((double)sum);
 }
+
+DLL_EXPORT int DLL_CALL DN_GetVersion() try {
+    return 20300;
+} catch (const std::exception& e) { SetError(L"DN_GetVersion: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_BeginGraph(int h, int features, int sequence) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->BeginGraph(features,sequence) : MQL_FALSE;
+} catch (const std::exception& e) { SetError(L"DN_BeginGraph: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
+
+DLL_EXPORT int DLL_CALL DN_AddGraphNode(int h, int type, int width, int activation, double dropout, const int* parents, int parent_count, int merge) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->AddGraphNode(type,width,activation,dropout,parents,parent_count,merge) : -1;
+} catch (const std::exception& e) { SetError(L"DN_AddGraphNode: %S",e.what()); return -1; } catch (...) { SetError(L"Graph API exception"); return -1; }
+
+DLL_EXPORT MQL_BOOL DLL_CALL DN_SetGraphOutput(int h, int node, int outputs) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->SetGraphOutput(node,outputs) : MQL_FALSE;
+} catch (const std::exception& e) { SetError(L"DN_SetGraphOutput: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
+
+DLL_EXPORT int DLL_CALL DN_GetInputDim(int h) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->GetInputDim() : 0;
+} catch (const std::exception& e) { SetError(L"DN_GetInputDim: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
+
+DLL_EXPORT int DLL_CALL DN_GetOutputDim(int h) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->GetOutputDim() : 0;
+} catch (const std::exception& e) { SetError(L"DN_GetOutputDim: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
+
+DLL_EXPORT int DLL_CALL DN_GetSequenceLength(int h) try {
+    std::shared_ptr<SequenceModel> net;
+    std::unique_lock<std::shared_mutex> lk;
+    net=FindAndLockExclusive(h,lk);
+    return net ? net->GetSequenceLength() : 0;
+} catch (const std::exception& e) { SetError(L"DN_GetSequenceLength: %S",e.what()); return 0; } catch (...) { SetError(L"Graph API exception"); return 0; }
 
 DLL_EXPORT int DLL_CALL DN_Create() try {
     auto net = std::make_shared<SequenceModel>();

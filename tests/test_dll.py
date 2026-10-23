@@ -44,6 +44,13 @@ bind('DN_SnapshotWeights', I, I)
 bind('DN_RestoreWeights', I, I)
 bind('DN_GetProgressLR', D, I)
 bind('DN_GetGradNorm', D, I)
+bind('DN_GetVersion', I)
+bind('DN_BeginGraph', I, I, I, I)
+bind('DN_AddGraphNode', I, I, I, I, I, D, P(I), I, I)
+bind('DN_SetGraphOutput', I, I, I, I)
+bind('DN_GetInputDim', I, I)
+bind('DN_GetOutputDim', I, I)
+bind('DN_GetSequenceLength', I, I)
 
 
 def scalar_checkpoint(kind, parameters):
@@ -301,6 +308,116 @@ class GPUApiTests(unittest.TestCase):
                 self.data(h)
                 self.ok(api.DN_Train(h, 1, 0, .001, 0))
                 self.assertTrue(math.isfinite(api.DN_GetGradNorm(h)))
+
+    def test_graph_builder_and_checkpoint(self):
+        h = self.model()
+        self.ok(api.DN_BeginGraph(h, 2, 3))
+        def add(kind, width, parents, merge=0, activation=0):
+            return api.DN_AddGraphNode(h,kind,width,activation,.1,(I*len(parents))(*parents),len(parents),merge)
+        self.assertEqual(add(0,5,[-1]),0)
+        self.assertEqual(add(1,5,[-1]),1)
+        self.assertEqual(add(4,0,[0,1],1),2)
+        self.assertEqual(add(3,4,[2,-1],activation=1),3)
+        self.assertEqual(add(0,4,[9]),-1)
+        self.assertEqual(add(4,0,[2,3],1),-1)
+        self.ok(api.DN_SetGraphOutput(h,3,2))
+        x,t=self.data(h)
+        self.ok(api.DN_Train(h,2,0,.001,0))
+        before=self.predict(h,x)
+        state=self.save(h)
+        self.assertTrue(state.startswith(b'SEQMODEL_V4'))
+        self.ok(api.DN_LoadState(h,state))
+        self.assertEqual(before,self.predict(h,x))
+        self.assertEqual(api.DN_GetInputDim(h),2)
+        self.assertEqual(api.DN_GetOutputDim(h),2)
+        self.assertEqual(api.DN_GetSequenceLength(h),3)
+        self.assertEqual(api.DN_LoadState(h,state.replace(b'NODE 0 0 1 -1',b'NODE 0 0 1 99',1)),0)
+        self.assertEqual(before,self.predict(h,x))
+
+    def test_graph_recurrent_fork_and_sigmoid_gradient(self):
+        params = [.25*math.sin(i+1) for i in range(29)]
+        samples, targets = [[.4,-.2,.6],[-.7,.5,.15]], [.3,-.2]
+        nodes=[]
+        for kind, weights, parent in [(0,params[:3],-1),(1,params[3:13],0),(2,params[13:25],0)]:
+            tokens=scalar_checkpoint(kind,weights+[1,0]).decode().split('LAYERS 1 ')[1].split('OUTPUT')[0].split()
+            nodes.append(' '.join(tokens[:4])+f' NODE 0 0 1 {parent} '+' '.join(tokens[4:]))
+        checkpoint=('SEQMODEL_V4 SEQ_LEN 3 INPUT 1 LAYERS 5 '+' '.join(nodes)+
+            ' 4 1 1 0 NODE 0 1 3 0 1 2 0 0 '+
+            f'3 1 1 0 NODE 3 0 1 3 1 1 {params[25]} {params[26]} '+
+            f'OUTPUT_NODE 4 OUTPUT 1 1 {params[27]} {params[28]}').encode()
+        def reference(p):
+            lower=scalar_reference(0,p[:3]+[1,0],samples,sequence=True)
+            left=scalar_reference(1,p[3:13]+[1,0],lower)
+            right=scalar_reference(2,p[13:25]+[1,0],lower)
+            return [p[27]/(1+math.exp(-(p[25]*(a+b+c[-1])+p[26])))+p[28]
+                    for a,b,c in zip(left,right,lower)]
+        def loss(p): return sum((a-b)**2 for a,b in zip(reference(p),targets))/2
+        h=self.model(); self.ok(api.DN_LoadState(h,checkpoint))
+        x=(D*6)(*(v for row in samples for v in row)); t=(D*2)(*targets); y=(D*2)()
+        self.ok(api.DN_PredictBatch(h,x,2,3,0,y))
+        for actual,expected in zip(y,reference(params)): self.assertAlmostEqual(actual,expected,delta=1e-6)
+        gradients=[]
+        for i in range(len(params)):
+            plus,minus=params.copy(),params.copy();plus[i]+=1e-5;minus[i]-=1e-5
+            gradients.append((loss(plus)-loss(minus))/2e-5)
+        self.ok(api.DN_SetGradClip(h,0));self.ok(api.DN_LoadBatch(h,x,t,2,3,1,0))
+        self.ok(api.DN_Train(h,1,0,.0001,0))
+        self.assertAlmostEqual(api.DN_GetGradNorm(h),math.sqrt(sum(g*g for g in gradients)),delta=2e-5)
+
+    def test_standalone_csv_train_reload(self):
+        import csv
+        from datetime import datetime, timedelta, timezone
+        import json
+        import subprocess
+        import tempfile
+        root=Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(prefix='mql5gpu csv ') as folder:
+            folder=Path(folder); prices=folder/'synthetic.csv'; bundle=folder/'model'
+            with prices.open('w',newline='') as stream:
+                writer=csv.writer(stream); writer.writerow(['time','AUDUSD','NZDUSD','USDJPY','USDCAD'])
+                for i in range(260):
+                    stamp=datetime(2026,1,1,tzinfo=timezone.utc)+timedelta(hours=i)
+                    writer.writerow([stamp.isoformat()]+[math.exp(.0001*i+.002*math.sin(i/5+f)) for f in range(4)])
+            env=os.environ.copy(); env['CUDA_PATH']=str(CUDA_BIN.parent if CUDA_BIN.name=='bin' else CUDA_BIN.parent.parent)
+            result=subprocess.run([sys.executable,str(root/'examples/train_csv.py'),'--dll',str(DLL_PATH),
+                '--csv',str(prices),'--sequence','4','--horizon','2','--epochs','2',
+                '--topology','gru:4:linear:0:concat:-1;dense:3:tanh:0:concat:0','--output',str(bundle)],
+                check=True,capture_output=True,text=True,env=env,timeout=60)
+            trained=json.loads(result.stdout)
+            result=subprocess.run([sys.executable,str(root/'examples/predict_csv.py'),'--dll',str(DLL_PATH),
+                '--csv',str(prices),'--model',str(bundle)],check=True,capture_output=True,text=True,env=env,timeout=60)
+            restored=json.loads(result.stdout)
+            self.assertEqual(trained['forecast_close'],restored['forecast_close'])
+            metadata=json.loads((bundle/'metadata.json').read_text())
+            self.assertLess(metadata['training_last_origin'],metadata['validation_first_origin'])
+            self.assertTrue(math.isfinite(trained['validation']['ratio']))
+
+    def test_graph_branch_sum_concat_gradient(self):
+        p=[.3,.1,-.2,.3,.4,-.1,.2,.7,-.05]
+        def checkpoint(v):
+            return (f'SEQMODEL_V4 SEQ_LEN 3 INPUT 1 LAYERS 4 '
+                f'3 1 1 0 NODE 1 0 1 -1 1 1 {v[0]} {v[1]} '
+                f'3 1 1 0 NODE 2 0 1 -1 1 1 {v[2]} {v[3]} '
+                f'4 1 1 0 NODE 0 1 2 0 1 0 0 '
+                f'3 2 1 0 NODE 1 0 2 2 -1 2 1 {v[4]} {v[5]} {v[6]} '
+                f'OUTPUT_NODE 3 OUTPUT 1 1 {v[7]} {v[8]}').encode()
+        samples=[[.1,-.2,.3],[-.3,.2,.15]]
+        target=[.2,-.1]
+        def reference(v):
+            return [v[7]*math.tanh(v[4]*(math.tanh(v[0]*row[-1]+v[1])+
+                max(0,v[2]*row[-1]+v[3]))+v[5]*row[-1]+v[6])+v[8] for row in samples]
+        def loss(v): return sum((a-b)**2 for a,b in zip(reference(v),target))/2
+        h=self.model(); self.ok(api.DN_LoadState(h,checkpoint(p)))
+        x=(D*6)(*(v for row in samples for v in row)); t=(D*2)(*target); y=(D*2)()
+        self.ok(api.DN_PredictBatch(h,x,2,3,0,y))
+        for actual,expected in zip(y,reference(p)): self.assertAlmostEqual(actual,expected,delta=1e-6)
+        gradients=[]
+        for i in range(len(p)):
+            plus,minus=p.copy(),p.copy(); plus[i]+=1e-5; minus[i]-=1e-5
+            gradients.append((loss(plus)-loss(minus))/2e-5)
+        self.ok(api.DN_SetGradClip(h,0)); self.ok(api.DN_LoadBatch(h,x,t,2,3,1,0))
+        self.ok(api.DN_Train(h,1,0,.0001,0))
+        self.assertAlmostEqual(api.DN_GetGradNorm(h),math.sqrt(sum(g*g for g in gradients)),delta=2e-5)
 
 if __name__ == '__main__':
     unittest.main(argv=[sys.argv[0]], verbosity=2)
