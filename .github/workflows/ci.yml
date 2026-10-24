@@ -1,0 +1,20 @@
+name: Portable checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  contracts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure CPU tests
+        run: cmake -S . -B build -DDN_BUILD_CUDA=OFF
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+      - name: Test validation, checkpoint parsing and ABI contracts
+        run: ctest --test-dir build -C Release --output-on-failure

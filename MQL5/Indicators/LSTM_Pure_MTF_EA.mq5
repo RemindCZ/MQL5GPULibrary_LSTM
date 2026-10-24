@@ -16,22 +16,7 @@
 //+------------------------------------------------------------------+
 //| DLL Import – signatury dle aktuálního exportu MQL5GPULibrary_LSTM |
 //+------------------------------------------------------------------+
-#import "MQL5GPULibrary_LSTM.dll"
-   int    DN_Create();
-   void   DN_Free(int h);
-   int    DN_SetSequenceLength(int h, int seq_len);
-   int    DN_SetMiniBatchSize(int h, int mbs);
-   // act: typ vrstvy (0=LSTM), ln: layer-norm flag, drop: dropout rate
-   int    DN_AddLayerEx(int h, int in_sz, int out_sz, int act, int ln, double drop);
-   int    DN_SetOutputDim(int h, int out_dim);
-   int    DN_SetGradClip(int h, double clip);
-   // DN_PredictBatch: layout=0 => [batch, out_dim] (flat), Y musí mít batch*out_dim prvků
-   int    DN_PredictBatch(int h, const double &X[], int batch, int in_dim, int layout, double &Y[]);
-   int    DN_SaveState(int h);
-   int    DN_GetState(int h, char &buf[], int max_len);
-   int    DN_LoadState(int h, const char &buf[]);
-   void   DN_GetError(short &buf[], int len);
-#import
+#include <MQL5GPULibrary.mqh>
 
 //+------------------------------------------------------------------+
 //| Konstanty                                                        |
