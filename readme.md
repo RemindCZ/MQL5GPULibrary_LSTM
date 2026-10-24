@@ -95,5 +95,3 @@ GitHub Actions runs portable checks on Windows and Linux. GPU checks are an expl
 | `CMakeLists.txt`, `*.sln`, `*.vcxproj` | Build entry points |
 
 [Changes](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Implementation guide](func_docu.md)
-
-![Poděkování Aničce](ann.svg)
