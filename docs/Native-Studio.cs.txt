@@ -1,0 +1,33 @@
+DNForecast 3.1 pro Windows x64
+Trénink v MT5 a v prohlížeči
+
+Instalace
+Spusťte DNForecast-3.1.0-MT5-Setup.exe. Vyberte datovou složku svého terminálu a potvrďte instalaci. Pro MT5, samostatný trenér i webové studio stačí distribuované binární soubory. Klient nepotřebuje Python, pip, PyTorch, CUDA ani cloudový účet. Studio používá systémový .NET Framework 4.8.
+
+Trénink přímo na grafu
+1. Otevřete například BTCUSD H1 a v Navigátoru obnovte seznam Skripty.
+2. Přetáhněte DNForecast_Train na graf. Povolte import DLL. Jako výchozí vstup poslouží 4096 uzavřených svíček, 96 kroků a 6 horizontů.
+3. Potvrďte nastavení. Skript přečte historii brokera, natrénuje časovou neuronovou síť a ověří exportovaný ONNX přes stejnou nativní DLL, jakou používá indikátor. Při InpAttach=true přidá DNForecast_Async s přesným modelem na aktuální graf.
+4. Průběh a přesnou cestu najdete na kartě Experti. ONNX a CSV s výsledky jsou v MQL5\Files\DNForecast. Další trhy lze zadat do InpDrivers v přesném pořadí a pod názvy brokera. Výpadky pomocných trhů mají masku. Cílová cena musí být platná.
+
+Trénink na pozadí v prohlížeči
+1. Po instalaci zvolte Otevřít studio. Později spusťte MQL5\Libraries\DNForecast-Studio.exe. Otevře se místní web na http://127.0.0.1:18765. Ikona v oznamovací oblasti otevře stránku znovu nebo ukončí nečinný server.
+2. Na grafu MT5 spusťte DNForecast_Train s volbou InpStudioHistoryOnly=true. Skript uloží historii do MQL5\Files\DNForecast\History. Ve studiu ji uvidíte v seznamu. CSV lze také importovat z jiného počítače.
+3. Vyberte historii a její skutečnou délku svíčky (H1 = 3600 sekund). Určete počet vstupních kroků, horizontů a epoch. Klikněte na Spustit trénink. Server spouští jednu úlohu najednou. Kartu lze zavřít, počítač a proces serveru musí zůstat spuštěné. Po dokončení studio nabídne model ke stažení. Na disku jsou také výsledky testu.
+4. Je-li studio na stejném profilu MT5, model již leží v MQL5\Files\DNForecast. Z jiného serveru ho stáhněte do této složky. Na cílový graf přidejte DNForecast_Async. Do InpModelFile patří DNForecast\Studio-<id>.onnx. InpSteps, InpHorizons, časový rámec grafu a InpDrivers musí odpovídat údajům úlohy. Pro samotný BTCUSD nechte InpDrivers prázdné a InpCuda=false.
+
+Samostatný Windows server
+Rozbalte celý distribuční ZIP. Server může běžet i na stroji bez terminálu MT5. V jeho MQL5\Libraries spusťte:
+DNForecast-Studio.exe --headless --data "D:\DNForecast" --port 18765
+Ve složce History se uchovávají CSV a v datové složce výstupní modely a reporty. Headless režim je určen také pro Plánovač úloh Windows. Server naslouchá jen na 127.0.0.1. Pro vzdálený prohlížeč lze použít přesměrování portu přes již nakonfigurovaný SSH server:
+ssh -N -L 18765:127.0.0.1:18765 uzivatel@server
+Potom na klientovi otevřete http://127.0.0.1:18765. Trénink pokračuje i po odpojení tunelu. Jedna instance využívá jeden port. Pro další profil zvolte jiný port.
+
+Samostatný nativní trenér
+V MQL5\Libraries spusťte:
+DNForecast-Train.exe bars.csv BTCUSD-H1.onnx 3600 96 6 8
+Sloupce CSV: close_time,available_at,BTCUSD a případně po něm další symboly. Řádky jsou od nejstaršího, čas je celé číslo v sekundách. Vstup tohoto trenéru používá synchronní snímky s available_at = close_time. Chybějící cena pomocného trhu je prázdné pole. Program odmítne přepsat existující model. Návratový kód 0 znamená úspěch. DLL lze použít z C/C++ přes include/DNForecastTrain.h. Výstupem je standardní ONNX.
+
+Co se učí a jak číst výsledky
+Nativní model je neuronová síť s časovými zpožděními, jednou skrytou vrstvou se 16 jednotkami tanh a přímými výstupy pro každý horizont. Vstupní příznaky jsou stejné jako při predikci v DLL. Obě vrstvy se učí na CPU. Poslední pozorování jsou vyhrazena čistě pro test. Chronologické rozdělení je 55 % trénink, 15 % výběr epochy, 15 % kalibrace intervalů a 15 % test. Počátky s přesahem budoucích hodnot přes hranici bloku jsou vynechány. Výstup zahrnuje bod, tři kvantily, pravděpodobnost růstu a odhad variance z kalibračního období.
+test_mse je průměrná kvadratická chyba logaritmického výnosu. Porovnejte ji na každém horizontu s last_price_mse. Coverage80 je podíl skutečností mezi spodní a horní mezí. Z těchto čísel samotných nelze určit výnos po nákladech. Model a jeho použití na grafu nezadávají obchodní pokyny.

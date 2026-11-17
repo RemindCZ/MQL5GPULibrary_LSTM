@@ -12,7 +12,7 @@ ctest --test-dir build -C Release --output-on-failure
 .\tools\package_forecast.ps1 -OrtSdk C:/sdk/onnxruntime-win-x64-1.23.2
 ```
 
-For a fresh reference-only build omit DN3_ORT_ROOT. Set DN_BUILD_CUDA=ON to compile the original GPU library and run its checkpoint and adapter tests. ONNX model fitting uses NumPy, PyTorch and onnx. Inference and CTest use the Python standard library. The release includes the trained graph, CPU backend license notices and a file hash manifest.
+For a fresh reference-only build omit DN3_ORT_ROOT. Set DN_BUILD_CUDA=ON to compile the original GPU library and run its checkpoint and adapter tests. DNForecastTrain and DNForecast-Train build with C++17. The Windows packaging script compiles DNForecast Studio with the system .NET Framework compiler. Customers can train and run the release without Python. To exercise the native build alone, configure with `-DCMAKE_DISABLE_FIND_PACKAGE_Python3=TRUE`. When available, Python runs additional development tests. The optional research trainer in the source tree uses PyTorch. The release includes the trained graph, CPU backend license notices and a file hash manifest.
 
 ## Windows CUDA DLL
 

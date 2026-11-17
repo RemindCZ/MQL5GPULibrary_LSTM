@@ -1,31 +1,23 @@
 param(
-    [string]$ReleaseZip = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\v3.0.0\DNForecast-3.0.0-win-x64.zip'),
+    [string]$ReleaseZip = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\forecast-release\DNForecast-3.1.0-win-x64.zip'),
     [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\mt5-installer'),
-    [string]$CrtDirectory
+    [string]$ExpectedZipSha256
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $archive = (Resolve-Path -LiteralPath $ReleaseZip).Path
-$digest = '9311babd86b9fa94cebbd862ff830fafc7972bf9012fcc75f12c7a5fbacf4d69'
-if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $digest) {
-    throw 'Expected the original published v3.0.0 Windows ZIP. Check its SHA-256.'
+if ($ExpectedZipSha256 -and (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $ExpectedZipSha256) {
+    throw 'Release ZIP SHA-256 differs from the expected digest.'
 }
-$prefix = 'DNForecast-3.0.0-win-x64/'
-if (!$CrtDirectory) {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if (!$vs) { throw 'Supply -CrtDirectory from the Visual Studio x64 redistributable folder.' }
-    $CrtDirectory = Get-ChildItem -Directory (Join-Path $vs 'VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT') |
-        Sort-Object { [version]$_.Parent.Parent.Name } -Descending | Select-Object -First 1 -ExpandProperty FullName
-}
+$prefix = 'DNForecast-3.1.0-win-x64/'
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $output -Force | Out-Null
-$exe = Join-Path $output 'DNForecast-3.0.0-MT5-Setup.exe'
+$exe = Join-Path $output 'DNForecast-3.1.0-MT5-Setup.exe'
 $work = Join-Path $output ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 $source = Join-Path $work 'Payload.cs'
 $packed = Join-Path $work 'install.zip'
-$intermediate = Join-Path $work 'DNForecast-3.0.0-MT5-Setup.exe'
+$intermediate = Join-Path $work 'DNForecast-3.1.0-MT5-Setup.exe'
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
@@ -39,20 +31,14 @@ try {
             elseif ($path -eq 'docs/DNForecast_Manual_cs.pdf') { $target = 'MQL5/Files/DNForecast/DNForecast_Manual_cs.pdf' }
             elseif ($path -eq 'LICENSE.txt' -or $path.StartsWith('licenses/')) { $target = "MQL5/Files/DNForecast/$path" }
             else { continue }
-            if ($path -notmatch '^[a-zA-Z0-9_./-]+$' -or $entry.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or -not $zip.GetEntry($prefix+$path)) {
+            if ($path.Split('/') -contains '..' -or $path -notmatch '^[a-zA-Z0-9_./-]+$' -or $entry.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or -not $zip.GetEntry($prefix+$path)) {
                 throw "Invalid release entry: $path"
             }
             $destination = $payload.CreateEntry($path).Open()
             $original = $zip.GetEntry($prefix+$path).Open()
             try { $original.CopyTo($destination) } finally { $original.Dispose(); $destination.Dispose() }
-            'new Item("{0}", "{1}", "{2}"),' -f $path, $target, $entry.sha256.ToLowerInvariant()
-        }
-        foreach ($name in @('msvcp140.dll','msvcp140_1.dll','vcruntime140.dll','vcruntime140_1.dll')) {
-            $dll = Get-Item -LiteralPath (Join-Path $CrtDirectory $name)
-            $entryName = "vc143/$name"
-            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($payload, $dll.FullName, $entryName) | Out-Null
-            $items += 'new Item("{0}", "MQL5/Libraries/{1}", "{2}", "{3}"),' -f $entryName, $name,
-                (Get-FileHash $dll.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $dll.VersionInfo.FileVersion
+            $argsText = if ($entry.runtime_version) { ', "' + ([version]$entry.runtime_version).ToString() + '"' } else { '' }
+            'new Item("{0}", "{1}", "{2}"{3}),' -f $path, $target, $entry.sha256.ToLowerInvariant(), $argsText
         }
     } finally { $payload.Dispose(); $zip.Dispose() }
     $definition = @(

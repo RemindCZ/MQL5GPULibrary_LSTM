@@ -38,10 +38,10 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
     try {
-        $reader = [IO.StreamReader]::new($zip.GetEntry('DNForecast-3.0.0-win-x64/SHA256.json').Open())
+        $reader = [IO.StreamReader]::new($zip.GetEntry('DNForecast-3.1.0-win-x64/SHA256.json').Open())
         try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-        $items = @($manifest | Where-Object { $_.path -like 'MQL5/*' })
-        Assert ($items.Count -eq 10) 'Unexpected release layout.'
+        $items = @($manifest | Where-Object { $_.path -like 'MQL5/*' -and !$_.runtime_version })
+        Assert ($items.Count -eq 16) 'Unexpected release layout.'
         foreach ($item in $items) {
             Assert ((Get-FileHash -LiteralPath (Join-Path $root $item.path)).Hash -eq $item.sha256) "Hash: $($item.path)"
         }

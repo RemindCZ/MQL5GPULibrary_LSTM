@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.1.0
+
+- Fit a time-delay neural network directly from an MT5 chart, verify its ONNX graph and attach the resulting forecast.
+- Train in a browser with DNForecast Studio on a Windows host, retain completed jobs and download models. The Windows client and training server run without Python.
+- Include a native CSV trainer, training DLL, C header, import library and Czech instructions in the standalone distribution.
+
 ## 3.0.0
 
 - Add a portable asynchronous forecasting ABI with bounded queues, per-session scheduling, terminal job states and explicit ownership.

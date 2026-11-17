@@ -39,13 +39,15 @@ DN3_TryRead vrací 1 při čekání, 0 při výsledku, −3 při malém bufferu.
 DN3_Cancel zruší čekající úlohu. Rozběhnutý výpočet může fyzicky skončit později. DN3_Release uvolní výsledek a bezpečně snese opakované volání. V režimu latest je starší nezahájená práce při přijetí nové označena −5, její ID lze zkontrolovat a uvolnit. Uzavřete všechny relace přes DN3_CloseSession před vyložením DLL. Poslední uzavření vyčká na dokončení pracovníků. DN3_Metrics vrací osm čítačů v pořadí veřejné hlavičky včetně času výpočtu poslední úlohy v mikrosekundách.
 
 ## Modely, trénink a kompatibilita
+
+Od verze 3.1 je součástí distribuce nativní CPU trenér, skript DNForecast_Train a webové DNForecast Studio. Trénink, export ONNX, test modelu i prognózy fungují bez Pythonu. Pro vlastní BTCUSD otevřete graf BTCUSD H1 a spusťte skript ze sekce Skripty. [Návod pro samostatný trénink a server](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/blob/v3.1.0/docs/Native-Studio.cs.txt)
 Výchozí reference funguje na CPU. Součástí vydání pro Windows je volitelně načítaný ONNX Runtime CPU 1.23.2 včetně licencí dodavatelů. Pro CUDA provider sestavte nebo instalujte odpovídající GPU distribuci ONNX Runtime, CUDA a cuDNN. Dostupné rozhraní zjistíte z DN3_GetCapabilities. Skutečné načtení konkrétního modelu ovládá stav relace. Původní nativní DLL 2.3 používá vlastní CUDA závislosti.
 
 ONNX vstup features je float32 [1,S,3M], výstup forecast je float32 [1,H,6]. Jedna samostatná ONNX zpráva obsahuje váhy, metadata dn3.contract a dn3.zero_probe. Kontrakt má tvar dn3-v1|target-trading-bars|3600|AUDUSD,NZDUSD,USDJPY,USDCAD. Referenční tenzor obsahuje 6H desetinných hodnot výstupu pro nulový příznakový vstup. DLL zkontroluje kontrakt, statické tvary, referenční hodnoty, konečnost, pořadí kvantilů, pravděpodobnost a kladnou varianci. U příznaků normalizovaných specificky pro model patří transformace dovnitř grafu.
 
 Knihovna podporuje vlastní topologie nad operátory zvoleného ONNX backendu. Přiložený trénink nabízí ridge, GRU a reziduální TCN s dilatacemi 1, 2, 4, 8, 16, 32. Lineární a neuronová verze dávají přímé odhady na všechny horizonty. Kvantilové posuny reziduí vznikají na samostatném kalibračním období. Všechny části používají stejnou nativní transformaci DN3_Encode. Přiložená TCN má status research.
 
-Trénink spouštějte mimo terminál. Chronologické bloky obsahují 55 % dat pro trénink a po 15 % pro výběr epochy, kalibraci a test. Na hranicích se vynechají počátky s přesahem budoucího cíle. Report obsahuje SHA-256 dat a modelu, rozsahy času, shodu PyTorch s vydaným modelem a ztráty po horizontech.
+Volitelný výzkumný trénink v PyTorch spouštějte mimo terminál. Chronologické bloky obsahují 55 % dat pro trénink a po 15 % pro výběr epochy, kalibraci a test. Na hranicích se vynechají počátky s přesahem budoucího cíle. Report obsahuje SHA-256 dat a modelu, rozsahy času, shodu PyTorch s vydaným modelem a ztráty po horizontech.
 
 Pro samostatný výběr jednotlivých výstupů použijte select_tasks.py. Za vstupním a novým názvem ONNX následuje jedna maska na každý horizont. Součet bitů 1 (bod), 2 (tři kvantily), 4 (směr), 8 (variance) vybírá výstupy sítě. Zbývající veličiny dodá reference. Maska 2 tak dovolí otestovat cenové pásmo sítě při ponechání poslední ceny jako středové čáry. Politika je součástí nového hashe modelu.
 
@@ -57,7 +59,7 @@ python examples/pack_legacy.py adresar_modelu model.dn2 --seconds 3600
 Adaptér DN3V2 přečte checkpoint a škálování vytvořené původním train_csv.py. Vyžaduje MQL5GPULibrary_LSTM.dll vedle DNForecast.dll a dostupné knihovny CUDA. Nativní výstup přepočte původním target_scale. Kvantily, p_up a variance zůstávají referenční. DLL 2.3 a její původní dokumentace jsou v repozitáři dále dostupné.
 
 ## Samostatný provoz a test obchodního pravidla
-Pythonový klient pro inferenci používá ctypes ze standardní knihovny. Uvolnění zdrojů zajistí with Session(...). Příklad v C přilinkujte proti DNForecast.lib a při spuštění umístěte DLL vedle aplikace. Pro trénink jsou navíc potřeba NumPy, PyTorch a onnx. Python export historie vyžaduje MetaTrader5 pro Windows a připojený terminál.
+Pythonový klient pro inferenci používá ctypes ze standardní knihovny. Uvolnění zdrojů zajistí with Session(...). Příklad v C přilinkujte proti DNForecast.lib a při spuštění umístěte DLL vedle aplikace. Volitelný výzkumný skript train_forecast.py v repozitáři používá NumPy, PyTorch a onnx. Python export historie vyžaduje MetaTrader5 pro Windows a připojený terminál.
 
 ```
 with Session(Library(dll), ["AUDUSD"], steps=96, horizons=6) as s:

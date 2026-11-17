@@ -14,7 +14,7 @@ namespace Remind.DNForecast.Setup
         private readonly ComboBox terminals = new ComboBox();
         private readonly TextBox path = new TextBox();
         private readonly Label heading, message;
-        private readonly Button browse, primary, cancel;
+        private readonly Button browse, primary, cancel, studio;
         private readonly ProgressBar progress = new ProgressBar();
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly string logPath;
@@ -70,7 +70,7 @@ namespace Remind.DNForecast.Setup
             Caption(header, "REMIND", new Rectangle(28, 17, 220, 20), new Font("Segoe UI", 9, FontStyle.Bold),
                 Color.FromArgb(135, 222, 246));
             Caption(header, "DNForecast", new Rectangle(25, 38, 350, 63), new Font("Segoe UI", 33, FontStyle.Bold), Color.White);
-            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.0.0", new Rectangle(29, 106, 330, 23),
+            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.1.0", new Rectangle(29, 106, 330, 23),
                 Font, Color.FromArgb(213, 228, 247));
 
             heading = Caption(this, T("Kam chcete DNForecast nainstalovat?", "Where should DNForecast be installed?"),
@@ -109,6 +109,12 @@ namespace Remind.DNForecast.Setup
             progress.Visible = false;
             footer.Controls.Add(progress);
             cancel = ActionButton(footer, "Cancel", T("Zrušit", "Cancel"), new Rectangle(389, 20, 112, 39), false);
+            studio = ActionButton(footer, "Studio", T("Otevřít studio", "Open studio"), new Rectangle(330, 20, 171, 39), false);
+            studio.Visible = false;
+            studio.Click += (sender, e) => {
+                try { System.Diagnostics.Process.Start(Path.Combine(folders[terminals.SelectedIndex], @"MQL5\Libraries\DNForecast-Studio.exe")); }
+                catch (Exception ex) { message.Text = ex.Message; }
+            };
             primary = ActionButton(footer, "Install", T("Nainstalovat", "Install"), new Rectangle(513, 20, 143, 39), true);
             primary.Font = new Font("Segoe UI", 10, FontStyle.Bold);
             primary.Click += async (sender, e) => await StartInstallation();
@@ -157,8 +163,8 @@ namespace Remind.DNForecast.Setup
             path.Text = index < 0 ? "" : folders[index];
             primary.Enabled = index >= 0;
             message.Text = index >= 0
-                ? T("Nainstaluje se indikátor, knihovny, model, ověřovací skript a manuál.",
-                    "Setup will install the indicator, libraries, model, verification script and manual.")
+                ? T("Nainstaluje se indikátor, model, nativní trenér a webové studio.",
+                    "Setup will install the indicator, model, native trainer and browser studio.")
                 : folders.Count > 0
                     ? T("Vyberte jeden terminál ze seznamu nebo otevřete jeho datovou složku.",
                         "Choose one terminal from the list or browse to its data folder.")
@@ -204,6 +210,7 @@ namespace Remind.DNForecast.Setup
             progress.Visible = false;
             finished = true;
             cancel.Visible = false;
+            studio.Visible = Result == 0;
             CancelButton = null;
             heading.Text = Result == 0 ? T("Instalace dokončena", "Installation complete") : T("Instalace se nedokončila", "Installation incomplete");
             if (Result == 0) message.Text = T("V MT5 obnovte seznam indikátorů a přidejte DNForecast_Async na graf.",

@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 if (-not (Test-Path -LiteralPath $MetaEditor)) { throw "Set -MetaEditor to your MetaEditor64.exe path" }
 $sources = @('MQL5\Indicators\LSTM_CrossAsset_Forecast.mq5','MQL5\Scripts\LSTM_SmokeTest.mq5',
-             'MQL5\Indicators\DNForecast_Async.mq5','MQL5\Scripts\DNForecast_Smoke.mq5')
+             'MQL5\Indicators\DNForecast_Async.mq5','MQL5\Scripts\DNForecast_Smoke.mq5','MQL5\Scripts\DNForecast_Train.mq5')
 foreach ($source in $sources) {
     $file = Join-Path $projectRoot $source
     $started = Get-Date

@@ -12,8 +12,8 @@ using System.Windows.Forms;
 [assembly: AssemblyProduct("DNForecast")]
 [assembly: AssemblyCompany("Remind / Tomáš Bělák")]
 [assembly: AssemblyCopyright("Tomáš Bělák / Remind")]
-[assembly: AssemblyVersion("3.0.0.2")]
-[assembly: AssemblyFileVersion("3.0.0.2")]
+[assembly: AssemblyVersion("3.1.0.0")]
+[assembly: AssemblyFileVersion("3.1.0.0")]
 
 namespace Remind.DNForecast.Setup
 {

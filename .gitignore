@@ -7,6 +7,9 @@ build-*/
 dist/
 .venv/
 *.ex5
+!MQL5/Indicators/DNForecast_Async.ex5
+!MQL5/Scripts/DNForecast_Smoke.ex5
+!MQL5/Scripts/DNForecast_Train.ex5
 output/
 tmp/
 ##
