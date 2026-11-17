@@ -100,14 +100,27 @@ try {
     $discover = $asm.GetType('Remind.DNForecast.Setup.Terminals').GetMethod('Discover',$flags)
     $roaming = Join-Path $scratch 'Roaming'
     $standard = Join-Path $roaming ('MetaQuotes\Terminal\' + ('1' * 32))
-    $broker = Join-Path $scratch 'Broker'
+    $programs = Join-Path $scratch 'Program Files'
+    $broker = Join-Path $programs 'Broker'
     Seed (Join-Path $broker 'terminal64.exe') 'test registration'
-    Folder (Join-Path $broker 'MQL5/Indicators')
+    Folder (Join-Path $broker 'MQL5/Logs')
     Folder (Join-Path $standard 'MQL5')
     [IO.File]::WriteAllText((Join-Path $standard 'origin.txt'),$broker,[Text.Encoding]::Unicode)
     $portable = Join-Path $scratch 'Portable'
     Seed (Join-Path $portable 'terminal64.exe') 'test registration'
-    Folder (Join-Path $portable 'MQL5')
+    Folder (Join-Path $portable 'MQL5/Logs')
+    $portableProfile = Join-Path $roaming ('MetaQuotes\Terminal\' + ('4' * 32))
+    Seed (Join-Path $portableProfile 'origin.txt') $portable
+    $customBroker = Join-Path $scratch 'Installed broker on another drive'
+    Seed (Join-Path $customBroker 'terminal64.exe') 'registered installation'
+    $customProfile = Join-Path $roaming ('MetaQuotes\Terminal\' + ('5' * 32))
+    Seed (Join-Path $customProfile 'origin.txt') $customBroker
+    Folder (Join-Path $customProfile 'MQL5')
+    $lookalike = Join-Path $scratch 'Program Files-copy\Broker'
+    Seed (Join-Path $lookalike 'terminal64.exe') 'unregistered copy'
+    $lookalikeProfile = Join-Path $roaming ('MetaQuotes\Terminal\' + ('6' * 32))
+    Seed (Join-Path $lookalikeProfile 'origin.txt') $lookalike
+    Folder (Join-Path $lookalikeProfile 'MQL5')
     $stale = Join-Path $roaming ('MetaQuotes\Terminal\' + ('2' * 32))
     Seed (Join-Path $stale 'origin.txt') (Join-Path $scratch 'Removed broker')
     Folder (Join-Path $stale 'MQL5')
@@ -115,11 +128,15 @@ try {
     Seed (Join-Path $mt4 'origin.txt') "$scratch\MT4"
     Seed "$scratch\MT4\terminal.exe" 'MT4'
     Folder "$mt4\MQL4"
-    $argsDiscover = [object[]]@($roaming.PSObject.BaseObject,$scratch.PSObject.BaseObject,[string[]]@($portable,$portable,$broker),[Action[string]]{param($s)})
+    $registered = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [void]$registered.Add($customBroker)
+    $argsDiscover = [object[]]@($roaming.PSObject.BaseObject,[string[]]@($programs),$registered.PSObject.BaseObject,[Action[string]]{param($s)})
     $found = $discover.Invoke($null,$argsDiscover)
-    Assert ($found.Count -eq 2 -and $found.Contains($standard) -and $found.Contains($portable)) 'Incorrect terminal discovery.'
+    Assert ($found.Count -eq 2 -and $found.Contains($standard) -and $found.Contains($customProfile)) 'Expected only installed brokers data profiles.'
+    Folder (Join-Path $portableProfile 'MQL5')
+    $found = $discover.Invoke($null,$argsDiscover)
+    Assert ($found.Count -eq 2 -and !$found.Contains($portableProfile) -and !$found.Contains($portable)) 'A portable registration with MQL5 became a target.'
     $argsDiscover[0] = [IO.Path]::Combine($scratch,'Uninitialized')
-    $argsDiscover[2] = [string[]]@()
     Assert ($discover.Invoke($null,$argsDiscover).Count -eq 0) 'Missing MT5 should be reported.'
 
     # On a clean Windows host the optional VC runtime is deployed app-locally.
@@ -134,14 +151,9 @@ try {
     }
 
     if ($InteractiveSmoke) {
-        # No arguments, exactly as on double-click. Only the adjacent portable copy is selected.
-        $gui = Join-Path $scratch 'GUI portable'
-        Seed (Join-Path $gui 'terminal64.exe') 'test registration'
-        Folder (Join-Path $gui 'MQL5')
-        $copy = Join-Path $gui 'DNForecast-Setup.exe'
-        Copy-Item -LiteralPath $setupExe -Destination $copy
-        Result (Start-Test $copy @()) 0
-        Assert ((Get-FileHash (Join-Path $gui 'MQL5/Libraries/DNForecast.dll')).Hash -eq $original) 'Zero-argument installation failed.'
+        $desktopShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        & $desktopShell -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_mt5_setup_ui.ps1') -Setup $setupExe -Scratch $scratch
+        if ($LASTEXITCODE -ne 0) { throw 'Installer window tests failed.' }
     }
     Write-Output 'PASS: package hashes, discovery, VC fallback, idempotence, locked update, backup, crash recovery and rollback.'
 } finally {

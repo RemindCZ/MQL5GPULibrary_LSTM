@@ -4,7 +4,7 @@
 
 [Download the Windows release](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/tag/v3.0.0) · [Czech PDF manual](docs/DNForecast_Manual_cs.pdf) · [C ABI](include/DNForecast.h) · [Research and architecture](docs/ARCHITEKTURA.cs.md)
 
-**[Download the automatic MT5 installer for Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.0.0/DNForecast-3.0.0-MT5-Setup.exe)** and double-click it. Setup finds initialized MT5 data folders for the current user, installs the indicator, CPU runtime, trained model, smoke test and manual, and verifies the copied files. It also supports portable terminals. [Detection, updates and silent installation](docs/MT5_SETUP.md)
+**[Download the automatic MT5 installer for Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.0.0/DNForecast-3.0.0-MT5-Setup.exe)** and double-click it. Select your broker terminal or browse to the location shown by **File → Open Data Folder** in MT5. Check the displayed path and click **Install** to add the indicator, CPU runtime, trained model, smoke test and manual to that profile. [Detection, updates and silent installation](docs/MT5_SETUP.md)
 
 In MT5, refresh Indicators in Navigator and attach `DNForecast_Async` to AUDUSD H1. Allow DLL imports for the indicator when MT5 prompts. Its default centre follows the last closed price. To evaluate the neural model set `InpModelFile` to `DNForecast\AUDUSD-H1-TCN.onnx`. Exact broker symbol names and timeframe are checked on load.
 

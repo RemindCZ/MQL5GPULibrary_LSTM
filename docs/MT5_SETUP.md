@@ -2,15 +2,15 @@
 
 [Stáhnout instalátor DNForecast 3.0.0 pro Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.0.0/DNForecast-3.0.0-MT5-Setup.exe)
 
-Spusťte EXE dvojklikem pod stejným uživatelem Windows, který používá MetaTrader 5. Instalace probíhá bez průvodce, volby složky a stahování dalších souborů. Podporované prostředí je Windows 10 nebo 11 x64 s klasickým terminálem MT5. Instalátor používá součást Windows .NET Framework 4.8. Po dokončení se okno samo zavře.
+Spusťte EXE dvojklikem pod stejným uživatelem Windows, který používá MetaTrader 5. Vyberte instalaci MT5, zkontrolujte zobrazenou datovou cestu a klikněte na **Nainstalovat**. Tlačítkem **Vybrat jinou složku…** můžete určit vlastní umístění. Po potvrzení instalátor provede všechny kroky offline. Podporované prostředí je Windows 10 nebo 11 x64 s klasickým terminálem MT5. Instalátor používá součást Windows .NET Framework 4.8. Po dokončení klikněte na **Zavřít**.
 
 V Navigátoru MT5 zvolte u **Indikátory → Obnovit** a přidejte **DNForecast_Async** na graf AUDUSD H1. Při prvním použití potvrďte import DLL pro tento indikátor. Pro výzkumnou TCN nastavte `InpModelFile` na `DNForecast\AUDUSD-H1-TCN.onnx`. Funkčnost knihovny a modelu můžete ověřit spuštěním skriptu **DNForecast_Smoke**. Indikátor potřebuje tržní historii podle zvolených symbolů.
 
 ## Výběr terminálů
 
-- Běžná instalace vyhledá datové složky aktuálního uživatele v `%APPDATA%\MetaQuotes\Terminal`. Ověří vazbu souboru `origin.txt` na existující `terminal64.exe` a složku `MQL5`. Při více platných instalacích obslouží všechny.
-- Přenosné terminály najde také podle běžících procesů aktuální relace a registrovaných instalačních složek. Pro samostatnou přenosnou kopii můžete umístit EXE vedle jejího `terminal64.exe`. Při dvojkliku odtud instaluje pouze do této kopie.
-- Před prvním spuštěním platformy mohou datové složky ještě chybět. Okno instalátoru v tom případě počká, až uživatel poprvé otevře MT5.
+- Při dvojkliku instalátor vyhledá datové složky aktuálního uživatele v `%APPDATA%\MetaQuotes\Terminal`. Každý profil musí mít složku `MQL5` a soubor `origin.txt` odkazující na existující `terminal64.exe` ve složce Program Files, v `%LOCALAPPDATA%\Programs` nebo v instalační složce evidované ve Windows. Jeden nalezený terminál je předvybraný. Při více terminálech vyberte jeden ze seznamu. První zápis provede až tlačítko **Nainstalovat**.
+- Pro přenosný terminál nebo vlastní instalaci mimo uvedená umístění otevřete v příslušném MT5 **Soubor → Otevřít složku dat**. V instalátoru zvolte **Vybrat jinou složku…** a vyberte tuto složku nebo její podsložku `MQL5`.
+- Před prvním spuštěním platformy mohou datové složky ještě chybět. Spusťte MT5, otevřete jeho datovou složku a vyberte ji v instalátoru.
 - Standardní datová složka potřebuje pouze oprávnění aktuálního uživatele. Přenosná kopie vyžaduje zápis do své složky.
 
 [Datové složky a režim portable podle MetaQuotes](https://www.metatrader5.com/en/terminal/help/start_advanced/start)
@@ -31,7 +31,7 @@ $p = Start-Process $setup -ArgumentList '/quiet' -Wait -PassThru
 $p.ExitCode
 ```
 
-Parametr `/target "C:\cesta k datům MT5"` určí jedinou datovou složku obsahující MQL5. `/quiet` potlačí okno, `/log "C:\cesta\setup.log"` zvolí protokol. S `/no-wait` lze zamčený soubor vyřešit opakováním z vlastního nasazovacího systému. Kód 0 znamená dokončeno, 1 chybu, 2 žádný nalezený terminál, 32 soubor používaný jiným procesem, 1223 ukončení uživatelem.
+V tichém režimu se při jediném nalezeném profilu použije tento profil. Při několika profilech zadejte cíl výslovně. Parametr `/target "C:\cesta k datům MT5"` určí jedinou datovou složku obsahující MQL5. `/quiet` potlačí okno, `/log "C:\cesta\setup.log"` zvolí protokol. S `/no-wait` lze zamčený soubor vyřešit opakováním z vlastního nasazovacího systému. Kód 0 znamená dokončeno, 1 chybu, 2 žádný nalezený terminál, 3 více profilů bez určeného cíle, 32 soubor používaný jiným procesem, 1223 ukončení uživatelem.
 
 ## Sestavení instalátoru
 

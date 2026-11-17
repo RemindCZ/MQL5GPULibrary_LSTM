@@ -1,21 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 [assembly: AssemblyTitle("DNForecast Setup for MetaTrader 5")]
 [assembly: AssemblyProduct("DNForecast")]
 [assembly: AssemblyCompany("Remind / Tomáš Bělák")]
 [assembly: AssemblyCopyright("Tomáš Bělák / Remind")]
-[assembly: AssemblyVersion("3.0.0.1")]
-[assembly: AssemblyFileVersion("3.0.0.1")]
+[assembly: AssemblyVersion("3.0.0.2")]
+[assembly: AssemblyFileVersion("3.0.0.2")]
 
 namespace Remind.DNForecast.Setup
 {
@@ -46,9 +44,16 @@ namespace Remind.DNForecast.Setup
             }
         }
 
-        private static int Install(Options args, Action<string> update, CancellationToken cancel)
+        internal static List<string> Candidates()
         {
-            string logfile = Path.GetFullPath(args.Log ?? Path.Combine(
+            return Terminals.Discover(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                Terminals.ProgramRoots(), Terminals.RegisteredPrograms(), s => Trace.WriteLine(s));
+        }
+
+        internal static int Install(string target, string logPath, bool noWait, Action<string> update, CancellationToken cancel)
+        {
+            string root = Terminals.Explicit(target);
+            string logfile = Path.GetFullPath(logPath ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Remind", "DNForecast", "Logs",
                 "Setup-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N") + ".log"));
             Directory.CreateDirectory(Path.GetDirectoryName(logfile));
@@ -56,65 +61,42 @@ namespace Remind.DNForecast.Setup
             {
                 writer.AutoFlush = true;
                 Action<string> log = s => writer.WriteLine("{0:O}  {1}", DateTime.Now, s);
-                List<string> pending;
-                for (;;)
+                log("Target: " + root);
+                try
                 {
-                    pending = args.Target == null
-                        ? Terminals.Discover(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                            AppDomain.CurrentDomain.BaseDirectory, Terminals.RunningDirectories(), log)
-                        : new List<string> { Terminals.Explicit(args.Target) };
-                    if (pending.Count != 0) break;
-                    if (args.Quiet || args.NoWait) { log("No initialized MT5 data directory found."); return 2; }
-                    update(T("Čekám na první spuštění MetaTraderu 5. Otevřete svůj terminál a instalace bude automaticky pokračovat.",
-                             "Waiting for MetaTrader 5. Open your terminal once and installation will continue automatically."));
-                    if (cancel.WaitHandle.WaitOne(2000)) cancel.ThrowIfCancellationRequested();
-                }
-                int total = pending.Count, errors = 0, finished = 0;
-                var reported = new HashSet<string>();
-                using (var zip = Installation.OpenPayload())
-                while (pending.Count != 0)
-                {
-                    foreach (string target in pending.ToArray())
+                    using (var zip = Installation.OpenPayload())
                     {
-                        cancel.ThrowIfCancellationRequested();
-                        if (!reported.Contains(target))
-                            update(T("Instaluji do ", "Installing into ") + target);
-                        try
+                        bool waiting = false;
+                        for (;;)
                         {
-                            bool changed = Installation.Apply(target, zip, log, Environment.SystemDirectory);
-                            log((changed ? "Installed: " : "Already current: ") + target);
-                            ++finished;
-                        }
-                        catch (IOException e)
-                        {
-                            int code = e.HResult & 0xffff;
-                            if (code == 32 || code == 33 || code == 1224)
+                            cancel.ThrowIfCancellationRequested();
+                            try
                             {
-                                if (reported.Add(target)) log("Waiting for file: " + e.Message);
-                                continue;
+                                bool changed = Installation.Apply(root, zip, log, Environment.SystemDirectory);
+                                log((changed ? "Installed: " : "Already current: ") + root);
+                                return 0;
                             }
-                            ++errors; log("Error: " + target + " | " + e.Message);
+                            catch (IOException e)
+                            {
+                                int code = e.HResult & 0xffff;
+                                if (code != 32 && code != 33 && code != 1224) throw;
+                                if (!waiting) log("Waiting for file: " + e.Message);
+                                waiting = true;
+                                update(T("Soubor používá jiný proces. Po jeho uvolnění bude instalace pokračovat.",
+                                         "A file is in use. Setup will continue when it is released."));
+                                if (noWait) return 32;
+                                if (cancel.WaitHandle.WaitOne(1500)) cancel.ThrowIfCancellationRequested();
+                            }
                         }
-                        catch (UnauthorizedAccessException e) { ++errors; log("Access: " + target + " | " + e.Message); }
-                        pending.Remove(target);
                     }
-                    if (pending.Count == 0) break;
-                    update(T("Soubor je právě používán. Instalace bude automaticky pokračovat po jeho uvolnění. Pokud jej používá MT5, zavřete terminál, až vám to bude vyhovovat.",
-                             "A file is in use. Setup will continue automatically when it is released. If MT5 is using it, close the terminal when convenient.")
-                           + Environment.NewLine + pending[0]);
-                    if (args.NoWait) return 32;
-                    if (cancel.WaitHandle.WaitOne(1500)) cancel.ThrowIfCancellationRequested();
                 }
-                if (errors != 0)
+                catch (OperationCanceledException) { throw; }
+                catch (Exception e)
                 {
-                    update(T("Dokončeno pro ", "Completed for ") + finished + " / " + total +
-                           T(" instalací. Podrobnosti o chybě: ", " installations. See the error log: ") + logfile);
+                    log("Error: " + e.Message);
+                    update(e.Message + Environment.NewLine + logfile);
                     return 1;
                 }
-                update(T("DNForecast je připraven v MT5", "DNForecast is installed in MT5") + " (" + finished + ")." +
-                       Environment.NewLine + T("V Navigátoru obnovte seznam Indikátory a na graf přidejte DNForecast_Async.",
-                                                "Refresh Indicators in Navigator and attach DNForecast_Async to a chart."));
-                return 0;
             }
         }
 
@@ -126,39 +108,24 @@ namespace Remind.DNForecast.Setup
             try
             {
                 var options = new Options(args);
-                if (options.Quiet) return Install(options, s => { }, CancellationToken.None);
-                Application.EnableVisualStyles();
-                using (var form = new Form { Text = "DNForecast · MetaTrader 5", ClientSize = new Size(510, 162),
-                        AutoScaleMode = AutoScaleMode.Dpi, FormBorderStyle = FormBorderStyle.FixedDialog,
-                        MaximizeBox = false, StartPosition = FormStartPosition.CenterScreen })
-                using (var token = new CancellationTokenSource())
-                using (var timer = new System.Windows.Forms.Timer { Interval = 4500 })
+                if (options.Quiet)
                 {
-                    var title = new Label { Text = T("Instalace DNForecast", "Installing DNForecast"), Left = 20, Top = 15,
-                        Width = 466, Height = 28, Font = new Font("Segoe UI", 14, FontStyle.Bold) };
-                    var status = new Label { Left = 22, Top = 52, Width = 466, Height = 75, AutoEllipsis = true,
-                        Text = T("Vyhledávám MetaTrader 5…", "Finding MetaTrader 5…") };
-                    var progress = new ProgressBar { Left = 22, Top = 133, Width = 466, Height = 9, Style = ProgressBarStyle.Marquee };
-                    form.Controls.AddRange(new Control[] { title, status, progress });
-                    bool done = false;
-                    int result = 1;
-                    form.FormClosing += (sender, ev) => { if (!done) { token.Cancel(); ev.Cancel = true; } };
-                    timer.Tick += (sender, ev) => { timer.Stop(); form.Close(); };
-                    form.Shown += async (sender, ev) =>
+                    string target = options.Target;
+                    if (target == null)
                     {
-                        IProgress<string> messages = new Progress<string>(s => status.Text = s);
-                        try { result = await Task.Run(() => Install(options, messages.Report, token.Token)); }
-                        catch (OperationCanceledException) { result = 1223; }
-                        catch (Exception e) { status.Text = e.Message; result = 1; }
-                        done = true;
-                        progress.Visible = false;
-                        title.Text = result == 0 ? T("Instalace dokončena", "Installation complete")
-                                                : T("Stav instalace", "Installation status");
-                        if (result == 1223) form.Close();
-                        else if (result == 0) timer.Start();
-                    };
+                        var candidates = Candidates();
+                        if (candidates.Count == 0) return 2;
+                        if (candidates.Count > 1) return 3;
+                        target = candidates[0];
+                    }
+                    return Install(target, options.Log, options.NoWait, s => { }, CancellationToken.None);
+                }
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                using (var form = new InstallerWindow(Candidates(), options.Target, options.Log, options.NoWait))
+                {
                     Application.Run(form);
-                    return result;
+                    return form.Result;
                 }
             }
             catch (Exception error)

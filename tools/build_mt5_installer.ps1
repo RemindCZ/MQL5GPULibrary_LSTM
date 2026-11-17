@@ -67,7 +67,8 @@ try {
     $sources = @(Get-ChildItem -Path (Join-Path $root 'installer\*.cs') -File | Sort-Object Name | ForEach-Object { $_.FullName })
     $switches = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/debug-', '/utf8output', '/codepage:65001',
         '/r:System.Core.dll', '/r:System.IO.Compression.dll', '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll',
-        "/win32manifest:$(Join-Path $root 'installer\app.manifest')", "/out:$intermediate", "/resource:$packed,release.zip")
+        "/win32manifest:$(Join-Path $root 'installer\app.manifest')", "/win32icon:$(Join-Path $root 'installer\assets\dnforecast.ico')",
+        "/resource:$(Join-Path $root 'installer\assets\setup-header.jpg'),setup-header.jpg", "/out:$intermediate", "/resource:$packed,release.zip")
     & $compiler @switches @sources $source
     if ($LASTEXITCODE -ne 0) { throw "C# compiler failed with exit code $LASTEXITCODE" }
     Copy-Item -LiteralPath $intermediate -Destination $exe -Force
