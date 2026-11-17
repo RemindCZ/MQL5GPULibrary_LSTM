@@ -1,5 +1,7 @@
 # MQL5GPULibrary_LSTM — český návod
 
+**[Stáhnout automatický instalátor pro MT5 a Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.0.0/DNForecast-3.0.0-MT5-Setup.exe)**. Spusťte EXE dvojklikem. Instalátor najde terminály uživatele, nainstaluje indikátor, model i knihovny a ověří jejich kontrolní součty. Po dokončení obnovte v Navigátoru seznam indikátorů. Na graf AUDUSD H1 přidejte `DNForecast_Async` a v nastavení indikátoru povolte import DLL. [Podrobnosti instalace](MT5_SETUP.md)
+
 **DNForecast 3.0** zpracovává prognózy na pozadí ze stejného vstupu v MT5, Pythonu i C. Balíček obsahuje indikátor, referenci poslední ceny, ONNX Runtime pro CPU a volitelnou TCN pro AUDUSD H1. Historické testy porovnávají jednotlivé horizonty a do simulace obchodování zahrnují skutečné kotace bid/ask. [Instalace a manuál DLL](DNForecast.cs.md) · [PDF](DNForecast_Manual_cs.pdf) · [Výsledek na říjnových datech](research/ICTrading-2026-10.json)
 
 ## Knihovna CUDA 2.3

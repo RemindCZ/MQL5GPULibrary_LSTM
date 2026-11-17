@@ -29,3 +29,11 @@ jobs:
         run: cmake --build build --config Release --parallel 2
       - name: Test validation, checkpoint parsing and ABI contracts
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Build and exercise the offline MT5 installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'DNForecast-3.0.0-win-x64.zip'
+          Invoke-WebRequest 'https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.0.0/DNForecast-3.0.0-win-x64.zip' -OutFile $zip
+          .\tools\build_mt5_installer.ps1 -ReleaseZip $zip -OutputDirectory build/installer
+          .\tests\test_mt5_installer.ps1 -Setup build/installer/DNForecast-3.0.0-MT5-Setup.exe -ReleaseZip $zip
