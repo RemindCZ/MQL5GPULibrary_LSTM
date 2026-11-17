@@ -6,6 +6,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 namespace {
