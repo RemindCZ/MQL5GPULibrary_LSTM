@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.0
+
+- Add a portable asynchronous forecasting ABI with bounded queues, per-session scheduling, terminal job states and explicit ownership.
+- Add an MT5 closed-bar indicator, C and Python clients, ONNX CPU inference and a Windows adapter for CUDA 2.3 checkpoints.
+- Add offline ridge, GRU and causal TCN training, calibrated residual bands, a forecast/outcome ledger and quote-based execution replay. Publish the trained research model, validation metrics and Czech deployment manual.
+
 ## 2.3.0 — unreleased
 
 - Add an acyclic graph builder with LSTM/GRU/RNN/Dense/Identity nodes, arbitrary widths, concatenation, residual sums, dense activations and multi-output linear heads.

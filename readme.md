@@ -1,5 +1,17 @@
 # MQL5GPULibrary_LSTM
 
+**DNForecast 3.0** runs asynchronous multi-market forecasts from MetaTrader 5, Python and C. The Windows x64 distribution includes a CPU reference, ONNX Runtime, a trained six-horizon AUDUSD H1 TCN and the compiled indicator. Each forecast carries a bar origin. Clients submit a copied window and poll for results while other charts continue running.
+
+[Download the Windows release](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/tag/v3.0.0) · [Czech PDF manual](docs/DNForecast_Manual_cs.pdf) · [C ABI](include/DNForecast.h) · [Research and architecture](docs/ARCHITEKTURA.cs.md)
+
+Unzip the release, run `tools/Install-MT5.ps1 -TerminalDataPath 'YOUR MT5 DATA FOLDER'`, enable DLL imports and run `DNForecast_Smoke`. Attach `DNForecast_Async` to AUDUSD H1. Its default centre follows the last closed price. To evaluate the neural model set `InpModelFile` to `DNForecast\AUDUSD-H1-TCN.onnx`. Exact broker symbol names and timeframe are checked on load.
+
+For an independent application, use [the Python client](python/dnforecast.py) or [C example](examples/forecast.c). The [offline trainer](examples/train_forecast.py) supports ridge, GRU and a six-block causal TCN. The [replay ledger](examples/replay_forecast.py) matures labels chronologically. The [execution test](examples/backtest_strategy.py) uses later bid/ask quotes, commissions and slippage. The frozen TCN issued 529 six-bar forecasts on the October 2026 broker sample. With the documented costs, the rule opened zero trades. [Execution report](docs/research/ICTrading-2026-10.json)
+
+Build the reference with CMake 3.24+ and a C++17 compiler. Set `DN3_ORT_ROOT` to an extracted ONNX Runtime C/C++ SDK to enable custom graphs. Windows can load the reference without a CUDA driver. [Build and package instructions](docs/BUILDING.md)
+
+## Version 2.3 CUDA library
+
 CUDA neural networks for MetaTrader 5 and standalone Windows applications. Version **2.3.0** supports configurable acyclic graphs of **LSTM, GRU, tanh RNN, Dense and Identity** layers, branches, concatenation, residual sums and multiple outputs. AdamW, dropout, gradient clipping and asynchronous training retain the original sequential C ABI.
 
 Author: **Tomáš Bělák** · [MIT license](LICENSE.txt) · [Česky](docs/README.cs.md)
@@ -29,7 +41,7 @@ Each node is `type:width:activation:dropout:merge:parents`. External input is `-
 Requires **64-bit Windows**, Visual Studio 2022 with C++ tools, a compatible NVIDIA CUDA Toolkit, an NVIDIA GPU and driver, CMake 3.24+, and Python 3 for tests. The locally verified configuration is CUDA 13.0, MSVC 19.44 and RTX 3060 (compute capability 8.6).
 
 ```powershell
-cmake -S . -B build -A x64 -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build -A x64 -DDN_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```

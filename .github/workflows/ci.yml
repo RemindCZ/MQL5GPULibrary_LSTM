@@ -13,7 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure CPU tests
+        if: runner.os != 'Windows'
         run: cmake -S . -B build -DDN_BUILD_CUDA=OFF
+      - name: Configure Windows with the release ONNX SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = 'onnxruntime-win-x64-1.23.2'
+          $archive = Join-Path $env:RUNNER_TEMP "$sdk.zip"
+          Invoke-WebRequest "https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/$sdk.zip" -OutFile $archive
+          if ((Get-FileHash $archive).Hash -ne '0B38DF9AF21834E41E73D602D90DB5CB06DBD1CA618948B8F1D66D607AC9F3CD') { throw 'Unexpected SDK SHA-256' }
+          Expand-Archive $archive -DestinationPath $env:RUNNER_TEMP
+          cmake -S . -B build -A x64 -DDN_BUILD_CUDA=OFF "-DDN3_ORT_ROOT=$env:RUNNER_TEMP/$sdk"
       - name: Build
         run: cmake --build build --config Release --parallel 2
       - name: Test validation, checkpoint parsing and ABI contracts

@@ -1,0 +1,61 @@
+{
+  "start": 1790812800,
+  "end_exclusive": 1793491200,
+  "horizon": 6,
+  "commission_bps_per_side": 0.5,
+  "slippage_bps_per_side": 0.5,
+  "max_wait_ms": 60000,
+  "availability": "assumed at bar close, prices and quotes on terminal time axis",
+  "symbols": [
+    "AUDUSD",
+    "NZDUSD",
+    "USDJPY",
+    "USDCAD"
+  ],
+  "model_sha256": "4c3f98413d51f9941dd8d832a3cd0c8eb251bfd2260864eaf536049ea39da85f",
+  "target_bars_including_warmup": 648,
+  "available_closes": [
+    648,
+    648,
+    648,
+    648
+  ],
+  "bars.csv_sha256": "9266a8204e291aa5483e6b005ccd826e62d93f8e390bc560c6ba7c54e5046a59",
+  "ticks.csv_sha256": "5719340664eaf21c327a9d698eeeed719df05907b80cb0b3991c08a196e330a1",
+  "reference": {
+    "net_return": 0.0,
+    "max_drawdown": 0.0,
+    "signals_observed": 528,
+    "opened": 0,
+    "closed": 0,
+    "open_at_end": false,
+    "wins": 0,
+    "expired_entries": 0,
+    "commission_paid": 0.0,
+    "turnover_initial_equity": 0.0,
+    "flat_return": 0.0,
+    "issued": 529,
+    "scored": 523,
+    "mse": 3.4245951992709987e-06,
+    "brier": 0.25,
+    "coverage": 0.7418738049713193
+  },
+  "tcn": {
+    "net_return": 0.0,
+    "max_drawdown": 0.0,
+    "signals_observed": 528,
+    "opened": 0,
+    "closed": 0,
+    "open_at_end": false,
+    "wins": 0,
+    "expired_entries": 0,
+    "commission_paid": 0.0,
+    "turnover_initial_equity": 0.0,
+    "flat_return": 0.0,
+    "issued": 529,
+    "scored": 523,
+    "mse": 3.41573154188899e-06,
+    "brier": 0.24842963833012635,
+    "coverage": 0.8317399617590823
+  }
+}

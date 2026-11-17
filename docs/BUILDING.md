@@ -1,11 +1,25 @@
 # Build and verification
 
+## DNForecast 3
+
+The default build produces the portable reference runtime. For the Windows release extract the official Microsoft ONNX Runtime x64 C/C++ SDK 1.23.2 and pass its directory to CMake. The SDK is optional for the reference. The legacy CUDA adapter looks for the version 2.3 DLL alongside DNForecast when opening a DN3V2 bundle.
+
+```powershell
+cmake -S . -B build -A x64 "-DDN3_ORT_ROOT=C:/sdk/onnxruntime-win-x64-1.23.2"
+cmake --build build --config Release --parallel 4
+ctest --test-dir build -C Release --output-on-failure
+.\tools\compile_mql.ps1
+.\tools\package_forecast.ps1 -OrtSdk C:/sdk/onnxruntime-win-x64-1.23.2
+```
+
+For a fresh reference-only build omit DN3_ORT_ROOT. Set DN_BUILD_CUDA=ON to compile the original GPU library and run its checkpoint and adapter tests. ONNX model fitting uses NumPy, PyTorch and onnx. Inference and CTest use the Python standard library. The release includes the trained graph, CPU backend license notices and a file hash manifest.
+
 ## Windows CUDA DLL
 
 Install Visual Studio 2022 with Desktop development with C++, Windows SDK and CUDA build integration. Use a CUDA toolkit compatible with the compiler and deployment driver. Install CMake 3.24+ and Python 3 for tests.
 
 ```powershell
-cmake -S . -B build -A x64 -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build -A x64 -DDN_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```

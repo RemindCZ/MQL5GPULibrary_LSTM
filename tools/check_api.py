@@ -13,16 +13,18 @@ def signatures(text, pattern, mql=False):
             argument = argument.strip()
             if not argument or argument == 'void':
                 continue
-            match = re.fullmatch(r'(const\s+)?(int|double|char|short)\s*([*&]?)\s*(\w+)\s*(\[\])?', argument)
+            match = re.fullmatch(r'(const\s+)?(int64_t|int|long|double|float|char|uchar|uint8_t|short)\s*([*&]?)\s*(\w+)\s*(\[\])?', argument)
             if not match:
                 raise ValueError(f'{name}: cannot parse {argument!r}')
             const, dtype, pointer, param_name, array = match.groups()
             if mql and pointer:
-                expected_array = param_name in ('X', 'T', 'Y', 'buf', 'parents')
+                expected_array = param_name in ('X', 'T', 'Y', 'buf', 'parents','contract','model','closes','features','output','text','metrics')
                 if bool(array) != expected_array:
                     raise ValueError(f'{name}: incorrect MQL array/scalar reference for {param_name}')
+            if name.startswith('DN3_'):
+                dtype={'long':'int64_t','uchar':'byte','char':'byte','uint8_t':'byte'}.get(dtype,dtype)
             types.append((bool(const), dtype, bool(pointer)))
-        result[name] = (return_type.replace('MQL_BOOL', 'int'), types)
+        result[name] = ({'long':'int64_t','MQL_BOOL':'int'}.get(return_type,return_type), types)
     return result
 
 
@@ -35,11 +37,16 @@ def main():
                      r'(\w+)\s+(DN_\w+)\((.*?)\);', mql=True)
     if not source or source != header or source != mql:
         raise SystemExit('CUDA exports, C header and MQL imports differ')
+    v3 = signatures((ROOT/'include/DNForecast.h').read_text(), r'DN3_API\s+(\w+)\s+(DN3_\w+)\((.*?)\);')
+    imports = signatures((ROOT/'MQL5/Include/DNForecast.mqh').read_text(), r'(\w+)\s+(DN3_\w+)\((.*?)\);',mql=True)
+    if len(v3)!=12 or v3!=imports:
+        raise SystemExit('DN3 C header and MQL imports differ')
     for path in (ROOT / 'MQL5').rglob('*.mq5'):
         text = path.read_text(encoding='utf-8-sig')
-        unknown = set(re.findall(r'\b(DN_\w+)\s*\(', text)) - source.keys()
-        if unknown or '#include <MQL5GPULibrary.mqh>' not in text:
-            raise SystemExit(f'{path}: missing shared include or unknown calls {unknown}')
+        for prefix,known,include in [('DN_',source,'MQL5GPULibrary.mqh'),('DN3_',v3,'DNForecast.mqh')]:
+            calls=set(re.findall(r'\b('+prefix+r'\w+)\s*\(',text))
+            if calls and (calls-known.keys() or f'#include <{include}>' not in text):
+                raise SystemExit(f'{path}: missing {include} or unknown calls {calls-known.keys()}')
     print(f'{len(source)} exports match C and MQL declarations; examples use the shared include.')
 
 

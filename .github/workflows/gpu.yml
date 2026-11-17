@@ -18,7 +18,7 @@ jobs:
         shell: pwsh
         env:
           DN_ARCH: ${{ inputs.architectures }}
-        run: cmake -S . -B build -A x64 "-DCMAKE_CUDA_ARCHITECTURES=$env:DN_ARCH"
+        run: cmake -S . -B build -A x64 -DDN_BUILD_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$env:DN_ARCH"
       - name: Build
         run: cmake --build build --config Release --parallel 2
       - name: Test on GPU

@@ -1,4 +1,12 @@
-# Local validation record
+# DNForecast 3.0 verification
+
+Windows x64, Xeon E5-2680 v4, MSVC 19.44 and ONNX Runtime CPU 1.23.2. The combined build passed the C executable, both ABI contracts, native validation, financial dataset tests, asynchronous runtime, CUDA tests and version 2.3 checkpoint parity. The standalone reference build passed all five CTest targets without an ONNX SDK or CUDA. The optional ONNX authoring test separately exercised all six fields of a mixed per-horizon policy.
+
+MetaEditor compiled both indicators and both smoke scripts without errors or warnings. The isolated MT5 demo terminal passed the reference and ONNX smoke tests. On the AUDUSD H1 demo chart, all four markets supplied 97 closed prices. The Python client and the sixth-horizon indicator buffer both produced 0.6738341392575763 from an anchor of 0.67379. The chart returned lower and upper prices of 0.6726279116985494 and 0.674967693327198. This was a live inference and chart integration test with order placement disabled.
+
+The October execution sample and its limitations are documented in [the report](research/ICTrading-2026-10.json). The broker's numeric bar and tick timestamps were used together. In the live observation the broker clock ran approximately two hours ahead of Unix wall-clock UTC. Historical close publication times were assumed. An independently verified historical UTC mapping across daylight-saving transitions, eight-hour model-swap soak and ONNX CUDA provider parity remain unverified.
+
+## Version 2.3 validation record
 
 Environment: Windows x64, NVIDIA GeForce RTX 3060 (compute capability 8.6), CUDA Toolkit 13.0.48, MSVC 19.44.35228, CMake 3.30.0-rc4, Python 3.14.7.
 

@@ -4,11 +4,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 if (-not (Test-Path -LiteralPath $MetaEditor)) { throw "Set -MetaEditor to your MetaEditor64.exe path" }
-$sources = @('MQL5\Indicators\LSTM_CrossAsset_Forecast.mq5','MQL5\Scripts\LSTM_SmokeTest.mq5')
+$sources = @('MQL5\Indicators\LSTM_CrossAsset_Forecast.mq5','MQL5\Scripts\LSTM_SmokeTest.mq5',
+             'MQL5\Indicators\DNForecast_Async.mq5','MQL5\Scripts\DNForecast_Smoke.mq5')
 foreach ($source in $sources) {
     $file = Join-Path $projectRoot $source
     $started = Get-Date
-    $arguments = @('/compile:"' + $file + '"','/include:"' + (Join-Path $projectRoot 'MQL5') + '"','/log')
+    $arguments = @("/compile:`"$file`"", "/include:`"$(Join-Path $projectRoot 'MQL5')`"", '/log')
     $job = Start-Process -FilePath $MetaEditor -ArgumentList $arguments -WindowStyle Hidden -PassThru
     if (-not $job.WaitForExit(60000)) { throw "MetaEditor timed out compiling $file" }
     $log = [IO.Path]::ChangeExtension($file,'.log')

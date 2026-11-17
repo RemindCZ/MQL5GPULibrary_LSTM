@@ -11,7 +11,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $target 'MQL5') -PathType Container)
     throw 'Choose the terminal DATA folder shown by MT5: File > Open Data Folder (must contain MQL5).'
 }
 $mql = Join-Path ([IO.Path]::GetFullPath($PackageRoot)) 'MQL5'
-if (-not (Test-Path -LiteralPath (Join-Path $mql 'Libraries\MQL5GPULibrary_LSTM.dll'))) {
+$forecast = Test-Path -LiteralPath (Join-Path $mql 'Libraries\DNForecast.dll')
+if (-not $forecast -and -not (Test-Path -LiteralPath (Join-Path $mql 'Libraries\MQL5GPULibrary_LSTM.dll'))) {
     throw 'Use this installer from the built release package, not the source checkout.'
 }
 $files = @(Get-ChildItem -LiteralPath $mql -File -Recurse)
@@ -38,5 +39,9 @@ foreach ($copy in $copies) {
     New-Item -ItemType Directory -Path (Split-Path $copy.Destination -Parent) -Force | Out-Null
     Copy-Item -LiteralPath $copy.Source -Destination $copy.Destination -Force:$Force
 }
-Write-Output "Installed $($copies.Count) files into $target. Restart MT5, enable DLL imports and run LSTM_SmokeTest."
-Write-Output 'An NVIDIA driver/GPU and Microsoft Visual C++ 2015-2022 x64 runtime are still required.'
+if ($forecast) {
+    Write-Output "Installed $($copies.Count) files into $target. Restart MT5, enable DLL imports and run DNForecast_Smoke."
+} else {
+    Write-Output "Installed $($copies.Count) files into $target. Restart MT5, enable DLL imports and run LSTM_SmokeTest."
+    Write-Output 'An NVIDIA driver/GPU and Microsoft Visual C++ 2015-2022 x64 runtime are required for version 2.3.'
+}

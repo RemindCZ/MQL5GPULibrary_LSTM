@@ -1,5 +1,9 @@
 # MQL5GPULibrary_LSTM — český návod
 
+**DNForecast 3.0** zpracovává prognózy na pozadí ze stejného vstupu v MT5, Pythonu i C. Balíček obsahuje indikátor, referenci poslední ceny, ONNX Runtime pro CPU a volitelnou TCN pro AUDUSD H1. Historické testy porovnávají jednotlivé horizonty a do simulace obchodování zahrnují skutečné kotace bid/ask. [Instalace a manuál DLL](DNForecast.cs.md) · [PDF](DNForecast_Manual_cs.pdf) · [Výsledek na říjnových datech](research/ICTrading-2026-10.json)
+
+## Knihovna CUDA 2.3
+
 Autor: **Tomáš Bělák**. Verze **2.3.0** podporuje acyklické grafy LSTM, GRU, RNN, Dense a Identity s libovolnou hloubkou, šířkami, větvením, konkatenací a reziduálními součty v mezích paměti a validovaných rozměrů. Obsahuje AdamW, dropout, ořezávání gradientů, asynchronní trénink a checkpointy V4.
 
 **[Komplexní PDF manuál](MQL5GPULibrary_Manual_cs.pdf)** · [Text manuálu](MANUAL.cs.md) · [Ověřené testy](VALIDATION.md)
@@ -13,7 +17,7 @@ Samostatné použití bez MT5 zajišťuje `python/mql5gpu.py` a příklady `exam
 Potřebujete 64bitová Windows, Visual Studio 2022 s C++ nástroji, kompatibilní NVIDIA CUDA Toolkit a ovladač, NVIDIA GPU, CMake 3.24+ a Python 3 pro testy.
 
 ```powershell
-cmake -S . -B build -A x64 -DCMAKE_CUDA_ARCHITECTURES=86
+cmake -S . -B build -A x64 -DDN_BUILD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```
