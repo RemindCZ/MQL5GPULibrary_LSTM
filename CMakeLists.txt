@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(MQL5GPULibrary_LSTM VERSION 3.1.0 LANGUAGES CXX)
+project(MQL5GPULibrary_LSTM VERSION 3.2.0 LANGUAGES CXX)
 
 include(CTest)
 option(DN_BUILD_CUDA "Also build the version 2.3 Windows CUDA DLL" OFF)

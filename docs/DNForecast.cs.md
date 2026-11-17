@@ -1,8 +1,8 @@
-# DNForecast 3.0
+# DNForecast 3.2
 Asynchronní predikce finančních časových řad pro MetaTrader 5, Python a C. Technický manuál • Remind / Tomáš Bělák
 
 ## Instalace ve Windows a první graf
-Rozbalte vydání DNForecast-3.0.0-win-x64.zip. V MT5 zvolte Soubor → Otevřít složku dat a zkopírujte její cestu. Z kořene rozbaleného vydání spusťte v PowerShellu instalační příkaz. Parametr -Force dovoluje přepsání souborů předchozí instalace. Během aktualizace DLL ukončete terminál.
+Spusťte DNForecast-3.2.0-MT5-Setup.exe a vyberte datovou složku terminálu. Při ruční instalaci rozbalte DNForecast-3.2.0-win-x64.zip. V MT5 zvolte Soubor → Otevřít složku dat a zkopírujte její cestu. Z kořene rozbaleného vydání spusťte v PowerShellu instalační příkaz. Parametr -Force dovoluje přepsání souborů předchozí instalace. Během aktualizace DLL ukončete terminál.
 
 ```
 .\tools\Install-MT5.ps1 -TerminalDataPath 'C:\cesta\ke\složce dat'
@@ -14,7 +14,21 @@ Na graf AUDUSD H1 přidejte DNForecast_Async. Výchozí střed je poslední uzav
 
 InpDrivers určuje přesné symboly v pořadí, oddělené čárkou. Prázdný řetězec znamená samotný cílový trh. InpSteps je počet minulých výnosů (16–1024). InpHorizons je počet budoucích svíček (1–64, nejvýše polovina okna). InpJournal zapíná zápis prospektivního CSV do MQL5/Files. InpCuda požaduje kompatibilní CUDA provider u ONNX.
 
-Model z balíčku vyberte zadáním DNForecast\AUDUSD-H1-TCN.onnx do InpModelFile. Vyžaduje AUDUSD H1, 96 kroků, 6 horizontů a pomocné trhy NZDUSD, USDJPY, USDCAD v tomto pořadí. Shoda symbolů včetně přípon chrání před záměnou vstupů. Pro jiného brokera lze vytrénovat balíček s jeho jmény. Instalátor ověří cílovou datovou složku, standardně odmítá přepis souborů.
+Model z balíčku vyberte zadáním DNForecast\AUDUSD-H1-TCN.onnx do InpModelFile. Vyžaduje AUDUSD H1, 96 kroků, 6 horizontů a pomocné trhy NZDUSD, USDJPY, USDCAD v tomto pořadí. Shoda symbolů včetně přípon chrání před záměnou vstupů. Pro jiného brokera lze vytrénovat balíček s jeho jmény. Instalátor před nahrazením souborů vytvoří zálohu.
+
+## Webové studio a autonomní trénink
+
+V přihlášeném terminálu přetáhněte DNForecast_Bridge z Navigátoru mezi experty na jeden otevřený graf. Konektor pouze čte historii. V instalátoru zvolte Otevřít studio nebo spusťte MQL5/Libraries/DNForecast-Studio.exe. V záhlaví uvidíte server brokera a stav MT5.
+
+Na kartě Experiment zadejte cílový symbol, například BTCUSD, časový rámec H1 a 4096 uzavřených svíček. Do pomocných trhů lze přidat přesné názvy brokera oddělené čárkou. Po spuštění získá server snímek požadovaného rozsahu. Pomocnou cenu použije jen tehdy, pokud odpovídající svíčka byla prokazatelně uzavřená v okamžiku rozhodnutí. Chybějící pozorování mají masku.
+
+Zvolte délku vstupu, horizont a počet epoch. CPU natrénuje síť a ověří export ONNX. Chronologické bloky mají poměr 55 % pro učení, 15 % pro výběr epochy, 15 % pro kalibraci a 15 % pro test. Počátky s budoucím cílem přesahujícím hranici jejich bloku jsou vynechány.
+
+V Automatizaci zvolte interval kontroly a aktivujte plán. Po zavření karty plán pracuje dál, pokud běží server a přihlášený terminál s konektorem. Při výpadku čeká na spojení. Po restartu Studio načte nastavení z disku. Kontrolní otisk historie a jméno brokera umožňují přeskočit již zpracovaný snímek. Samostatný server vedle volby --data podporuje --mt5-data s cestou k profilu obsahujícímu MQL5.
+
+Graf ceny zarovnává odhad s časem jeho cíle. Zlepšení MSE je 1 − MSE sítě / MSE poslední ceny. Pokrytí udává podíl skutečných cen mezi Q10 a Q90. Obchodní simulace porovnává výnos na nejdelším horizontu H se zvoleným prahem. Na signál reaguje až na příští uzavírací ceně a pozici drží H svíček. Poplatek účtuje při vstupu i výstupu podle hodnoty pozice. Kapitál se oceňuje na každé uzavřené svíčce. Jde o historickou simulaci při zadaných nákladech. Skutečná exekuce, financování a změny spreadu mohou průběh podstatně změnit.
+
+Výsledky obsahují ONNX, snímek vstupu, metriky pro každý horizont, úplnou testovací řadu a přehled obchodů. Stažený ONNX připojte na cílový graf indikátorem DNForecast_Async se stejnými symboly, délkou vstupu a horizontem.
 
 ## Datová smlouva a interpretace výstupu
 Nejstarší řádek matice je první. Vstup jsou uzavírací ceny [S+1,M], kde S je délka okna a M počet trhů. Sloupec 0 je kladná cena cíle. U pomocného trhu nula značí nedostupnou kotaci. Vstup musí být konečný. Klient drží původ každé predikce odděleně od okamžiku vydání.
@@ -40,7 +54,8 @@ DN3_Cancel zruší čekající úlohu. Rozběhnutý výpočet může fyzicky sko
 
 ## Modely, trénink a kompatibilita
 
-Od verze 3.1 je součástí distribuce nativní CPU trenér, skript DNForecast_Train a webové DNForecast Studio. Trénink, export ONNX, test modelu i prognózy fungují bez Pythonu. Pro vlastní BTCUSD otevřete graf BTCUSD H1 a spusťte skript ze sekce Skripty. [Návod pro samostatný trénink a server](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/blob/v3.1.0/docs/Native-Studio.cs.txt)
+Distribuce obsahuje nativní CPU trenér, skript DNForecast_Train a webové DNForecast Studio. Pro trénink přímo na grafu BTCUSD H1 můžete spustit skript ze sekce Skripty. DLL vystavuje DNFit_Train pro běžné klienty. Rozšiřující rozhraní DNFit_TrainTrace přijímá navíc výstupní pole a jeho délku v hodnotách double. Pro každý testovací počátek zapisuje čtyři hodnoty nejdelšího horizontu v pořadí bodový logaritmický výnos, Q10, Q90 a pravděpodobnost růstu. Počet počátků odpovídá rows − H − floor(0,85 × rows). Úplná deklarace je v include/DNForecastTrain.h.
+
 Výchozí reference funguje na CPU. Součástí vydání pro Windows je volitelně načítaný ONNX Runtime CPU 1.23.2 včetně licencí dodavatelů. Pro CUDA provider sestavte nebo instalujte odpovídající GPU distribuci ONNX Runtime, CUDA a cuDNN. Dostupné rozhraní zjistíte z DN3_GetCapabilities. Skutečné načtení konkrétního modelu ovládá stav relace. Původní nativní DLL 2.3 používá vlastní CUDA závislosti.
 
 ONNX vstup features je float32 [1,S,3M], výstup forecast je float32 [1,H,6]. Jedna samostatná ONNX zpráva obsahuje váhy, metadata dn3.contract a dn3.zero_probe. Kontrakt má tvar dn3-v1|target-trading-bars|3600|AUDUSD,NZDUSD,USDJPY,USDCAD. Referenční tenzor obsahuje 6H desetinných hodnot výstupu pro nulový příznakový vstup. DLL zkontroluje kontrakt, statické tvary, referenční hodnoty, konečnost, pořadí kvantilů, pravděpodobnost a kladnou varianci. U příznaků normalizovaných specificky pro model patří transformace dovnitř grafu.

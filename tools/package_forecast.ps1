@@ -8,7 +8,7 @@ $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 $build=Join-Path $root $BuildDirectory
 $ort=(Resolve-Path -LiteralPath $OrtSdk).Path
-$package=Join-Path (Join-Path $root $OutputDirectory) 'DNForecast-3.1.0-win-x64'
+$package=Join-Path (Join-Path $root $OutputDirectory) 'DNForecast-3.2.0-win-x64'
 if ((Test-Path -LiteralPath $package) -or (Test-Path -LiteralPath "$package.zip")) {throw "Choose an unused output directory: $package"}
 $map=[ordered]@{}
 if (!$CrtDirectory) {
@@ -33,7 +33,7 @@ foreach($file in @('LICENSE.txt','include\DNForecast.h','include\DNForecastTrain
     $map[(Join-Path $root $file)]=$file
 }
 foreach($ext in @('mq5','ex5')) {
-    foreach($stem in @('MQL5\Scripts\DNForecast_Smoke','MQL5\Scripts\DNForecast_Train','MQL5\Indicators\DNForecast_Async')) {
+    foreach($stem in @('MQL5\Experts\DNForecast_Bridge','MQL5\Scripts\DNForecast_Smoke','MQL5\Scripts\DNForecast_Train','MQL5\Indicators\DNForecast_Async')) {
         $file="$stem.$ext"; $map[(Join-Path $root $file)]=$file
     }
 }
@@ -42,7 +42,8 @@ foreach($ext in @('onnx','json')) {
 }
 $studio = Join-Path $build 'DNForecast-Studio.exe'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.dll /r:System.Web.Extensions.dll "/out:$studio" "/win32icon:$(Join-Path $root 'installer/assets/dnforecast.ico')" "/resource:$(Join-Path $root 'studio/index.html'),index.html" "/resource:$(Join-Path $root 'installer/assets/setup-header.jpg'),header.jpg" (Join-Path $root 'studio/Program.cs') (Join-Path $root 'studio/Server.cs')
+$studioSources=@(Get-ChildItem -LiteralPath (Join-Path $root 'studio') -File -Filter '*.cs' | ForEach-Object { $_.FullName })
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.dll /r:System.Web.Extensions.dll "/out:$studio" "/win32icon:$(Join-Path $root 'installer/assets/dnforecast.ico')" "/resource:$(Join-Path $root 'studio/index.html'),index.html" "/resource:$(Join-Path $root 'studio/style.css'),style.css" "/resource:$(Join-Path $root 'studio/app.js'),app.js" @studioSources
 if($LASTEXITCODE -ne 0){throw 'Studio compilation failed'}
 $map[$studio]='MQL5\Libraries\DNForecast-Studio.exe'
 foreach($source in $map.Keys) {if(-not (Test-Path -LiteralPath $source -PathType Leaf)){throw "Required file missing: $source"}}

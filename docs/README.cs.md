@@ -1,10 +1,10 @@
 # MQL5GPULibrary_LSTM — český návod
 
-**[Stáhnout automatický instalátor pro MT5 a Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.1.0/DNForecast-3.1.0-MT5-Setup.exe)**. Spusťte EXE dvojklikem. Vyberte svůj terminál ze seznamu nebo zvolte jeho datovou složku ručně a klikněte na **Nainstalovat**. Instalátor do tohoto profilu přidá celý predikční balíček a ověří kontrolní součty souborů. Po dokončení obnovte v Navigátoru seznam indikátorů. Na graf AUDUSD H1 přidejte `DNForecast_Async` a v nastavení indikátoru povolte import DLL. [Podrobnosti instalace](MT5_SETUP.md)
+**[Stáhnout automatický instalátor pro MT5 a Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.2.0/DNForecast-3.2.0-MT5-Setup.exe)**. Spusťte EXE dvojklikem. Vyberte svůj terminál ze seznamu nebo zvolte jeho datovou složku ručně a klikněte na **Nainstalovat**. Instalátor do tohoto profilu přidá celý predikční balíček a ověří kontrolní součty souborů. Po dokončení obnovte v Navigátoru seznam indikátorů. Na graf AUDUSD H1 přidejte `DNForecast_Async` a v nastavení indikátoru povolte import DLL. [Podrobnosti instalace](MT5_SETUP.md)
 
 **DNForecast 3.0** zpracovává prognózy na pozadí ze stejného vstupu v MT5, Pythonu i C. Balíček obsahuje indikátor, referenci poslední ceny, ONNX Runtime pro CPU a volitelnou TCN pro AUDUSD H1. Historické testy porovnávají jednotlivé horizonty a do simulace obchodování zahrnují skutečné kotace bid/ask. [Instalace a manuál DLL](DNForecast.cs.md) · [PDF](DNForecast_Manual_cs.pdf) · [Výsledek na říjnových datech](research/ICTrading-2026-10.json)
 
-**Vlastní model pro BTCUSD.** Na grafu BTCUSD H1 spusťte ze Skriptů **DNForecast_Train**, povolte import DLL a potvrďte. Skript natrénuje model na historii brokera a přidá předpověď na graf. Pro trénink v prohlížeči otevřete **DNForecast Studio** z instalátoru. Windows klient ani tréninkový server nepotřebují Python. [Postup pro MT5 i samostatný server](Native-Studio.cs.txt)
+**Vlastní model pro BTCUSD.** Jednou přidejte na graf experta **DNForecast_Bridge** a otevřete **DNForecast Studio** z instalátoru. V prohlížeči zadejte BTCUSD, H1 a pomocné symboly brokera. Studio získá data, natrénuje síť a zobrazí chybu, intervaly, obchody i kapitál po nákladech. Pro opakování zvolte Automatizaci. Windows klient i server pracují bez Pythonu. [Postup pro MT5 i samostatný server](Native-Studio.cs.txt)
 
 ## Knihovna CUDA 2.3
 

@@ -10,6 +10,7 @@ dist/
 !MQL5/Indicators/DNForecast_Async.ex5
 !MQL5/Scripts/DNForecast_Smoke.ex5
 !MQL5/Scripts/DNForecast_Train.ex5
+!MQL5/Experts/DNForecast_Bridge.ex5
 output/
 tmp/
 ##

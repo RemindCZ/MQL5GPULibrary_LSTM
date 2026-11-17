@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.2.0
+
+- Request aligned closed bars from a connected MT5 terminal through a read-only Expert Advisor. The browser controls symbols, timeframe, sample size and training parameters.
+- Schedule native training independently of the browser. Restore schedules after restarting Studio and skip unchanged snapshots.
+- Inspect held-out forecasts, calibrated intervals, model skill, trade returns and mark-to-market equity. Configure direction, signal threshold, position size and per-side costs.
+- Export chronological holdout predictions through the native trainer and the optional DNFit_TrainTrace ABI.
+
 ## 3.1.0
 
 - Fit a time-delay neural network directly from an MT5 chart, verify its ONNX graph and attach the resulting forecast.

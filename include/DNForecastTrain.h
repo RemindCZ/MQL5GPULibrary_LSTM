@@ -19,6 +19,13 @@ DN_FIT_API int DNFit_Train(int steps, int markets, int horizons, int epochs,
     const char* contract, int contract_size, const int64_t* times, int rows,
     const double* closes, int close_count, uint8_t* model, int capacity,
     double* report, int report_count, char* error, int error_capacity);
+// Optional holdout trace. Four doubles per test origin at the longest horizon, in order:
+// point log return, Q10, Q90, probability of an up move. Origins start at rows*85/100.
+// Required capacity (doubles): 4*(rows-horizons-rows*85/100). Null disables the trace.
+DN_FIT_API int DNFit_TrainTrace(int steps, int markets, int horizons, int epochs,
+    const char* contract, int contract_size, const int64_t* times, int rows,
+    const double* closes, int close_count, uint8_t* model, int capacity,
+    double* report, int report_count, double* trace, int trace_count, char* error, int error_capacity);
 #ifdef __cplusplus
 }
 #endif

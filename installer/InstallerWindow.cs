@@ -70,7 +70,7 @@ namespace Remind.DNForecast.Setup
             Caption(header, "REMIND", new Rectangle(28, 17, 220, 20), new Font("Segoe UI", 9, FontStyle.Bold),
                 Color.FromArgb(135, 222, 246));
             Caption(header, "DNForecast", new Rectangle(25, 38, 350, 63), new Font("Segoe UI", 33, FontStyle.Bold), Color.White);
-            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.1.0", new Rectangle(29, 106, 330, 23),
+            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.2.0", new Rectangle(29, 106, 330, 23),
                 Font, Color.FromArgb(213, 228, 247));
 
             heading = Caption(this, T("Kam chcete DNForecast nainstalovat?", "Where should DNForecast be installed?"),
@@ -213,8 +213,8 @@ namespace Remind.DNForecast.Setup
             studio.Visible = Result == 0;
             CancelButton = null;
             heading.Text = Result == 0 ? T("Instalace dokončena", "Installation complete") : T("Instalace se nedokončila", "Installation incomplete");
-            if (Result == 0) message.Text = T("V MT5 obnovte seznam indikátorů a přidejte DNForecast_Async na graf.",
-                                                 "Refresh Indicators in MT5 and attach DNForecast_Async to a chart.");
+            if (Result == 0) message.Text = T("Pro trénink ze Studia přidejte v MT5 na jeden graf experta DNForecast_Bridge.",
+                                                 "To train from Studio, attach the DNForecast_Bridge expert to one MT5 chart.");
             primary.Text = T("Zavřít", "Close");
             primary.Enabled = true;
             primary.Focus();

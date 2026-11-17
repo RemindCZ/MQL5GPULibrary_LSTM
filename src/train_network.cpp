@@ -35,7 +35,7 @@ float quantile(const Vec& sorted,float fraction) {
     size_t i=static_cast<size_t>(pos);
     return sorted[i]+(pos-i)*(sorted[std::min(i+1,sorted.size()-1)]-sorted[i]);
 }
-Net fit(int steps,int markets,int h,int epochs,const double* prices,int rows,double* report) {
+Net fit(int steps,int markets,int h,int epochs,const double* prices,int rows,double* report,double* trace) {
     Net n{}; n.steps=steps; n.markets=markets; n.horizons=h;
     for (int lag:{0,1,2,3,7,15,steps/2,steps-1}) {
         int tap=steps-1-lag;
@@ -131,6 +131,10 @@ Net fit(int steps,int markets,int h,int epochs,const double* prices,int rows,dou
     std::fill_n(report,3*h,0.);
     for (int i=split3;i<end;++i) {
         n.forward(x.data()+i*dim,state,head); const auto output=n.predict(head);
+        if (trace) {
+            const auto* prediction=output.data()+(h-1)*DN3_FIELDS;
+            for (auto field:{DN3_POINT,DN3_Q10,DN3_Q90,DN3_P_UP}) *trace++=prediction[field];
+        }
         for (int q=0;q<h;++q) {
             const double truth=y[i*h+q], e=output[6*q]-truth;
             report[3*q]+=e*e; report[3*q+1]+=truth*truth;
@@ -174,16 +178,16 @@ void verify_export(const Net& net,const std::string& key,const std::vector<uint8
         if(std::abs(output[i]-expected[i])>1.e-8+2.e-4*std::abs(expected[i])) throw std::runtime_error("Native and ONNX predictions differ");
 }
 }
-int DNFit_Train(int steps,int markets,int h,int epochs,const char* contract,int contract_size,
+int DNFit_TrainTrace(int steps,int markets,int h,int epochs,const char* contract,int contract_size,
                 const int64_t* times,int rows,const double* closes,int close_count,uint8_t* model,
-                int capacity,double* report,int report_count,char* error,int error_capacity) {
+                int capacity,double* report,int report_count,double* trace,int trace_count,char* error,int error_capacity) {
     if (!error || error_capacity<1) return -1;
     error[0]=0;
     try {
         if (steps<16 || steps>1024 || markets<1 || markets>16 || h<1 || h>64 || h>steps/2 ||
             epochs<1 || epochs>64 || rows<1 || rows>100000 || !closes || !times || close_count!=rows*markets ||
             !contract || contract_size<1 || contract_size>2048 || std::memchr(contract,0,contract_size) ||
-            !model || capacity<1 || !report || report_count<3*h)
+            !model || capacity<1 || !report || report_count<3*h || (trace && trace_count<4*(rows-h-rows*85/100)))
             throw std::invalid_argument("Invalid dimensions, contract or output buffers");
         const std::string key(contract,contract_size);
         const std::string prefix="dn3-v1|target-trading-bars|";
@@ -193,7 +197,7 @@ int DNFit_Train(int steps,int markets,int h,int epochs,const char* contract,int 
             throw std::invalid_argument("Invalid market/timeframe contract");
         for (int i=0;i<rows;++i) if (times[i]<=0 || (i && times[i]<=times[i-1]))
             throw std::invalid_argument("Closed bar timestamps must increase strictly");
-        auto net=dnfit::fit(steps,markets,h,epochs,closes,rows,report);
+        auto net=dnfit::fit(steps,markets,h,epochs,closes,rows,report,trace);
         auto bytes=dnfit::export_onnx(net,key);
         if (bytes.size()>static_cast<size_t>(capacity)) throw std::length_error("Model buffer too small");
         dnfit::verify_export(net,key,bytes,closes+(rows-steps-1)*markets,times[rows-1]);
@@ -202,4 +206,10 @@ int DNFit_Train(int steps,int markets,int h,int epochs,const char* contract,int 
         size_t n=std::min(std::strlen(e.what()),static_cast<size_t>(error_capacity-1));
         std::memcpy(error,e.what(),n); error[n]=0; return -1;
     } catch (...) { return -1; }
+}
+int DNFit_Train(int steps,int markets,int h,int epochs,const char* contract,int contract_size,
+                const int64_t* times,int rows,const double* closes,int close_count,uint8_t* model,
+                int capacity,double* report,int report_count,char* error,int error_capacity) {
+    return DNFit_TrainTrace(steps,markets,h,epochs,contract,contract_size,times,rows,closes,close_count,
+        model,capacity,report,report_count,nullptr,0,error,error_capacity);
 }

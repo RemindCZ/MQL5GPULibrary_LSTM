@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -55,8 +56,8 @@ int wmain(int argc,wchar_t** argv) {
 int main(int argc,char** argv) {
 #endif
     try {
-        if (argc<4 || argc>7) {
-            std::cerr<<"DNForecast-Train bars.csv new-model.onnx timeframe_seconds [steps=96] [horizons=6] [epochs=8]\n"
+        if (argc<4 || argc>8) {
+            std::cerr<<"DNForecast-Train bars.csv new-model.onnx timeframe_seconds [steps=96] [horizons=6] [epochs=8] [new-trace.csv]\n"
                        "CSV header: close_time,available_at,TARGET[,DRIVER...]; timestamps in seconds; blank auxiliary = missing\n";
             return 2;
         }
@@ -97,10 +98,24 @@ int main(int argc,char** argv) {
         }
         if (f.bad()) throw std::runtime_error("CSV read error");
         std::vector<uint8_t> model(1024*1024); std::vector<double> metrics(h*3); char error[512]{};
-        int size=DNFit_Train(steps,markets,h,epochs,contract.data(),static_cast<int>(contract.size()),times.data(),
+        const int rows=static_cast<int>(times.size()), first=rows*85/100;
+        std::vector<double> trace(argc==8 ? 4*std::max(0,rows-first-h) : 0);
+        if(argc==8 && fs::exists(fs::path(argv[7]))) throw std::invalid_argument("Trace file already exists");
+        int size=DNFit_TrainTrace(steps,markets,h,epochs,contract.data(),static_cast<int>(contract.size()),times.data(),
             static_cast<int>(times.size()),prices.data(),static_cast<int>(prices.size()),model.data(),static_cast<int>(model.size()),
-            metrics.data(),static_cast<int>(metrics.size()),error,sizeof(error));
+            metrics.data(),static_cast<int>(metrics.size()),trace.empty()?nullptr:trace.data(),static_cast<int>(trace.size()),error,sizeof(error));
         if (size<=0) throw std::runtime_error(error);
+        if (argc==8) {
+            std::ostringstream out; out<<std::setprecision(17)<<"time,close,point,q10,q90,p_up\n";
+            for (int i=first;i<rows;++i) {
+                out<<times[i]<<','<<prices[i*markets];
+                if (i<rows-h) for (int k=0;k<4;++k) out<<','<<trace[(i-first)*4+k];
+                else out<<",,,,";
+                out<<'\n';
+            }
+            const auto csv=out.str();
+            save_new(fs::path(argv[7]),reinterpret_cast<const uint8_t*>(csv.data()),static_cast<int>(csv.size()));
+        }
         save_new(dest,model.data(),size);
         std::cout<<"horizon,test_mse,last_price_mse,coverage80\n";
         for (int q=0;q<h;++q) std::cout<<q+1<<','<<metrics[3*q]<<','<<metrics[3*q+1]<<','<<metrics[3*q+2]<<'\n';

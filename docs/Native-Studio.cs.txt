@@ -1,8 +1,8 @@
-DNForecast 3.1 pro Windows x64
+DNForecast 3.2 pro Windows x64
 Trénink v MT5 a v prohlížeči
 
 Instalace
-Spusťte DNForecast-3.1.0-MT5-Setup.exe. Vyberte datovou složku svého terminálu a potvrďte instalaci. Pro MT5, samostatný trenér i webové studio stačí distribuované binární soubory. Klient nepotřebuje Python, pip, PyTorch, CUDA ani cloudový účet. Studio používá systémový .NET Framework 4.8.
+Spusťte DNForecast-3.2.0-MT5-Setup.exe. Vyberte datovou složku svého terminálu a potvrďte instalaci. Pro MT5, samostatný trenér i webové studio stačí distribuované binární soubory. Klient nepotřebuje Python, pip, PyTorch, CUDA ani cloudový účet. Studio používá systémový .NET Framework 4.8.
 
 Trénink přímo na grafu
 1. Otevřete například BTCUSD H1 a v Navigátoru obnovte seznam Skripty.
@@ -12,13 +12,17 @@ Trénink přímo na grafu
 
 Trénink na pozadí v prohlížeči
 1. Po instalaci zvolte Otevřít studio. Později spusťte MQL5\Libraries\DNForecast-Studio.exe. Otevře se místní web na http://127.0.0.1:18765. Ikona v oznamovací oblasti otevře stránku znovu nebo ukončí nečinný server.
-2. Na grafu MT5 spusťte DNForecast_Train s volbou InpStudioHistoryOnly=true. Skript uloží historii do MQL5\Files\DNForecast\History. Ve studiu ji uvidíte v seznamu. CSV lze také importovat z jiného počítače.
-3. Vyberte historii a její skutečnou délku svíčky (H1 = 3600 sekund). Určete počet vstupních kroků, horizontů a epoch. Klikněte na Spustit trénink. Server spouští jednu úlohu najednou. Kartu lze zavřít, počítač a proces serveru musí zůstat spuštěné. Po dokončení studio nabídne model ke stažení. Na disku jsou také výsledky testu.
-4. Je-li studio na stejném profilu MT5, model již leží v MQL5\Files\DNForecast. Z jiného serveru ho stáhněte do této složky. Na cílový graf přidejte DNForecast_Async. Do InpModelFile patří DNForecast\Studio-<id>.onnx. InpSteps, InpHorizons, časový rámec grafu a InpDrivers musí odpovídat údajům úlohy. Pro samotný BTCUSD nechte InpDrivers prázdné a InpCuda=false.
+2. V přihlášeném MT5 v Navigátoru otevřete sekci Experti, obnovte seznam a jednou přetáhněte DNForecast_Bridge na graf. Graf ponechte otevřený. Konektor pouze čte historii a nepotřebuje oprávnění k obchodování ani import DLL. Sledujte ve Studiu vpravo nahoře jméno serveru a stav připojení.
+3. Na kartě Experiment zvolte Terminál MT5. Zadejte například BTCUSD, H1 a 4096 svíček. Pomocné trhy zadejte čárkou pod jejich přesnými názvy u brokera. Zvolte počet kroků, horizontů, epoch a pravidla obchodu. Tlačítko Spustit experiment načte historii, natrénuje síť a provede simulaci. Při nedostatku svíček nebo neznámém symbolu najdete důvod v Historii. Historii lze též importovat na kartě Historie CSV. Prohlížeč může být během zpracování zavřený.
+4. V Automatizaci zvolte interval a aktivujte plán. Platí konfigurace experimentu v okamžiku aktivace. Server vyčká na dostupný terminál a zpracuje jeden experiment najednou. Při shodném snímku a brokerovi přeskočí opakování. Nastavení a otisk dat posledního úspěšného běhu uchová i po restartu. Zastavit plán ukončí další kontroly, probíhající experiment doběhne. Po restartu Windows musí znovu běžet přihlášený MT5 s konektorem a proces Studia.
+5. Je-li studio na stejném profilu MT5, model již leží v MQL5\Files\DNForecast. Z jiného serveru ho stáhněte do této složky. Na cílový graf přidejte DNForecast_Async. Do InpModelFile patří DNForecast\Studio-<id>.onnx. InpSteps, InpHorizons, časový rámec grafu a InpDrivers musí odpovídat údajům úlohy. Pro samotný BTCUSD nechte InpDrivers prázdné a InpCuda=false.
 
 Samostatný Windows server
 Rozbalte celý distribuční ZIP. Server může běžet i na stroji bez terminálu MT5. V jeho MQL5\Libraries spusťte:
 DNForecast-Studio.exe --headless --data "D:\DNForecast" --port 18765
+Pro samostatné úložiště a připojený profil MT5 zadejte také přesnou cestu z MT5 → Soubor → Otevřít složku dat:
+DNForecast-Studio.exe --headless --data "D:\DNForecast" --mt5-data "D:\MT5-Profil" --port 18765
+Server i konektor potřebují přístup do MQL5\Files\DNForecast\Bridge zvoleného profilu. Cesta může být také sdílená složka dostupná oběma procesům. Server od brokera nepřijímá ani neukládá přihlašovací údaje. Čte publikované snímky ze zvoleného terminálu. Bez zdroje MT5 lze použít CSV.
 Ve složce History se uchovávají CSV a v datové složce výstupní modely a reporty. Headless režim je určen také pro Plánovač úloh Windows. Server naslouchá jen na 127.0.0.1. Pro vzdálený prohlížeč lze použít přesměrování portu přes již nakonfigurovaný SSH server:
 ssh -N -L 18765:127.0.0.1:18765 uzivatel@server
 Potom na klientovi otevřete http://127.0.0.1:18765. Trénink pokračuje i po odpojení tunelu. Jedna instance využívá jeden port. Pro další profil zvolte jiný port.
@@ -31,3 +35,9 @@ Sloupce CSV: close_time,available_at,BTCUSD a případně po něm další symbol
 Co se učí a jak číst výsledky
 Nativní model je neuronová síť s časovými zpožděními, jednou skrytou vrstvou se 16 jednotkami tanh a přímými výstupy pro každý horizont. Vstupní příznaky jsou stejné jako při predikci v DLL. Obě vrstvy se učí na CPU. Poslední pozorování jsou vyhrazena čistě pro test. Chronologické rozdělení je 55 % trénink, 15 % výběr epochy, 15 % kalibrace intervalů a 15 % test. Počátky s přesahem budoucích hodnot přes hranici bloku jsou vynechány. Výstup zahrnuje bod, tři kvantily, pravděpodobnost růstu a odhad variance z kalibračního období.
 test_mse je průměrná kvadratická chyba logaritmického výnosu. Porovnejte ji na každém horizontu s last_price_mse. Coverage80 je podíl skutečností mezi spodní a horní mezí. Z těchto čísel samotných nelze určit výnos po nákladech. Model a jeho použití na grafu nezadávají obchodní pokyny.
+
+Simulace pravidel a čtení grafu
+Web vykreslí posledních 15 % uzavřených svíček. Každý bod prognózy je zarovnaný s časem, pro který byla vydaná předpověď na nejdelším horizontu H. Ceny a interval mezi Q10 a Q90 jsou přepočtené z logaritmických výnosů a ceny známé při vzniku předpovědi. Časové popisky zachovávají čas brokera. Pokrytí 80% intervalu je empirický podíl výsledků uvnitř pásma. Zlepšení MSE = 1 − MSE modelu / MSE poslední ceny. Záporná hodnota znamená vyšší chybu modelu.
+Pravidlo porovnává bodový logaritmický výnos s prahem v bazických bodech (1 bp = 0,01 %). Kladný signál otevírá long, záporný short, podle povoleného směru. Při signálu na zavření t simulace vstoupí na zavření t+1 a vystoupí na zavření t+1+H. Předpověď se tedy vyhodnocuje k t+H, obchod drží H svíček od zpožděného vstupu. Současně je otevřena nejvýše jedna pozice. Velikost je podíl aktuálního kapitálu. Náklad za každou stranu je podíl skutečné hodnoty vstupu nebo výstupu. Nastavte jej podle testovaného trhu. Vývoj kapitálu a maximální propad se přeceňují na každém zavření. Simulace neobsahuje intrabarové ceny, skutečné plnění, měnící se spread, financování ani maržové požadavky brokera.
+V Historii lze otevřít některý z posledních 30 dokončených modelů, stáhnout ONNX nebo znovu použít nastavení. Snímek CSV, model, nativní metriky, časová řada predikcí (.trace.csv) a úplný seznam obchodů a hodnot kapitálu (.report.json) zůstávají v datové složce. Web ukazuje posledních 100 obchodů. Nativní příkazový trenér přijímá za počtem epoch také volitelný název nového souboru pro testovací predikce. DLL poskytuje odpovídající rozhraní DNFit_TrainTrace.
+Opakovaný výběr pravidel podle stejného testu ovlivňuje interpretaci výsledků. Změněnou strategii vyhodnoťte na dalším, předem nepoužitém období.

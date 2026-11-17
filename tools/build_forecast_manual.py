@@ -21,7 +21,7 @@ subtitle=ParagraphStyle("subtitle",fontName="Manual",fontSize=12,leading=18,spac
 code=ParagraphStyle("code",fontName="Mono",fontSize=8.1,leading=12,spaceBefore=4,spaceAfter=14,backColor=colors.HexColor("#EFF5F4"),borderPadding=6)
 out=root/"docs/DNForecast_Manual_cs.pdf"
 doc=SimpleDocTemplate(str(out),pagesize=A4,leftMargin=49,rightMargin=49,topMargin=62,bottomMargin=55,
-                      title="DNForecast 3.0 | Technický manuál",author="Remind / Tomáš Bělák")
+                      title="DNForecast 3.2 | Technický manuál",author="Remind / Tomáš Bělák")
 story=[]
 source=(root/"docs/DNForecast.cs.md").read_text(encoding="utf-8")
 intro,*chapters=re.split(r"(?m)^## ",source)
@@ -29,7 +29,7 @@ for i,chapter in enumerate(chapters):
     if i:story.append(PageBreak())
     title,text=chapter.split("\n",1)
     if not i:
-        story.append(Paragraph("DNForecast 3.0",heading))
+        story.append(Paragraph("DNForecast 3.2",heading))
         story.append(Paragraph(escape(intro.splitlines()[1]),subtitle))
     story.append(Paragraph(escape(title),heading))
     for j,part in enumerate(text.strip().split("```")):
@@ -48,7 +48,7 @@ def frame(c,d):
     c.drawString(49,A4[1]-34,"REMIND   /   DNFORECAST")
     c.setStrokeColor(teal);c.line(49,A4[1]-42,A4[0]-49,A4[1]-42)
     c.setFont("Manual",8);c.setFillColor(ink)
-    c.drawString(49,30,"Tomáš Bělák  •  MT5 a samostatné aplikace  /  3.0")
+    c.drawString(49,30,"Tomáš Bělák  •  MT5 a samostatné aplikace  /  3.2")
     c.drawRightString(A4[0]-49,30,str(d.page));c.restoreState()
 
 doc.build(story,onFirstPage=frame,onLaterPages=frame)
