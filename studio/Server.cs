@@ -19,7 +19,7 @@ namespace Remind.DNForecast.Studio
 {
     internal sealed class Job
     {
-        public string id, dataset, status, model, log, contract, created, broker;
+        public string id, dataset, status, model, log, contract, created, broker, device;
         public Recipe config;
         public bool hasReport;
     }
@@ -31,7 +31,7 @@ namespace Remind.DNForecast.Studio
         private readonly object gate = new object();
         private readonly List<Job> jobs = new List<Job>();
         private readonly SemaphoreSlim clients = new SemaphoreSlim(8);
-        private readonly byte[] page, style, script;
+        private readonly byte[] page, style, script, editor;
         private bool busy;
         private volatile bool stopping;
         internal string Url { get; private set; }
@@ -47,7 +47,7 @@ namespace Remind.DNForecast.Studio
             if (!File.Exists(trainer)) throw new FileNotFoundException("Missing native trainer",trainer);
             foreach (var f in new DirectoryInfo(root).GetFiles("Studio-*.job.json").OrderByDescending(v=>v.LastWriteTimeUtc).Take(30)) {
                 try {
-                    if (f.Length>65536 || !RegularFile(f.FullName)) continue;
+                    if (f.Length>524288 || !RegularFile(f.FullName)) continue;
                     var j=new JavaScriptSerializer().Deserialize<Job>(File.ReadAllText(f.FullName));
                     if(j!=null && j.id!=null && Regex.IsMatch(j.id,"^[0-9a-f]{32}$") &&
                        j.model=="Studio-"+j.id+".onnx" && RegularFile(Path.Combine(root,j.model))) jobs.Add(j);
@@ -57,10 +57,10 @@ namespace Remind.DNForecast.Studio
             token = BitConverter.ToString(random).Replace("-","");
             using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("index.html"))
             using (var reader = new StreamReader(s)) page = Encoding.UTF8.GetBytes(reader.ReadToEnd().Replace("__NONCE__",token));
-            style=Resource("style.css"); script=Resource("app.js");
+            editor=Resource("editor.js");style=Resource("style.css"); script=Resource("app.js");
             listener = new TcpListener(IPAddress.Loopback,port); listener.Start(16);
             Url = "http://127.0.0.1:" + ((IPEndPoint)listener.LocalEndpoint).Port + "/";
-            ResumePlan();Task.Run((Action)Accept);
+            ResumePlan();Task.Run((Action)ProbeCuda);Task.Run((Action)Accept);
         }
         private static byte[] Resource(string name)
         {
@@ -126,6 +126,7 @@ namespace Remind.DNForecast.Studio
                     if (first[0]=="GET") {
                         if(path=="/") Reply(stream,200,"text/html; charset=utf-8",page);
                         else if(path=="/style.css") Reply(stream,200,"text/css; charset=utf-8",style);
+                        else if(path=="/editor.js") Reply(stream,200,"application/javascript; charset=utf-8",editor);
                         else if(path=="/app.js") Reply(stream,200,"application/javascript; charset=utf-8",script);
                         else if(path.StartsWith("/report/")) {
                             Job j;lock(gate) j=jobs.Find(x=>x.id==path.Substring(8) && x.hasReport);
@@ -136,7 +137,7 @@ namespace Remind.DNForecast.Studio
                             var datasets=Directory.EnumerateFiles(history,"*.csv").Where(RegularFile).Select(Path.GetFileName).Where(IsDataName).OrderByDescending(n=>n).ToArray();
                             string json;
                             bool online;var feed=Feed(out online);
-                            lock(gate) json=new JavaScriptSerializer().Serialize(new { datasets=datasets, busy=busy, jobs=jobs.ToArray(),feed=feed,plan=plan });
+                            lock(gate) json=new JavaScriptSerializer {MaxJsonLength=32*1024*1024}.Serialize(new { cuda=cudaDevice,cudaMessage=cudaProblem,datasets=datasets, busy=busy, jobs=jobs.ToArray(),feed=feed,plan=plan });
                             Reply(stream,200,"application/json; charset=utf-8",Encoding.UTF8.GetBytes(json));
                         } else if(path.StartsWith("/model/")) {
                             Job j; lock(gate) j=jobs.Find(x=>x.id==path.Substring(7) && x.model!=null);
@@ -169,13 +170,24 @@ namespace Remind.DNForecast.Studio
                         } finally { if(File.Exists(temp)) File.Delete(temp); }
                         Text(stream,200,name);return;
                     }
-                    if(length!=0) throw new InvalidDataException("Unexpected body");
+
                     if(path=="/api/stop-plan") {
                         lock(gate) {File.Delete(PlanPath);plan=null;} Text(stream,200,"OK");return;
                     }
                     bool brokerRequest=path=="/api/run" || path=="/api/plan";
                     if(!brokerRequest && path!="/api/train") {Text(stream,404,"Not found");return;}
                     var config=Recipe.Parse(query,brokerRequest);
+                    string dataset=brokerRequest ? null : query["file"];
+                    if(!brokerRequest && (!IsDataName(dataset) || !RegularFile(Path.Combine(history,dataset)))) {Text(stream,404,"Dataset unavailable");return;}
+                    if(config.engine!="tdnn"){
+                        if(config.engine=="cuda" && cudaDevice.Length==0) {Text(stream,409,"CUDA není dostupná: "+cudaProblem);return;}
+                        config.graph=ReadGraph(input,length);
+                        int markets;
+                        if(brokerRequest)markets=config.Symbols.Split(',').Length;
+                        else using(var reader=File.OpenText(Path.Combine(history,dataset)))markets=(reader.ReadLine()??"").Split(',').Length-2;
+                        if(markets<1 || markets>16)throw new InvalidDataException("Neplatné vstupy historie.");
+                        Architecture.Validate(config.graph,markets,config.horizons);
+                    } else if(length!=0)throw new InvalidDataException("Unexpected network configuration");
                     if(path=="/api/plan") {
                         if(config.minutes<1) throw new InvalidDataException("Chybí interval.");
                         lock(gate) {
@@ -183,8 +195,6 @@ namespace Remind.DNForecast.Studio
                             AtomicText(PlanPath,new JavaScriptSerializer().Serialize(next));plan=next;
                         } Text(stream,200,"OK");return;
                     }
-                    string dataset=brokerRequest ? null : query["file"];
-                    if(!brokerRequest && (!IsDataName(dataset) || !RegularFile(Path.Combine(history,dataset)))) {Text(stream,404,"Dataset unavailable");return;}
                     if(brokerRequest) {
                         bool online;Feed(out online);
                         if(!online) {Text(stream,409,"Připojte DNForecast_Bridge k přihlášenému MT5.");return;}
@@ -206,12 +216,23 @@ namespace Remind.DNForecast.Studio
             var c=job.config;
             string arguments=String.Format(CultureInfo.InvariantCulture,"\"{0}\" \"{1}\" {2} {3} {4} {5} \"{6}\"",
                 dataset,Path.Combine(root,name),c.seconds,c.steps,c.horizons,c.epochs,trace);
+            if(c.engine=="cuda" || c.engine=="cpu"){
+                string recipePath=Path.Combine(root,stem+".dng");
+                AtomicText(recipePath,c.engine+" "+c.batch+" "+c.rate.ToString("R",CultureInfo.InvariantCulture)+"\n"+c.graph+"\n");
+                arguments+=" \""+recipePath+"\"";
+            }
             var psi=new ProcessStartInfo(trainer,arguments) {
                 UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true };
             using(var p=Process.Start(psi)) {
-                var stdout=p.StandardOutput.ReadToEndAsync();var stderr=p.StandardError.ReadToEndAsync();
-                p.WaitForExit();Task.WaitAll(stdout,stderr);
-                if(p.ExitCode!=0) throw new InvalidDataException(stderr.Result.Trim());
+                var stdout=p.StandardOutput.ReadToEndAsync();
+                var errors=new StringBuilder();string line;
+                while((line=p.StandardError.ReadLine())!=null) {
+                    if(Regex.IsMatch(line,@"^epoch [0-9]+/[0-9]+$")) {
+                        lock(gate) job.status="Trénink · "+job.device+" · "+line.Replace("epoch","epocha");
+                    } else if(errors.Length<4096)errors.AppendLine(line);
+                }
+                p.WaitForExit();stdout.Wait();
+                if(p.ExitCode!=0) throw new InvalidDataException(errors.Length>0?errors.ToString().Trim():"Trenér skončil s kódem "+p.ExitCode);
                 lock(gate) job.status="Vyhodnocení strategie";
                 Research.Evaluate(trace,Path.Combine(root,stem+".report.json"),c);
                 File.WriteAllText(Path.Combine(root,stem+".csv"),stdout.Result,Encoding.UTF8);

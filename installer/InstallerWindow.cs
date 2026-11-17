@@ -70,7 +70,7 @@ namespace Remind.DNForecast.Setup
             Caption(header, "REMIND", new Rectangle(28, 17, 220, 20), new Font("Segoe UI", 9, FontStyle.Bold),
                 Color.FromArgb(135, 222, 246));
             Caption(header, "DNForecast", new Rectangle(25, 38, 350, 63), new Font("Segoe UI", 33, FontStyle.Bold), Color.White);
-            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.2.0", new Rectangle(29, 106, 330, 23),
+            Caption(header, "MetaTrader 5   /   Windows x64   /   v3.3.0", new Rectangle(29, 106, 330, 23),
                 Font, Color.FromArgb(213, 228, 247));
 
             heading = Caption(this, T("Kam chcete DNForecast nainstalovat?", "Where should DNForecast be installed?"),

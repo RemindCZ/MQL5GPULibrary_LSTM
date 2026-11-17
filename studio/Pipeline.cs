@@ -15,7 +15,9 @@ namespace Remind.DNForecast.Studio
 {
     internal sealed class Recipe
     {
-        public string target,drivers,side;
+        public string target,drivers,side,engine,graph;
+        public int batch;
+        public double rate;
         public int seconds,steps,horizons,epochs,bars,minutes;
         public double cost,edge,allocation;
 
@@ -24,9 +26,13 @@ namespace Remind.DNForecast.Studio
             var c=new Recipe {
                 seconds=Integer(q,"seconds",1,31536000),steps=Integer(q,"steps",16,1024),
                 horizons=Integer(q,"horizons",1,64),epochs=Integer(q,"epochs",1,64),
-                side=q["side"]??"both",cost=Decimal(q,"cost",1,0,100),edge=Decimal(q,"edge",2,0,1000),
+                engine=q["engine"]??"tdnn",side=q["side"]??"both",cost=Decimal(q,"cost",1,0,100),edge=Decimal(q,"edge",2,0,1000),
                 allocation=Decimal(q,"allocation",100,1,100)
             };
+            if(c.engine!="tdnn" && c.engine!="cpu" && c.engine!="cuda")throw new InvalidDataException("Neplatný výpočetní režim.");
+            if(c.engine!="tdnn"){
+                c.batch=Integer(q,"batch",1,4096);c.rate=Decimal(q,"rate",.001,.000001,1);
+            }
             if(c.horizons>c.steps/2 || !(new[]{"long","short","both"}).Contains(c.side))
                 throw new InvalidDataException("Neplatný horizont nebo směr pozice.");
             if(broker) {
@@ -38,7 +44,7 @@ namespace Remind.DNForecast.Studio
                     symbols.Distinct(StringComparer.Ordinal).Count()!=symbols.Length)
                     throw new InvalidDataException("Zadejte různé platné symboly brokera.");
                 if(c.bars*55/100-c.horizons-c.steps<64 || c.bars-c.bars*85/100-c.horizons<32 ||
-                   (long)c.bars*(24*symbols.Length+c.horizons)>16000000)
+                   (c.engine=="tdnn" && (long)c.bars*(24*symbols.Length+c.horizons)>16000000))
                     throw new InvalidDataException("Upravte počet svíček, symbolů nebo délku vstupu pro oddělený test.");
                 c.target=symbols[0];c.drivers=String.Join(",",symbols.Skip(1));
             }
@@ -119,6 +125,7 @@ namespace Remind.DNForecast.Studio
             try {
                 lock(gate) {
                     if(stopping || busy || plan==null || DateTime.Parse(plan.next,null,DateTimeStyles.RoundtripKind)>DateTime.UtcNow) return;
+                    if(plan.recipe.engine=="cuda" && cudaDevice.Length==0){plan.message="Čeká na CUDA: "+cudaProblem;return;}
                     bool online;Feed(out online);
                     if(!online) {plan.message="Čeká na připojení MT5";return;}
                     plan.next=At(DateTime.UtcNow.AddMinutes(plan.recipe.minutes));plan.message="Probíhá kontrola historie";SavePlan();
@@ -129,7 +136,7 @@ namespace Remind.DNForecast.Studio
         private Job StartJob(Recipe config,string dataset,Schedule scheduled)
         {
             var job=new Job {id=Guid.NewGuid().ToString("N"),dataset=dataset,status=dataset==null?"Načítání z MT5":"Trénink",
-                config=config,created=At(DateTime.UtcNow),contract=String.Format("{0} | {1} s | {2} kroků | {3} horizontů",
+                config=config,device=config.engine=="cuda"?cudaDevice:"CPU",created=At(DateTime.UtcNow),contract=String.Format("{0} | {1} s | {2} kroků | {3} horizontů",
                     config.target??dataset,config.seconds,config.steps,config.horizons)};
             jobs.Insert(0,job);busy=true;
             Task.Run(()=>Run(job,scheduled));return job;

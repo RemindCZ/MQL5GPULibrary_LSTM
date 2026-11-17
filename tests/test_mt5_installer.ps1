@@ -38,10 +38,15 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
     try {
-        $reader = [IO.StreamReader]::new($zip.GetEntry('DNForecast-3.2.0-win-x64/SHA256.json').Open())
+        $reader = [IO.StreamReader]::new($zip.GetEntry('DNForecast-3.3.0-win-x64/SHA256.json').Open())
         try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
         $items = @($manifest | Where-Object { $_.path -like 'MQL5/*' -and !$_.runtime_version })
-        Assert ($items.Count -eq 18) 'Unexpected release layout.'
+        $gpu = @($items | Where-Object { $_.path -like 'MQL5/Libraries/DNForecast-CUDA/*' })
+        if ($gpu.Count) {
+            $expected=@('MQL5GPULibrary_LSTM.dll','cublas64_13.dll','cublasLt64_13.dll','curand64_10.dll','cudart64_13.dll')
+            Assert (!(Compare-Object $expected @($gpu | ForEach-Object { Split-Path $_.path -Leaf }))) 'Incomplete CUDA runtime.'
+        }
+        Assert ($items.Count -eq (18+$gpu.Count)) 'Unexpected release layout.'
         foreach ($item in $items) {
             Assert ((Get-FileHash -LiteralPath (Join-Path $root $item.path)).Hash -eq $item.sha256) "Hash: $($item.path)"
         }

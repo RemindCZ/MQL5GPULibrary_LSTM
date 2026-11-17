@@ -1,6 +1,6 @@
 # Automatická instalace DNForecast do MT5
 
-[Stáhnout instalátor DNForecast 3.2.0 pro Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.2.0/DNForecast-3.2.0-MT5-Setup.exe)
+[Stáhnout instalátor DNForecast 3.3.0 pro Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.3.0/DNForecast-3.3.0-MT5-Setup.exe)
 
 Spusťte EXE dvojklikem pod stejným uživatelem Windows, který používá MetaTrader 5. Vyberte instalaci MT5, zkontrolujte zobrazenou datovou cestu a klikněte na **Nainstalovat**. Tlačítkem **Vybrat jinou složku…** můžete určit vlastní umístění. Po potvrzení instalátor provede všechny kroky offline. Podporované prostředí je Windows 10 nebo 11 x64 s klasickým terminálem MT5. Instalátor používá součást Windows .NET Framework 4.8. Po dokončení klikněte na **Zavřít**.
 
@@ -28,7 +28,7 @@ Protokoly jsou v `%LOCALAPPDATA%\Remind\DNForecast\Logs`. Obsahují cílové ces
 ## Bezobslužné nasazení
 
 ```powershell
-$setup = '.\DNForecast-3.2.0-MT5-Setup.exe'
+$setup = '.\DNForecast-3.3.0-MT5-Setup.exe'
 $p = Start-Process $setup -ArgumentList '/quiet' -Wait -PassThru
 $p.ExitCode
 ```
@@ -37,9 +37,9 @@ V tichém režimu se při jediném nalezeném profilu použije tento profil. Př
 
 ## Sestavení instalátoru
 
-Vývojář potřebuje ZIP v3.2.0 a kompilátor .NET Framework x64. ZIP už obsahuje distribuovatelné knihovny Visual C++ x64. Pro kontrolu zveřejněného ZIPu předejte `-ExpectedZipSha256` s otiskem vydání. Skript `package_forecast.ps1` přijímá při vytváření ZIPu volitelný `-CrtDirectory`.
+Vývojář potřebuje ZIP v3.3.0 a kompilátor .NET Framework x64. ZIP už obsahuje distribuovatelné knihovny Visual C++ x64. Pro kontrolu zveřejněného ZIPu předejte `-ExpectedZipSha256` s otiskem vydání. Skript `package_forecast.ps1` přijímá při vytváření ZIPu volitelný `-CrtDirectory`.
 
 ```powershell
-.\tools\build_mt5_installer.ps1 -ReleaseZip .\DNForecast-3.2.0-win-x64.zip
-.\tests\test_mt5_installer.ps1 -Setup .\output\mt5-installer\DNForecast-3.2.0-MT5-Setup.exe -ReleaseZip .\DNForecast-3.2.0-win-x64.zip
+.\tools\build_mt5_installer.ps1 -ReleaseZip .\DNForecast-3.3.0-win-x64.zip
+.\tests\test_mt5_installer.ps1 -Setup .\output\mt5-installer\DNForecast-3.3.0-MT5-Setup.exe -ReleaseZip .\DNForecast-3.3.0-win-x64.zip
 ```

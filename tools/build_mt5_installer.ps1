@@ -1,5 +1,5 @@
 param(
-    [string]$ReleaseZip = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\forecast-release\DNForecast-3.2.0-win-x64.zip'),
+    [string]$ReleaseZip = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\forecast-release\DNForecast-3.3.0-win-x64.zip'),
     [string]$OutputDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'output\mt5-installer'),
     [string]$ExpectedZipSha256
 )
@@ -9,15 +9,15 @@ $archive = (Resolve-Path -LiteralPath $ReleaseZip).Path
 if ($ExpectedZipSha256 -and (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $ExpectedZipSha256) {
     throw 'Release ZIP SHA-256 differs from the expected digest.'
 }
-$prefix = 'DNForecast-3.2.0-win-x64/'
+$prefix = 'DNForecast-3.3.0-win-x64/'
 $output = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $output -Force | Out-Null
-$exe = Join-Path $output 'DNForecast-3.2.0-MT5-Setup.exe'
+$exe = Join-Path $output 'DNForecast-3.3.0-MT5-Setup.exe'
 $work = Join-Path $output ([guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 $source = Join-Path $work 'Payload.cs'
 $packed = Join-Path $work 'install.zip'
-$intermediate = Join-Path $work 'DNForecast-3.2.0-MT5-Setup.exe'
+$intermediate = Join-Path $work 'DNForecast-3.3.0-MT5-Setup.exe'
 try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)

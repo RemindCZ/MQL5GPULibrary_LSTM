@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.3.0
+
+- Build branched LSTM, GRU, RNN, Dense and Identity networks in the Studio layer editor. Persist the graph, learning rate, batch size and backend with experiments and schedules.
+- Train custom graphs on CPU or NVIDIA CUDA. The offline Windows release includes the CUDA training engine and its user-mode runtime libraries.
+- Select the epoch on a chronological validation block, calibrate residual intervals and check the exported ONNX against the fitted model before making it available to MT5.
+
 ## 3.2.0
 
 - Request aligned closed bars from a connected MT5 terminal through a read-only Expert Advisor. The browser controls symbols, timeframe, sample size and training parameters.

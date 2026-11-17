@@ -8,6 +8,9 @@ const palette={price:'#d5e8ed',forecast:'#63e3c1',band:'#55948f',equity:'#7ce2c1
 let state=null, selected='', desired='', report=null, source='mt5', mode='price', cursor=-1, jobSignature='',loading='',pinned=false;
 function msg(message){const el=$('#notice');el.hidden=!message;el.textContent=message||'';}
 async function api(path,params,body){
+    if(params && Object.prototype.hasOwnProperty.call(params,'graph')){
+        params={...params};body=params.engine==='tdnn'?'':params.graph;delete params.graph;
+    }
     const opt=params?{method:'POST',headers:{'X-DNForecast-Key':token},body:body||''}:{};
     const r=await fetch(path+(params?'?'+new URLSearchParams(params):''),opt);
     if(!r.ok)throw Error(await r.text());return r;
@@ -25,16 +28,18 @@ function pickSource(value){
 $$('[data-source]').forEach(b=>b.onclick=()=>pickSource(b.dataset.source));
 function params(){return Object.fromEntries(new FormData(form));}
 function applyRecipe(p){
+    form.elements.engine.value=p.engine||'tdnn';
     Object.entries(p).forEach(([key,value])=>{if(form.elements[key]&&value!=null)form.elements[key].value=value;});
+    NetworkEditor.refresh();
 }
 try{applyRecipe(JSON.parse(localStorage.getItem('studio.recipe')||'{}'));}catch{}
 form.addEventListener('change',()=>{try{localStorage.setItem('studio.recipe',JSON.stringify(params()));}catch{}});
-function draft(){const p=params();$('#draft').textContent=p.target+' · '+form.elements.seconds.selectedOptions[0].text+' · '+p.bars+' svíček · '+p.epochs+' epoch';}
+function draft(){const p=params();$('#draft').textContent=p.engine.toUpperCase()+' · '+p.target+' · '+form.elements.seconds.selectedOptions[0].text+' · '+p.bars+' svíček · '+p.epochs+' epoch';}
 function hint(){
     if(!state)return;
     $('#hint').textContent=source==='file'?'Vstup v CSV musí obsahovat uzavřené svíčky ve správném pořadí.':
         state.feed.online?'Připojeno k '+state.feed.broker+'. Historii načte terminál automaticky.':
-        'V Navigátoru MT5 otevřete Experti a přetáhněte DNForecast_Bridge na jeden graf přihlášeného terminálu.';
+        'V Navigátoru MT5 otevřete Strategie a přetáhněte DNForecast_Bridge na jeden graf přihlášeného terminálu.';
 }
 function fillOptions(el,values){
     if(JSON.stringify(Array.from(el.children,o=>o.value))===JSON.stringify(values))return;
@@ -89,8 +94,9 @@ async function openJob(j){
     $('#settings').hidden=!j.config;
     if(j.config){
         const c=j.config;
-        $('#recipe-text').textContent=[c.epochs+' epoch',({both:'long i short',long:'long',short:'short'})[c.side],
-            'práh '+c.edge+' bp','náklad '+c.cost+' bp na stranu','pozice '+c.allocation+' %'].join(' · ');
+        $('#recipe-text').style.whiteSpace='pre-wrap';
+        $('#recipe-text').textContent=[j.device||'CPU',c.epochs+' epoch',({both:'long i short',long:'long',short:'short'})[c.side],
+            'práh '+c.edge+' bp','náklad '+c.cost+' bp na stranu','pozice '+c.allocation+' %'].join(' · ')+(c.graph?'\n'+c.graph:'');
         $('#reuse').onclick=()=>{applyRecipe(c);pickSource(c.target?'mt5':'file');if(!c.target)$('#dataset').value=j.dataset;msg('Parametry načteny do konfigurace.');};
     }
     const scores=(j.log||'').split(/\r?\n/).slice(1).filter(Boolean).map(line=>{
@@ -109,6 +115,7 @@ async function openJob(j){
 }
 async function refresh(){
     const s=await(await api('/api/state')).json();state=s;
+    NetworkEditor.hardware(s.cuda,s.cudaMessage);
     $('#lamp').classList.toggle('on',s.feed.online);
     $('#connection').textContent=s.feed.online?s.feed.broker+' · MT5 připojeno':'MT5 odpojeno';
     fillOptions($('#symbols'),s.feed.symbols);fillOptions($('#dataset'),s.datasets);hint();jobs(s.jobs);

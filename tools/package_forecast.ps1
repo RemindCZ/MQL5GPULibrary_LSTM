@@ -2,15 +2,24 @@ param(
     [Parameter(Mandatory=$true)][string]$OrtSdk,
     [string]$BuildDirectory='build\Release',
     [string]$OutputDirectory='output\forecast-release',
-    [string]$CrtDirectory
+    [string]$CrtDirectory,
+    [string]$CudaRuntime
 )
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
 $build=Join-Path $root $BuildDirectory
 $ort=(Resolve-Path -LiteralPath $OrtSdk).Path
-$package=Join-Path (Join-Path $root $OutputDirectory) 'DNForecast-3.2.0-win-x64'
+$package=Join-Path (Join-Path $root $OutputDirectory) 'DNForecast-3.3.0-win-x64'
 if ((Test-Path -LiteralPath $package) -or (Test-Path -LiteralPath "$package.zip")) {throw "Choose an unused output directory: $package"}
 $map=[ordered]@{}
+if($CudaRuntime) {
+    $cuda=(Resolve-Path -LiteralPath $CudaRuntime).Path
+    $map[(Join-Path $build 'MQL5GPULibrary_LSTM.dll')]='MQL5\Libraries\DNForecast-CUDA\MQL5GPULibrary_LSTM.dll'
+    foreach($name in @('cublas64_13.dll','cublasLt64_13.dll','curand64_10.dll','cudart64_13.dll')) {
+        $map[(Join-Path $cuda "bin\x64\$name")]="MQL5\Libraries\DNForecast-CUDA\$name"
+    }
+    foreach($name in @('EULA.txt','LICENSE')) { $map[(Join-Path $cuda $name)]="licenses\cuda\$name" }
+}
 if (!$CrtDirectory) {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
@@ -29,7 +38,9 @@ $map[(Join-Path $root 'docs\Native-Studio.cs.txt')]='MQL5\Files\DNForecast\Nativ
 foreach($name in @('LICENSE','ThirdPartyNotices.txt','VERSION_NUMBER')) {$map[(Join-Path $ort $name)]="licenses\onnxruntime\$name"}
 foreach($file in @('LICENSE.txt','include\DNForecast.h','include\DNForecastTrain.h','MQL5\Include\DNForecast.mqh','docs\DNForecast.cs.md',
     'docs\DNForecast_Manual_cs.pdf','docs\research\ICTrading-2026-10.json',
-    'tools\Install-MT5.ps1','examples\forecast.c','examples\train_native.cpp')) {
+    'tools\Install-MT5.ps1','examples\forecast.c','examples\train_native.cpp','include\checkpoint.h',
+    'include\model_validation.h','include\topology.h','include\MQL5GPULibrary.h','src\graph_fit.h',
+    'src\graph_fit.cpp','src\graph_cpu.cpp','src\graph_cuda.cpp','src\graph_onnx.cpp','src\onnx_writer.h')) {
     $map[(Join-Path $root $file)]=$file
 }
 foreach($ext in @('mq5','ex5')) {
@@ -43,7 +54,7 @@ foreach($ext in @('onnx','json')) {
 $studio = Join-Path $build 'DNForecast-Studio.exe'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $studioSources=@(Get-ChildItem -LiteralPath (Join-Path $root 'studio') -File -Filter '*.cs' | ForEach-Object { $_.FullName })
-& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.dll /r:System.Web.Extensions.dll "/out:$studio" "/win32icon:$(Join-Path $root 'installer/assets/dnforecast.ico')" "/resource:$(Join-Path $root 'studio/index.html'),index.html" "/resource:$(Join-Path $root 'studio/style.css'),style.css" "/resource:$(Join-Path $root 'studio/app.js'),app.js" @studioSources
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.dll /r:System.Web.Extensions.dll "/out:$studio" "/win32icon:$(Join-Path $root 'installer/assets/dnforecast.ico')" "/resource:$(Join-Path $root 'studio/index.html'),index.html" "/resource:$(Join-Path $root 'studio/style.css'),style.css" "/resource:$(Join-Path $root 'studio/editor.js'),editor.js" "/resource:$(Join-Path $root 'studio/app.js'),app.js" @studioSources
 if($LASTEXITCODE -ne 0){throw 'Studio compilation failed'}
 $map[$studio]='MQL5\Libraries\DNForecast-Studio.exe'
 foreach($source in $map.Keys) {if(-not (Test-Path -LiteralPath $source -PathType Leaf)){throw "Required file missing: $source"}}

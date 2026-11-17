@@ -11,7 +11,14 @@
 <div id="files" hidden><label>Datová sada<select id="dataset"></select></label><label class="upload">Importovat CSV<input type="file" id="upload" accept=".csv"></label></div>
 <div class="pair"><label>Časový rámec<select name="seconds"><option value="60">M1</option><option value="300">M5</option><option value="900">M15</option><option value="1800">M30</option><option selected value="3600">H1</option><option value="14400">H4</option><option value="86400">D1</option></select></label>
 <label>Počet svíček<input name="bars" type="number" value="4096" min="512" max="20000" required></label></div>
-<fieldset><legend>Neuronová síť</legend><div class="trio"><label>Vstup<input name="steps" type="number" value="96" min="16" max="1024" required></label><label>Horizont<input name="horizons" type="number" value="6" min="1" max="64" required></label><label>Epochy<input name="epochs" type="number" value="8" min="1" max="64" required></label></div></fieldset>
+<fieldset><legend>Neuronová síť</legend>
+<label>Tréninkový režim<select name="engine" id="engine"><option value="tdnn">CPU · výchozí časová síť</option><option value="cpu">CPU · vlastní architektura</option><option value="cuda">CUDA · vlastní architektura</option></select></label>
+<p id="gpu-state" class="hint"></p>
+<button type="button" id="design">Navrhnout architekturu ↗</button>
+<textarea name="graph" id="graph-spec" hidden>LSTM 32 linear 0 concat -1
+Dense 16 tanh 0 concat 0</textarea>
+<div id="graph-options" hidden><p id="graph-summary" class="hint"></p><div class="pair"><label>Minidávka<input name="batch" type="number" min="1" max="4096" value="32" required></label><label>Learning rate<input name="rate" type="number" min="0.000001" max="1" step="any" value="0.001" required></label></div></div>
+<div class="trio"><label>Vstup<input name="steps" type="number" value="96" min="16" max="1024" required></label><label>Horizont<input name="horizons" type="number" value="6" min="1" max="64" required></label><label>Epochy<input name="epochs" type="number" value="8" min="1" max="64" required></label></div></fieldset>
 <fieldset><legend>Obchodní pravidla</legend><label>Směr pozice<select name="side"><option value="both">Long i short</option><option value="long">Pouze long</option><option value="short">Pouze short</option></select></label>
 <div class="pair"><label>Práh signálu · bp<input name="edge" type="number" min="0" max="1000" step="0.1" value="2" required></label><label>Náklad / strana · bp<input name="cost" type="number" min="0" max="100" step="0.1" value="1" required></label></div>
 <label>Velikost pozice · % kapitálu<input name="allocation" type="number" min="1" max="100" value="100" required></label></fieldset>
@@ -30,4 +37,10 @@
 <div class="plan-grid"><div><label>Interval kontroly<select id="interval"><option value="1">1 minuta</option><option value="15">15 minut</option><option value="60" selected>1 hodina</option><option value="240">4 hodiny</option><option value="1440">1 den</option></select></label><p id="draft"></p><button class="primary" id="schedule">Aktivovat podle konfigurace</button></div><div class="plan-state"><small>Aktivní plán</small><h3 id="plan-title">Vypnuto</h3><p id="plan-text"></p><button id="stop" hidden>Zastavit plán</button></div></div></section>
 <section id="archive" class="view workspace" hidden><div class="kicker">ULOŽENÉ EXPERIMENTY</div><h2>Historie úloh</h2><p>Vyberte dokončenou úlohu a otevřete její výsledky v laboratoři.</p><div id="jobs"></div></section></main>
 <footer><b>DNForecast Studio</b><span>Remind · Windows x64</span></footer>
-<script>const token='__NONCE__';</script><script src="/app.js"></script></body></html>
+<dialog id="graph-dialog" aria-labelledby="graph-title"><div class="editor-head"><div><div class="kicker">NEURONOVÁ SÍŤ</div><h2 id="graph-title">Architektura modelu</h2></div><button type="button" id="dismiss" aria-label="Zavřít">✕</button></div>
+<div class="editor-main"><p class="muted">Vrstva může číst původní sekvenci (0) i výstupy dřívějších vrstev. Poslední vrstva předává výstup predikční hlavě.</p>
+<div class="graph-tools"><label>Předloha<select id="preset"><option value="">Vlastní návrh</option><option value="stack">LSTM → GRU → Dense</option><option value="residual">Reziduální síť</option><option value="parallel">Paralelní větve</option></select></label><button type="button" id="add-node">+ Přidat vrstvu</button></div>
+<div class="network-layers" id="layer-list"></div>
+<details id="graph-text"><summary>Textový zápis pro kopírování a vložení</summary><p class="muted">Na řádku je typ, šířka, aktivace, dropout, spojení a indexy rodičů. V textu je vstup −1 a první vrstva má index 0.</p><textarea id="graph-raw" spellcheck="false" aria-label="Text architektury"></textarea><button type="button" id="import-graph">Načíst z textu</button></details>
+</div><div class="editor-foot"><output id="graph-note" role="status"></output><button id="apply-graph" type="button" class="primary">Použít architekturu</button></div></dialog>
+<script src="/editor.js"></script><script>const token='__NONCE__';</script><script src="/app.js"></script></body></html>

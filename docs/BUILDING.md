@@ -16,6 +16,8 @@ For a fresh reference-only build omit DN3_ORT_ROOT. Set DN_BUILD_CUDA=ON to comp
 
 ## Windows CUDA DLL
 
+To build the full Studio distribution, configure with both `DN_BUILD_CUDA=ON` and `DN3_ORT_ROOT`. Compile for the GPU architectures that you intend to distribute. The 3.3.0 Windows binaries target compute capability 8.6 with forward-compatible PTX. Supply `-CudaRuntime $env:CUDA_PATH` to `tools/package_forecast.ps1` to bundle the matching CUDA 13 runtime, cuBLAS, cuBLASLt, cuRAND and license notices. The CPU-only package omits this option. A compatible NVIDIA driver is required for GPU training.
+
 Install Visual Studio 2022 with Desktop development with C++, Windows SDK and CUDA build integration. Use a CUDA toolkit compatible with the compiler and deployment driver. Install CMake 3.24+ and Python 3 for tests.
 
 ```powershell

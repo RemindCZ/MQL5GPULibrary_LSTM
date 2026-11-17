@@ -11,7 +11,7 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("DNForecast Studio")]
 [assembly: AssemblyCompany("Remind / Tomáš Bělák")]
-[assembly: AssemblyVersion("3.2.0.0")]
+[assembly: AssemblyVersion("3.3.0.0")]
 namespace Remind.DNForecast.Studio
 {
     internal static class Program

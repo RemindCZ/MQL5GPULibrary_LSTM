@@ -1,4 +1,5 @@
 #include "DNForecastTrain.h"
+#include "graph_fit.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -56,8 +57,11 @@ int wmain(int argc,wchar_t** argv) {
 int main(int argc,char** argv) {
 #endif
     try {
-        if (argc<4 || argc>8) {
-            std::cerr<<"DNForecast-Train bars.csv new-model.onnx timeframe_seconds [steps=96] [horizons=6] [epochs=8] [new-trace.csv]\n"
+        if(argc==2 && fs::path(argv[1])=="--cuda-device") {
+            std::cout<<graphfit::device()<<'\n';return 0;
+        }
+        if (argc<4 || argc>9) {
+            std::cerr<<"DNForecast-Train bars.csv new-model.onnx timeframe_seconds [steps=96] [horizons=6] [epochs=8] [new-trace.csv] [network.dng]\n"
                        "CSV header: close_time,available_at,TARGET[,DRIVER...]; timestamps in seconds; blank auxiliary = missing\n";
             return 2;
         }
@@ -99,13 +103,20 @@ int main(int argc,char** argv) {
         if (f.bad()) throw std::runtime_error("CSV read error");
         std::vector<uint8_t> model(1024*1024); std::vector<double> metrics(h*3); char error[512]{};
         const int rows=static_cast<int>(times.size()), first=rows*85/100;
-        std::vector<double> trace(argc==8 ? 4*std::max(0,rows-first-h) : 0);
-        if(argc==8 && fs::exists(fs::path(argv[7]))) throw std::invalid_argument("Trace file already exists");
-        int size=DNFit_TrainTrace(steps,markets,h,epochs,contract.data(),static_cast<int>(contract.size()),times.data(),
-            static_cast<int>(times.size()),prices.data(),static_cast<int>(prices.size()),model.data(),static_cast<int>(model.size()),
-            metrics.data(),static_cast<int>(metrics.size()),trace.empty()?nullptr:trace.data(),static_cast<int>(trace.size()),error,sizeof(error));
-        if (size<=0) throw std::runtime_error(error);
-        if (argc==8) {
+        std::vector<double> trace(argc>=8 ? 4*std::max(0,rows-first-h) : 0);
+        if(argc>=8 && fs::exists(fs::path(argv[7]))) throw std::invalid_argument("Trace file already exists");
+        int size;
+        if(argc==9) {
+            auto config=graphfit::read(fs::path(argv[8]),3*markets,h);
+            model=graphfit::fit(config,contract,steps,markets,h,epochs,times,prices,metrics,trace);
+            size=static_cast<int>(model.size());
+        } else {
+            size=DNFit_TrainTrace(steps,markets,h,epochs,contract.data(),static_cast<int>(contract.size()),times.data(),
+                rows,prices.data(),static_cast<int>(prices.size()),model.data(),static_cast<int>(model.size()),
+                metrics.data(),static_cast<int>(metrics.size()),trace.empty()?nullptr:trace.data(),static_cast<int>(trace.size()),error,sizeof(error));
+            if(size<=0)throw std::runtime_error(error);
+        }
+        if (argc>=8) {
             std::ostringstream out; out<<std::setprecision(17)<<"time,close,point,q10,q90,p_up\n";
             for (int i=first;i<rows;++i) {
                 out<<times[i]<<','<<prices[i*markets];

@@ -2,7 +2,7 @@
 Asynchronní predikce finančních časových řad pro MetaTrader 5, Python a C. Technický manuál • Remind / Tomáš Bělák
 
 ## Instalace ve Windows a první graf
-Spusťte DNForecast-3.2.0-MT5-Setup.exe a vyberte datovou složku terminálu. Při ruční instalaci rozbalte DNForecast-3.2.0-win-x64.zip. V MT5 zvolte Soubor → Otevřít složku dat a zkopírujte její cestu. Z kořene rozbaleného vydání spusťte v PowerShellu instalační příkaz. Parametr -Force dovoluje přepsání souborů předchozí instalace. Během aktualizace DLL ukončete terminál.
+Spusťte DNForecast-3.3.0-MT5-Setup.exe a vyberte datovou složku terminálu. Při ruční instalaci rozbalte DNForecast-3.3.0-win-x64.zip. V MT5 zvolte Soubor → Otevřít složku dat a zkopírujte její cestu. Z kořene rozbaleného vydání spusťte v PowerShellu instalační příkaz. Parametr -Force dovoluje přepsání souborů předchozí instalace. Během aktualizace DLL ukončete terminál.
 
 ```
 .\tools\Install-MT5.ps1 -TerminalDataPath 'C:\cesta\ke\složce dat'

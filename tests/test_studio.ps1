@@ -111,9 +111,12 @@ try {
     try{Invoke-WebRequest "$url/api/run?$recipe" -UseBasicParsing -Headers $header -Method Post -Body '' | Out-Null;throw 'Offline MT5 accepted'}catch{if([int]$_.Exception.Response.StatusCode -ne 409){throw}}
     $snapshot="close_time,available_at,BTCUSD"+[Environment]::NewLine+(($sourceRows | Select-Object -Last 720 | ForEach-Object {($_.Split(',')[0..2]) -join ','}) -join [Environment]::NewLine)
     Feed
-    Invoke-WebRequest "$url/api/plan?$recipe" -UseBasicParsing -Headers $header -Method Post -Body '' | Out-Null
+    $recipe+='&engine=cpu&batch=16&rate=0.002'
+    $graph="RNN 4 linear 0 concat -1`nDense 4 tanh 0 concat 0`nIdentity 0 linear 0 sum 0 1"
+    try {Invoke-WebRequest "$url/api/plan?$recipe" -UseBasicParsing -Headers $header -Method Post -Body "Dense 4 tanh 0 concat -1`nIdentity 0 linear 0 sum 0 -1" | Out-Null;throw 'Invalid residual dimensions accepted'}catch{if([int]$_.Exception.Response.StatusCode -ne 400){throw}}
+    Invoke-WebRequest "$url/api/plan?$recipe" -UseBasicParsing -Headers $header -Method Post -Body $graph | Out-Null
     $scheduled=Answer
-    if(!$scheduled.jobs[0].hasReport -or !$scheduled.plan.fingerprint){throw 'Scheduled training failed'}
+    if(!$scheduled.jobs[0].hasReport -or !$scheduled.plan.fingerprint -or $scheduled.jobs[0].config.graph -ne $graph){throw 'Scheduled graph training failed'}
     Stop-TestStudio $p
     $planFile=Join-Path $work 'studio-plan.json'
     $plan=[IO.File]::ReadAllText($planFile) | ConvertFrom-Json
@@ -122,6 +125,7 @@ try {
     Feed
     $p=Start-Studio
     $again=Answer
+    if($again.plan.recipe.graph -ne $graph -or $again.plan.recipe.engine -ne 'cpu'){throw 'Saved topology or backend changed after restart'}
     if($again.jobs[0].model -or $again.plan.fingerprint -ne $scheduled.plan.fingerprint -or $again.jobs[0].status -eq 'Chyba'){throw 'Unchanged data triggered another model'}
     $page=(Invoke-WebRequest "$url/" -UseBasicParsing).Content
     $header=@{'X-DNForecast-Key'=[regex]::Match($page,"token='([A-F0-9]{64})'").Groups[1].Value}

@@ -33,8 +33,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          .\tests\test_graph_training.ps1 -Trainer build/Release/DNForecast-Train.exe
           .\tools\package_forecast.ps1 -OrtSdk "$env:RUNNER_TEMP/onnxruntime-win-x64-1.23.2" -OutputDirectory build/client
-          $zip = 'build/client/DNForecast-3.2.0-win-x64.zip'
+          $zip = 'build/client/DNForecast-3.3.0-win-x64.zip'
           .\tools\build_mt5_installer.ps1 -ReleaseZip $zip -OutputDirectory build/installer
-          .\tests\test_mt5_installer.ps1 -Setup build/installer/DNForecast-3.2.0-MT5-Setup.exe -ReleaseZip $zip -InteractiveSmoke
+          .\tests\test_mt5_installer.ps1 -Setup build/installer/DNForecast-3.3.0-MT5-Setup.exe -ReleaseZip $zip -InteractiveSmoke
           .\tests\test_studio.ps1 -Studio build/Release/DNForecast-Studio.exe

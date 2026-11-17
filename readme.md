@@ -1,10 +1,12 @@
 # MQL5GPULibrary_LSTM
 
-**DNForecast 3.2** runs asynchronous multi-market forecasts from MetaTrader 5, Python and C. The Windows x64 distribution includes a CPU reference, ONNX Runtime, a trained six-horizon AUDUSD H1 TCN and the compiled indicator. Each forecast carries a bar origin. Clients submit a copied window and poll for results while other charts continue running.
+**DNForecast 3.3** runs asynchronous multi-market forecasts from MetaTrader 5, Python and C. The Windows x64 distribution includes a CPU reference, ONNX Runtime, a trained six-horizon AUDUSD H1 TCN and the compiled indicator. Each forecast carries a bar origin. Clients submit a copied window and poll for results while other charts continue running.
 
-[Download the Windows release](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/tag/v3.2.0) · [Czech PDF manual](docs/DNForecast_Manual_cs.pdf) · [C ABI](include/DNForecast.h) · [Research and architecture](docs/ARCHITEKTURA.cs.md)
+[Download the Windows release](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/tag/v3.3.0) · [Czech PDF manual](docs/DNForecast_Manual_cs.pdf) · [C ABI](include/DNForecast.h) · [Research and architecture](docs/ARCHITEKTURA.cs.md)
 
-**[Download the automatic MT5 installer for Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.2.0/DNForecast-3.2.0-MT5-Setup.exe)** and double-click it. Select your broker terminal or browse to the location shown by **File → Open Data Folder** in MT5. Check the displayed path and click **Install** to add the indicator, CPU runtime, trained model, smoke test and manual to that profile. [Detection, updates and silent installation](docs/MT5_SETUP.md)
+**[Download the automatic MT5 installer for Windows x64](https://github.com/RemindCZ/MQL5GPULibrary_LSTM/releases/download/v3.3.0/DNForecast-3.3.0-MT5-Setup.exe)** and double-click it. Select your broker terminal or browse to the location shown by **File → Open Data Folder** in MT5. Check the displayed path and click **Install** to add the indicator, CPU runtime, trained model, smoke test and manual to that profile. [Detection, updates and silent installation](docs/MT5_SETUP.md)
+
+**Design your network in Studio.** Choose CPU or CUDA, then open the architecture editor. Connect LSTM, GRU, RNN, Dense and Identity layers in sequence, in parallel, or through residual sums. Each experiment saves its graph, backend, learning rate and minibatch size. The Windows release bundles the CUDA 13 training runtime. The default MT5 indicator runs exported ONNX models on CPU.
 
 **Train from your chart.** Open BTCUSD H1 (or another symbol), refresh Scripts, and run **DNForecast_Train** with DLL imports enabled. The script fits a time-delay neural network to closed bars, validates the exported ONNX in the production runtime and attaches the indicator. The Windows package needs no Python installation.
 

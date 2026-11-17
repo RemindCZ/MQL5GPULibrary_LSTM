@@ -1,8 +1,8 @@
-DNForecast 3.2 pro Windows x64
+DNForecast 3.3 pro Windows x64
 Trénink v MT5 a v prohlížeči
 
 Instalace
-Spusťte DNForecast-3.2.0-MT5-Setup.exe. Vyberte datovou složku svého terminálu a potvrďte instalaci. Pro MT5, samostatný trenér i webové studio stačí distribuované binární soubory. Klient nepotřebuje Python, pip, PyTorch, CUDA ani cloudový účet. Studio používá systémový .NET Framework 4.8.
+Spusťte DNForecast-3.3.0-MT5-Setup.exe. Vyberte datovou složku svého terminálu a potvrďte instalaci. Pro MT5, samostatný trenér i webové studio stačí distribuované binární soubory. Klient nepotřebuje Python ani CUDA Toolkit. Pro trénink na GPU potřebuje podporovanou grafickou kartu NVIDIA a ovladač kompatibilní s přibaleným CUDA 13 runtime. Studio používá systémový .NET Framework 4.8.
 
 Trénink přímo na grafu
 1. Otevřete například BTCUSD H1 a v Navigátoru obnovte seznam Skripty.
@@ -16,6 +16,13 @@ Trénink na pozadí v prohlížeči
 3. Na kartě Experiment zvolte Terminál MT5. Zadejte například BTCUSD, H1 a 4096 svíček. Pomocné trhy zadejte čárkou pod jejich přesnými názvy u brokera. Zvolte počet kroků, horizontů, epoch a pravidla obchodu. Tlačítko Spustit experiment načte historii, natrénuje síť a provede simulaci. Při nedostatku svíček nebo neznámém symbolu najdete důvod v Historii. Historii lze též importovat na kartě Historie CSV. Prohlížeč může být během zpracování zavřený.
 4. V Automatizaci zvolte interval a aktivujte plán. Platí konfigurace experimentu v okamžiku aktivace. Server vyčká na dostupný terminál a zpracuje jeden experiment najednou. Při shodném snímku a brokerovi přeskočí opakování. Nastavení a otisk dat posledního úspěšného běhu uchová i po restartu. Zastavit plán ukončí další kontroly, probíhající experiment doběhne. Po restartu Windows musí znovu běžet přihlášený MT5 s konektorem a proces Studia.
 5. Je-li studio na stejném profilu MT5, model již leží v MQL5\Files\DNForecast. Z jiného serveru ho stáhněte do této složky. Na cílový graf přidejte DNForecast_Async. Do InpModelFile patří DNForecast\Studio-<id>.onnx. InpSteps, InpHorizons, časový rámec grafu a InpDrivers musí odpovídat údajům úlohy. Pro samotný BTCUSD nechte InpDrivers prázdné a InpCuda=false.
+
+Vlastní síť a trénink CUDA
+V části Neuronová síť zvolte vlastní architekturu na CPU nebo CUDA. Studio zobrazí jméno rozpoznané karty. Při nedostupném zařízení úloha s režimem CUDA skončí chybou.
+Klikněte na Upravit architekturu. Přidejte vrstvy LSTM, GRU, RNN, Dense nebo Identity. Vstup 0 je původní sekvence, následná čísla označují již definované vrstvy. Concat spojuje kanály, Sum sčítá větve stejné šířky. Všechny větve musí vést k poslední vrstvě. Dense umožňuje lineární aktivaci, tanh, ReLU a sigmoid. Dropout je aktivní pouze během tréninku.
+Předlohy zahrnují sériové, paralelní a reziduální sítě. V textovém editoru můžete kopírovat celý graf. Text používá nulové indexování vrstev a −1 pro původní vstup. Vstupní rozměr je třikrát počet trhů. Výstupní hlava se vytvoří podle zvoleného počtu horizontů. Limit grafu je 1024 uzlů a 64 vstupů na uzel. Praktickou šířku a hloubku určuje také paměť a limit velikosti ONNX v MT5.
+Nastavte minidávku, rychlost učení a počet epoch. Po volbě Spustit experiment sledujte průběh v Historii. Studio vybere epochu pomocí validační chyby, odhadne kvantily na následujícím kalibračním úseku a na posledním úseku vyhodnotí predikce. Pravděpodobnost růstu u vlastního grafu je logistický odhad z mediánu a škály kalibračních reziduí.
+Soubor ONNX po verifikaci funguje také v CPU runtime indikátoru DNForecast_Async. CUDA trénink lze tedy použít i pro model určený na počítač bez GPU.
 
 Samostatný Windows server
 Rozbalte celý distribuční ZIP. Server může běžet i na stroji bez terminálu MT5. V jeho MQL5\Libraries spusťte:
